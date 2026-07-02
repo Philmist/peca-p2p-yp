@@ -20,7 +20,7 @@
   - ✅ `.specify/templates/tasks-template.md` — Security hardeningフェーズは既に存在。Formal Verification タスクを追加フェーズとして利用可能
 **Follow-up TODOs**:
   - ✅ FORMAL_VERIFICATION_TOOLCHAIN: `docs/formal/README.md` にセットアップ手順を追加済み
-  - TODO(SECURITY_SCAN_TOOL): CIに組み込むセキュリティスキャンツールを選定しADRに記録する
+  - ✅ SECURITY_SCAN_TOOL: Gitleaks (pre-commit) + Trivy (CI) + Dependabot を選定。`docs/adr/0001-security-scanning-tools.md` に記録済み
 -->
 
 # peca-p2p-yp Constitution

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Principle I & II: シークレット混入をコミット前に阻止する
+# gitleaks protect --staged はステージ済みファイルのみをスキャンするため高速
+
+gitleaks protect --staged --redact --exit-code 1
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+  echo ""
+  echo "ERROR: gitleaks がシークレットを検出しました。コミットを中断します。"
+  echo "       検出されたファイルからシークレットを削除し、再度ステージしてください。"
+  echo "       意図的な除外が必要な場合は .gitleaks.toml の allowlist を使用してください。"
+  exit 1
+fi
