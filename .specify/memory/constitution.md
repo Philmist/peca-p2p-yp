@@ -1,29 +1,37 @@
 <!--
 ## Sync Impact Report
 
-**Version Change**: unversioned template → 1.0.0
-**Modified Principles**: (全て新規 — テンプレートプレースホルダーを置換)
+**Version Change**: 1.0.0 → 1.1.0
+**Modified Principles**:
+  - I  — 既知脆弱性リリース禁止を深刻度しきい値ベースへ緩和
+  - III — レビュー要求を人数非依存に一般化（ゲート=MUST / 独立性=SHOULD）
+  - V  — MUST→SHOULD、クリティカル基準を厳格化
 **Added Sections**:
-  - I. Safety First — ユーザー安全最優先 (NON-NEGOTIABLE)
-  - II. Security by Design — 設計によるセキュリティ
-  - III. Code Quality and Review — コード品質とレビュー
-  - IV. Behavior-Driven Testing with Gherkin — 振舞い駆動テスト
-  - V. Formal Verification for Critical Paths — クリティカルパスの形式的検証
-  - VI. Principle Traceability — 原則追跡可能性
-  - Security Requirements (セキュリティ要件)
-  - Development Workflow & Quality Gates (開発ワークフローと品質ゲート)
-  - Governance
+  - 規範キーワード (RFC 2119)
+  - Security Requirements に P2P 脅威（Sybil/汚染）の緩和項を追加
+  - Governance にライセンス暫定方針を追加
 **Removed Sections**: なし
 **Templates Requiring Updates**:
   - ✅ `.specify/templates/plan-template.md` — Constitution Check section は原則参照を含む形で使用すること (構造変更不要)
   - ✅ `.specify/templates/spec-template.md` — Given/When/Then フォーマットは既に存在。Gherkinシナリオの必須化はPrinciple IVに準拠
   - ✅ `.specify/templates/tasks-template.md` — Security hardeningフェーズは既に存在。Formal Verification タスクを追加フェーズとして利用可能
-**Follow-up TODOs**:
+**Follow-up TODOs（未完）**:
+  - ⏳ SAST_TOOL: 実装言語確定後に静的解析ツールを別 ADR で選定（ADR-0001 で保留中）
+  - ⏳ LICENSE: 公開前に許容的ライセンスを ADR で確定（MIT 相当想定、GPL 結合回避）
+  - ⏳ PRIVACY: 配信者IP・視聴メタデータの取り扱い方針を要件定義段階で検討
+  - ⏳ INTEROP: プロトコル互換性・相互運用方針を要件定義段階で検討
+  - ⏳ THREAT_MODEL: Sybil/汚染の具体的緩和策を設計フェーズで ADR 化
+**Follow-up TODOs（完了）**:
   - ✅ FORMAL_VERIFICATION_TOOLCHAIN: `docs/formal/README.md` にセットアップ手順を追加済み
   - ✅ SECURITY_SCAN_TOOL: Gitleaks (pre-commit) + Trivy (CI) + Dependabot を選定。`docs/adr/0001-security-scanning-tools.md` に記録済み
 -->
 
 # peca-p2p-yp Constitution
+
+## 規範キーワード
+
+本文書の MUST / MUST NOT / SHOULD / SHOULD NOT / MAY は RFC 2119 の定義に従う。
+SHOULD 要求は、正当な理由が記録される限り満たさないことを許容する。
 
 ## Core Principles
 
@@ -35,7 +43,8 @@
 - すべての機能はユーザーへのリスク評価を伴わなければならない (MUST)
 - 安全性に影響する変更は、実装前に明示的なレビューを経なければならない (MUST)
 - ユーザーデータの機密性・完全性・可用性を保護しなければならない (MUST)
-- 既知のセキュリティ脆弱性が存在するコードはリリースしてはならない (MUST NOT)
+- 未緩和の High または Critical 深刻度の既知脆弱性を含むコードはリリースしてはならない (MUST NOT)
+- Low / Medium の既知脆弱性は、影響評価と緩和方針をイシューに記録した上で許容してよい (MAY)
 - ユーザーを危険にさらす可能性のあるP2Pネットワーク上の悪意あるコンテンツを
   検出または警告する仕組みを持たなければならない (MUST)
 
@@ -63,7 +72,9 @@
 コードの品質はユーザー安全の技術的基盤である。低品質なコードはバグを生み、
 バグはセキュリティ上の脆弱性となりうる。
 
-- すべてのコードはピアレビューを経なければならない (MUST)
+- すべての変更はレビューを経なければならない (MUST)
+- レビューは作者以外の開発者によって行われることが望ましい (SHOULD)
+- セキュリティに関わる変更は、レビュー観点チェックリストの適用結果を記録しなければならない (MUST)
 - 静的解析ツールによるチェックをCIに組み込まなければならない (MUST)
 - 依存ライブラリのセキュリティ更新は速やかに適用しなければならない (MUST)
 - 技術的負債は意識的に管理し、ADRまたはイシューに文書化しなければならない (MUST)
@@ -104,20 +115,20 @@ Feature: Yellow Pages エントリ登録のセキュリティ
 
 ### V. Formal Verification for Critical Paths
 
-クリティカルなコンポーネント（ネットワークプロトコル処理・認証フロー・
-データ整合性保証・並行処理）はPlusCalまたはTLA+によってバグを設計段階で発見しなければならない。
+新規に設計する非自明な並行アルゴリズムおよびプロトコル状態機械は、
+PlusCal または TLA+ による形式的検証で設計段階のバグを発見することが強く推奨される。
 
-**クリティカルと判断する基準**:
-- 並行処理や競合状態が発生しうる箇所
-- セキュリティに直結する認証・認可ロジック
-- ネットワークプロトコルの状態機械
-- データ整合性を保証しなければならない箇所
+**「クリティカル」と判断する基準（すべてを満たすもの）**:
+- 新規設計であり、既存の実績ある仕様・ライブラリの単純な利用ではない
+- 競合状態・デッドロック・プロトコル違反がテストで再現困難な非自明さを持つ
+- 失敗がユーザー安全（Principle I）またはデータ整合性に直接影響する
 
 **要件**:
-- クリティカルと判断されたアルゴリズムはPlusCalモデルを作成しなければならない (MUST)
-- PlusCalモデルはデッドロック・ライブロック・不変条件違反をチェックしなければならない (MUST)
-- 形式的検証の結果と.tlaファイルは `docs/formal/` ディレクトリに保存しなければならない (MUST)
-- クリティカルと判断した理由はADRに明示しなければならない (MUST)
+- 上記すべてを満たすアルゴリズムはPlusCalモデルを作成するべきである (SHOULD)
+- モデルを作成する場合、デッドロック・ライブロック・不変条件違反をチェックしなければならない (MUST)
+- .tlaファイルと検証結果は `docs/formal/` ディレクトリに保存しなければならない (MUST)
+- クリティカルと判断した／しなかった理由は、該当機能の設計時にADRで明示しなければならない (MUST)
+- 既存 PeerCast YP プロトコルに準拠する状態機械は、状態遷移が既知のため対象外とする
 
 **Rationale**: P2Pプロトコルの並行処理部分は、テストのみでは発見できない
 微妙な競合状態やプロトコル違反が存在しうる。PlusCalによる形式的検証は
@@ -147,6 +158,7 @@ Principle Iのユーザー安全が実際の実装に反映されることを保
 - **依存関係**: サードパーティライブラリはセキュリティ監査された版を使用し、定期的に更新しなければならない
 - **レート制限**: イエローページエントリの登録・取得はレート制限を設けてDoS攻撃を緩和しなければならない
 - **コンテンツ検証**: 登録されるエントリの内容は許可されたフォーマットに準拠しているか検証しなければならない
+- **P2P 脅威の緩和**: 大量の偽登録（Sybil）や虚偽・なりすましエントリによる YP 情報の汚染に対する緩和策を設計に含めなければならない。具体的手法は脅威モデル ADR で定める
 
 ## Development Workflow & Quality Gates
 
@@ -174,10 +186,10 @@ Principle Iのユーザー安全が実際の実装に反映されることを保
 本コンスティテューションはすべての他のプラクティス・慣習に優先する。
 
 **改正手順**:
-1. 変更内容と理由をADRとして草案を作成し、参照する原則番号を明示する
+1. 変更内容・理由・参照する原則番号をADR草案に記す
 2. ユーザー安全（Principle I）への影響を評価する
-3. すべてのステークホルダーのレビューを得る
-4. 本ファイルと依存テンプレートを同時に更新し、バージョンを上げる
+3. 本ファイルと依存テンプレートを同時に更新し、バージョンを上げる (MUST)
+4. 改正は独立したレビュー（作者以外による）を経ることが望ましい (SHOULD)
 
 **バージョニングポリシー**:
 - MAJOR: 原則の削除・後方互換性のない再定義
@@ -186,9 +198,13 @@ Principle Iのユーザー安全が実際の実装に反映されることを保
 
 **コンプライアンスレビュー**:
 - すべてのPRはplan.mdのConstitution Checkセクションを通過しなければならない (MUST)
-- 四半期ごとにコンスティテューションの有効性をレビューする
 - 原則に反する実装が発見された場合は、即座に是正しなければならない
+- コンスティテューションの有効性は、beta リリース時および以降の各マイナーリリース時にレビューする
+
+**ライセンス方針（暫定）**:
+本プロジェクトは PeerCastStation 等と TCP 経由の API 連携に留まり GPL の結合著作物には
+当たらないとの判断のもと、公開前に許容的ライセンス（MIT 相当を想定）を別 ADR で確定する。
 
 ランタイム開発ガイダンスは `docs/agents/domain.md` を参照。
 
-**Version**: 1.0.0 | **Ratified**: 2026-07-02 | **Last Amended**: 2026-07-02
+**Version**: 1.1.0 | **Ratified**: 2026-07-02 | **Last Amended**: 2026-07-02
