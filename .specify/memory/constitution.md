@@ -19,7 +19,7 @@
   - ✅ `.specify/templates/spec-template.md` — Given/When/Then フォーマットは既に存在。Gherkinシナリオの必須化はPrinciple IVに準拠
   - ✅ `.specify/templates/tasks-template.md` — Security hardeningフェーズは既に存在。Formal Verification タスクを追加フェーズとして利用可能
 **Follow-up TODOs**:
-  - TODO(FORMAL_VERIFICATION_TOOLCHAIN): PlusCalとTLA+ Toolboxのセットアップ手順をdocs/に追加する
+  - ✅ FORMAL_VERIFICATION_TOOLCHAIN: `docs/formal/README.md` にセットアップ手順を追加済み
   - TODO(SECURITY_SCAN_TOOL): CIに組み込むセキュリティスキャンツールを選定しADRに記録する
 -->
 
