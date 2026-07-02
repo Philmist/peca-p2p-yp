@@ -17,20 +17,20 @@
 | Method & Path | 説明 | 主な入出力 |
 |---------------|------|-----------|
 | `GET /channels` | 発見済みチャンネル一覧(視聴者向け) | DiscoveredChannel の配列(muted 除外、`url_warning` フラグ付き — FR-012) |
-| `GET /announced` | 自分が掲載中のチャンネルと掲載状態 | AnnouncedChannel + 掲載成功リレー数 |
+| `GET /announced` | 自分が掲載中のチャンネルと掲載状態 | AnnouncedChannel + 伝搬先(established ピア)数 |
 | `GET /personas` | ペルソナ一覧(pubkey, label, state) | 秘密鍵は返さない |
 | `POST /personas` | ペルソナ新規作成 | `{label}` → `{pubkey}` |
 | `PUT /personas/{pubkey}` | label 変更 / archive / チャンネルへの割当 | |
 | `DELETE /personas/{pubkey}` | ペルソナ破棄(確認フラグ必須、復元不可) | |
 | `POST /personas/{pubkey}/export` | nsec 表示(明示操作+警告 — research R6) | |
-| `GET /relays` | リレー一覧+健全性(last_ok_at) | |
-| `POST /relays` | 追加。**貼り付け一括登録**(`{urls:["wss://…",…]}`)対応(research R10) | 不正 URL は個別にエラー返却 |
-| `PUT /relays/{id}` | enabled/read/write 変更 | |
-| `DELETE /relays/{id}` | 削除 | |
-| `GET /relays/export` | 共有用テキスト(1 行 1 URL)書き出し(research R10) | |
+| `GET /peers` | ピア一覧+健全性(source, verified, enabled, last_ok_at, fail_count, 接続中か) | |
+| `POST /peers` | 追加。**貼り付け一括登録**(`{addrs:["host:port",…]}`)対応(research R10) | 不正アドレスは個別にエラー返却。source=manual で登録 |
+| `PUT /peers/{id}` | enabled 変更 | |
+| `DELETE /peers/{id}` | 削除 | |
+| `GET /peers/export` | 共有用テキスト(1 行 1 アドレス。verified のみ)書き出し(research R10) | |
 | `GET /mutes` / `POST /mutes` / `DELETE /mutes/{id}` | ミュート管理(pubkey / channel 単位 — FR-008) | |
 | `GET /settings` / `PUT /settings` | data-model.md の Settings キー | バインド変更は再起動要求を返す |
-| `GET /status` | 全体状態(PCP 待受、リレー接続数、全リレー到達不能フラグ) | US3 シナリオ 3 の通知に使用 |
+| `GET /status` | 全体状態(PCP 待受、established ピア数 in/out、着信可否(UPnP 結果 — FR-016)、全ピア到達不能フラグ) | US3 シナリオ 3 の通知に使用 |
 
 ## UI 要件(契約レベル)
 
@@ -38,7 +38,9 @@
   ミュート操作・コンタクト URL の警告表示(FR-012)・「未検証リンクを開く前の確認」を含む
 - ペルソナ切替: チャンネル掲載に使うペルソナを配信ごとに選択できる(FR-013)。
   現在選択中のペルソナを常時明示し、意図しないペルソナでの掲載(誤爆)を防ぐ
-- 全リレー到達不能時: 目立つバナーで通知し、回復後自動で掲載再開を表示(US3-3)
+- 全ピア到達不能時: 目立つバナーで通知し、回復後自動で掲載再開を表示(US3-3)
+- 着信不可(UPnP 失敗・待受無効)時: 状態表示で「外向き接続のみで参加中」であることを示す
+  (エラーではない — FR-016)
 
 ## 検証方法
 

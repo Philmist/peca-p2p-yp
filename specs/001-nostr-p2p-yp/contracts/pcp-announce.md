@@ -21,7 +21,7 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
 - `PCP_BCST` 内のチャンネル情報 atom(`name`/`gnre`/`desc`/`url`/`bitr`/`type`/
   `titl`/`crea`/`albm`)と `PCP_HOST`(グローバル IP:port、`numl`/`numr`、flg1)を
   data-model.md の AnnouncedChannel に写像する
-- 受信内容の変更検知(または受信そのもの)を契機に nostr 掲載を更新する(contracts/nostr-events.md)
+- 受信内容の変更検知(または受信そのもの)を契機にイベントを再発行し gossip へ伝搬する(contracts/nostr-events.md, p2p-gossip.md)
 - 本ソフトウェアから切断する場合は `PCP_QUIT` を送る。BAN 相当機能(helo_disable)は実装しない
 
 ## 入力検証(Principle II)
@@ -42,10 +42,10 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
 
 - Tracker Lookup(`GET /channel/<id>` + HTTP 503 + PCP_HOST 応答)は v1 では提供しない。
   視聴側は index.txt の TIP フィールドでトラッカーへ到達する。将来要望があれば追加
-- ルート YP 間のホスト転送(PCP_BCST の中継ネットワーク)は実装しない(nostr が代替)
+- ルート YP 間のホスト転送(PCP_BCST の中継ネットワーク)は実装しない(P2P gossip が代替)
 
 ## 検証方法
 
 - `tests/contract/`: HELO→OLEH→BCST→QUIT のフィクスチャバイト列で往復を検証
-- 統合テスト: PCP 疑似クライアント(テスト用実装)で announce→nostr 発行→ended までを通す
+- 統合テスト: PCP 疑似クライアント(テスト用実装)で announce→イベント発行・伝搬→ended までを通す
 - 受け入れ: 実機 PeerCastStation からの掲載(quickstart.md 手順 3)
