@@ -1,0 +1,16 @@
+# Gitleaks 設定ファイル
+# Principle I & II: シークレット検出のルール設定
+# 詳細: https://github.com/gitleaks/gitleaks
+
+title = "peca-p2p-yp gitleaks config"
+
+[extend]
+# 公式デフォルトルールセットを継承する
+useDefault = true
+
+# プロジェクト固有の除外設定が必要な場合は以下に追加する
+# [[rules.allowlist]]
+# description = "テストデータの除外例"
+# paths = ["tests/fixtures/.*"]
+
+# hook test
