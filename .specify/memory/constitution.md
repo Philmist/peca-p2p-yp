@@ -16,7 +16,7 @@
   - ✅ `.specify/templates/spec-template.md` — Given/When/Then フォーマットは既に存在。Gherkinシナリオの必須化はPrinciple IVに準拠
   - ✅ `.specify/templates/tasks-template.md` — Security hardeningフェーズは既に存在。Formal Verification タスクを追加フェーズとして利用可能
 **Follow-up TODOs（未完）**:
-  - ⏳ SAST_TOOL: 実装言語確定後に静的解析ツールを別 ADR で選定（ADR-0001 で保留中）
+  - ✅ SAST_TOOL: Rust 確定に伴い Clippy + cargo audit を選定。ADR-0001 追補（2026-07-03）に記録済み
   - ⏳ LICENSE: 公開前に許容的ライセンスを ADR で確定（MIT 相当想定、GPL 結合回避）
   - ⏳ PRIVACY: 配信者IP・視聴メタデータの取り扱い方針を要件定義段階で検討
   - ⏳ INTEROP: プロトコル互換性・相互運用方針を要件定義段階で検討

@@ -2,3 +2,15 @@
 .claude/skills
 skills-lock.json
 
+
+
+# Added by cargo
+/target
+
+# Database files
+*.db
+
+# TLA+/TLC 中間生成物(docs/formal — 成果物は .tla/.cfg/-result.md のみ)
+docs/formal/**/states/
+docs/formal/**/*.old
+docs/formal/**/*.log.txt

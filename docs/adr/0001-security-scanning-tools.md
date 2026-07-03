@@ -63,3 +63,48 @@ git config core.hooksPath .githooks
 - シークレットを含むコミットはローカルで即座にブロックされる
 - 依存ライブラリのCVEはCI実行時に検出される
 - 脆弱な依存ライブラリのアップデートPRがDependabotにより自動作成される
+
+---
+
+## 追補: Rust 静的コード解析（SAST）ツール選定
+
+**Date**: 2026-07-03
+**Principles**: Principle II (Security by Design), Principle III (Code Quality and Review)
+
+### 背景
+
+本ADR原版では「静的コード解析（SAST）ツールは実装言語確定後に別ADRで決定する」と保留していた。
+Phase 1（T001）で実装言語を **Rust（stable, edition 2024）** と確定したため、SAST ツールを選定する。
+constitution Follow-up TODO `SAST_TOOL` を本追補で解消する。
+
+### 決定
+
+Rust プロジェクトに対し以下のツールを採用する:
+
+| ツール | 役割 | 実行タイミング |
+|--------|------|--------------|
+| **Clippy** | 静的解析・慣用句チェック・セキュリティ観点の lint | CI（`cargo clippy -- -D warnings`）|
+| **cargo audit** | `Cargo.lock` 依存クレートの既知 CVE スキャン | CI（`cargo audit`）|
+
+`Cargo.toml` の `[lints.rust]` に `warnings = "deny"` を設定し、
+コンパイラ警告をエラーとして扱うことでコード品質の継続的な維持を保証する。
+
+### 採用理由
+
+- **Clippy**: Rust の公式リンター。コンパイラと同梱されるため外部ツール導入不要。
+  `unsafe` ブロックや整数オーバーフロー・未処理エラー等のセキュリティ観点の lint を含む。
+  `-D warnings` で警告をエラー扱いにすることで CI の強制ゲートとして機能する。
+- **cargo audit**: `Cargo.lock` の依存クレートを RustSec Advisory Database と照合する。
+  Trivy の Rust エコシステムカバレッジを補完し、より精度の高い Rust 固有の CVE 検出が可能。
+
+### 否定した選択肢
+
+- **semgrep / CodeQL（Rust ルールセット）**: 現時点での Rust ルールセットの成熟度が Clippy に
+  劣るため却下。Clippy の lint カバレッジで本プロジェクトの要件は充足する。
+- **cargo-geiger（unsafe 検出）**: 現フェーズでは不使用だが、unsafe ブロック導入時に追加を検討する。
+
+### CI 統合
+
+`.github/workflows/ci.yml` の `ci` ジョブに以下を組み込み済み:
+- `cargo clippy --locked -- -D warnings`
+- `cargo audit`（`cargo-audit` クレートを CI 上でインストール）
