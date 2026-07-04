@@ -17,7 +17,10 @@
 use std::collections::HashSet;
 use std::net::Ipv6Addr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+use tokio::sync::Notify;
 
 use crate::store::{PeerEndpoint, PeerSource, Store, StoreError};
 
@@ -576,6 +579,58 @@ impl PeerManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ReachabilityState(全断検出と回復通知 — T047 / US3)
+// ---------------------------------------------------------------------------
+
+/// 全ピア到達不能状態の共有フラグと回復通知(T047)。
+///
+/// - [`is_all_unreachable`](ReachabilityState::is_all_unreachable) を全体状態 API
+///   (T048)が読み、UI が「全ピア到達不能」バナーを表示する。
+/// - 全断からいずれかのピアと再確立した瞬間([`mark_reachable`](ReachabilityState::mark_reachable))
+///   に [`recovered`](ReachabilityState::recovered) の待機者を起こす。main.rs の
+///   再発行タスクがこれを受けて掲載中チャンネルを即時再発行する(US3 シナリオ 3)。
+///
+/// `Notify::notify_one` は待機者不在時に 1 つだけパーミットを保持するため、
+/// 回復通知は取りこぼされない(単一リスナー前提)。
+pub struct ReachabilityState {
+    all_unreachable: AtomicBool,
+    recovered: Notify,
+}
+
+impl ReachabilityState {
+    /// 到達可能(全断でない)状態で共有ハンドルを作る。
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            all_unreachable: AtomicBool::new(false),
+            recovered: Notify::new(),
+        })
+    }
+
+    /// 全ピア到達不能か。
+    pub fn is_all_unreachable(&self) -> bool {
+        self.all_unreachable.load(Ordering::Relaxed)
+    }
+
+    /// established を得た/維持していることを記録する。直前が全断だった場合のみ
+    /// 回復通知を出す(接続確立時に呼ぶ — 方向を問わない)。
+    pub fn mark_reachable(&self) {
+        if self.all_unreachable.swap(false, Ordering::Relaxed) {
+            self.recovered.notify_one();
+        }
+    }
+
+    /// 全ピア到達不能を記録する(維持ループが検出時に呼ぶ)。
+    pub fn mark_all_unreachable(&self) {
+        self.all_unreachable.store(true, Ordering::Relaxed);
+    }
+
+    /// 全断からの回復を待つ(main.rs の再発行タスクが使う)。
+    pub async fn recovered(&self) {
+        self.recovered.notified().await;
+    }
+}
+
 /// 基本候補順の比較: manual 優先 → last_ok_at 新しい順 → fail_count 少ない順 → id 昇順。
 fn cmp_base(a: &PeerEndpoint, b: &PeerEndpoint) -> std::cmp::Ordering {
     let manual_rank = |p: &PeerEndpoint| {
@@ -821,6 +876,25 @@ mod tests {
     }
 
     // ---- バックオフ ----
+
+    // ---- ReachabilityState(T047) ----
+
+    #[tokio::test]
+    async fn reachability_recovery_notifies_only_after_all_unreachable() {
+        let r = ReachabilityState::new();
+        assert!(!r.is_all_unreachable());
+        // 全断でない状態での mark_reachable は回復通知を出さない。
+        r.mark_reachable();
+        // 全断 → 回復で通知が出る(notify_one はパーミット保持のため取りこぼさない)。
+        r.mark_all_unreachable();
+        assert!(r.is_all_unreachable());
+        r.mark_reachable();
+        assert!(!r.is_all_unreachable());
+        // 回復通知が保持されており、待機は即座に解ける。
+        tokio::time::timeout(std::time::Duration::from_millis(100), r.recovered())
+            .await
+            .expect("回復通知が届くべき");
+    }
 
     #[test]
     fn backoff_is_deterministic_capped() {

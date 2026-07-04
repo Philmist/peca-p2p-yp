@@ -23,6 +23,9 @@
     #status-bar { background: #f8f8f8; border: 1px solid #ddd; padding: 0.4rem 0.7rem;
       font-size: 0.85rem; margin-bottom: 1rem; border-radius: 4px; }
     #status-bar span { margin-right: 1.2rem; }
+    .banner { padding: 0.6rem 0.9rem; margin-bottom: 0.8rem; border-radius: 4px; font-weight: bold; }
+    .banner-alert { background: #f8d7da; border: 1px solid #b00; color: #700; }
+    .banner-warn  { background: #fff3cd; border: 1px solid #b06000; color: #663c00; }
     #confirm-dialog { display: none; position: fixed; top: 30%; left: 50%; transform: translateX(-50%);
       background: #fff; border: 1px solid #ccc; padding: 1rem; box-shadow: 0 4px 12px rgba(0,0,0,.2); z-index: 100; }
     #confirm-dialog p { margin: 0 0 1rem; }
@@ -36,11 +39,20 @@
   <p><a href="/index.html">&larr; トップ</a></p>
   <h1>チャンネル一覧</h1>
 
+  <!-- 全ピア到達不能バナー(US3 — T048) -->
+  <div id="banner-unreachable" class="banner banner-alert" hidden>
+    ⚠ 全ピア到達不能: すべての接続先ピアと通信できません。既知ピアへ自動再接続中です
+    (回復すると掲載・発見が自動再開します)。
+  </div>
+  <!-- 時計ずれ警告バナー(T048) -->
+  <div id="banner-clockskew" class="banner banner-warn" hidden></div>
+
   <!-- ノードステータス -->
   <div id="status-bar">
     <span id="stat-pcp">PCP: —</span>
     <span id="stat-in">IN: —</span>
     <span id="stat-out">OUT: —</span>
+    <span id="stat-reach">着信: —</span>
   </div>
 
   <!-- 掲載中チャンネル -->
@@ -123,7 +135,7 @@
       pendingUrl = null;
     });
 
-    // ノードステータス(PCP / 確立ピア数)を取得して表示する
+    // ノードステータス(PCP / 確立ピア数 / 全断・時計ずれ通知)を取得して表示する
     async function loadStatus() {
       try {
         const res = await fetch('/api/v1/status');
@@ -133,6 +145,25 @@
           'PCP: ' + (s.pcp_listening ? '待受中' : '停止');
         document.getElementById('stat-in').textContent  = 'IN: '  + (s.established?.in  ?? 0);
         document.getElementById('stat-out').textContent = 'OUT: ' + (s.established?.out ?? 0);
+
+        // 着信可否(UPnP — T053 / FR-016)。着信不可なら「外向き接続のみで参加中」。
+        document.getElementById('stat-reach').textContent =
+          s.inbound_reachable ? '着信: 可能' : '着信: 外向き接続のみで参加中';
+
+        // 全ピア到達不能バナー(回復すると status が false になり自動的に消える)。
+        document.getElementById('banner-unreachable').hidden = !s.all_peers_unreachable;
+
+        // 時計ずれ警告バナー(中央値がしきい値超過のときのみ)。
+        const skew = s.clock_skew ?? {};
+        const skewBanner = document.getElementById('banner-clockskew');
+        if (skew.warning) {
+          skewBanner.textContent =
+            '⚠ 時計のずれを検出しました(推定 ' + skew.median_sec + ' 秒)。' +
+            'ずれが大きいと掲載イベントが他ノードに拒否されます。OS の時刻同期を確認してください。';
+          skewBanner.hidden = false;
+        } else {
+          skewBanner.hidden = true;
+        }
       } catch (_) {}
     }
 
@@ -279,6 +310,8 @@
     (async () => {
       try { await loadToken(); } catch(_) {}
       await Promise.all([loadStatus(), loadAnnounced(), loadChannels()]);
+      // ステータスを定期更新し、全断→回復・自動再開や時計ずれ解消を反映する(T048)。
+      setInterval(loadStatus, 5000);
     })();
   </script>
 </body>

@@ -1,8 +1,10 @@
-//! cucumber ハーネス(T004/T022/T034)
+//! cucumber ハーネス(T004/T022/T034/T045/T051)
 //!
 //! World は全フィーチャで共有し、ステップ定義はストーリー別モジュールに置く:
 //! - `steps/us1.rs` — US1 掲載(T022 骨格 → T033 で実装)
 //! - `steps/us2.rs` — US2 発見(T034 骨格 → T044 で実装)
+//! - `steps/us3.rs` — US3 継続性(T045 骨格 → T049 で実装)
+//! - `steps/outbound_only.rs` — 着信不可ノード参加(T051 骨格 → T054 で実装)
 //!
 //! `fail_on_skipped` により、未実装ステップのシナリオは失敗として報告される
 //! (Principle IV — テストファーストの失敗確認)。
@@ -18,6 +20,10 @@ pub(crate) mod mock_peer;
 mod us1;
 #[path = "steps/us2.rs"]
 mod us2;
+#[path = "steps/us3.rs"]
+mod us3;
+#[path = "steps/outbound_only.rs"]
+mod outbound_only;
 
 /// 全フィーチャ共通の World。ストーリー実装時に必要なフィールドを追加する。
 #[derive(Debug, Default, World)]
@@ -26,6 +32,10 @@ pub struct AppWorld {
     us1: Option<us1::Us1World>,
     /// US2(発見)シナリオの状態。各シナリオの Given で初期化する(T044)。
     us2: Option<us2::Us2World>,
+    /// US3(継続性)シナリオの状態。各シナリオの Given で初期化する(T049)。
+    us3: Option<us3::Us3World>,
+    /// 着信不可ノード参加シナリオの状態。各シナリオの Given で初期化する(T054)。
+    outbound: Option<outbound_only::OutboundWorld>,
 }
 
 #[tokio::main]

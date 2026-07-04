@@ -23,12 +23,15 @@ use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::identity::IdentityManager;
 use peca_p2p_yp::p2p::hub::GossipHub;
-use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig};
+use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
+use peca_p2p_yp::p2p::upnp::{self, InboundReachable};
 use peca_p2p_yp::pcp::channel::{AnnouncedChannel, ChannelChange, ChannelRegistry, ChannelState};
 use peca_p2p_yp::security::SecurityLog;
 use peca_p2p_yp::store::Store;
-use peca_p2p_yp::web::announced::{AnnouncedProvider, AnnouncedSummary, NodeStatusProvider};
+use peca_p2p_yp::web::announced::{
+    AnnouncedProvider, AnnouncedSummary, ClockSkewStatus, NodeStatusProvider, clock_skew_status,
+};
 use peca_p2p_yp::web::{AppState, build_router};
 
 /// 鮮度切れ・期限切れイベントの物理回収(sweep)周期。
@@ -124,14 +127,31 @@ async fn run() -> Result<(), i32> {
     };
 
     // 12. P2P ランタイム起動(ハブへ受信処理・SYNC・再伝搬を委譲)。
+    let has_listener = p2p_listener.is_some();
     let runtime = Arc::new(P2pRuntime::new(
         Arc::clone(&peers),
         Arc::clone(&security),
         Arc::clone(&hub),
         nonce,
         listen_port,
+        settings.pex_enabled,
     ));
+    // 全ピア到達不能状態と回復通知の共有ハンドル(status API・回復再発行と共有 — T047/T048)。
+    let reachability = runtime.reachability();
     let mut handles = Arc::clone(&runtime).spawn(p2p_listener, shutdown_rx.clone());
+
+    // 12a. 着信可否の共有状態(UPnP — T053 / FR-016)。待受なしは常に到達不能、
+    //      待受あり + UPnP 無効は直接待受として到達可能、待受あり + UPnP 有効は
+    //      マッピング成功まで到達不能(タスクが更新する)。
+    let inbound_reachable =
+        InboundReachable::new(upnp::decide_initial(has_listener, settings.upnp_enabled));
+    if has_listener && settings.upnp_enabled {
+        let reachable = inbound_reachable.clone();
+        let sd = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            upnp::run(listen_port, reachable, sd).await;
+        }));
+    }
 
     // 13. PCP アナウンス待受(loopback のみ — ADR-0006 決定 4)。
     let registry = ChannelRegistry::new();
@@ -173,7 +193,27 @@ async fn run() -> Result<(), i32> {
             .collect()
     });
     handles.push(Arc::clone(&engine).spawn_republish_loop(snapshot, shutdown_rx.clone()));
-    // 14c. 鮮度切れ・期限切れイベントの物理回収。
+    // 14c. 全断→回復時の即時再発行(US3 シナリオ 3)。周期再発行(60 秒)を待たず、
+    //      いずれかのピアと再確立した瞬間に掲載中チャンネルを再送する。
+    {
+        let recovery_registry = Arc::clone(&registry);
+        let recovery_snapshot: Arc<dyn Fn() -> Vec<ChannelListing> + Send + Sync> =
+            Arc::new(move || {
+                recovery_registry
+                    .snapshot()
+                    .iter()
+                    .filter(|c| c.state != ChannelState::Ended)
+                    .map(AnnouncedChannel::to_listing)
+                    .collect()
+            });
+        handles.push(spawn_recovery_republish(
+            Arc::clone(&reachability),
+            Arc::clone(&engine),
+            recovery_snapshot,
+            shutdown_rx.clone(),
+        ));
+    }
+    // 14d. 鮮度切れ・期限切れイベントの物理回収。
     handles.push(spawn_sweep_loop(Arc::clone(&hub), shutdown_rx.clone()));
 
     // 15. Web 起動(一覧・ペルソナ・掲載状態の供給元を注入)。
@@ -186,7 +226,10 @@ async fn run() -> Result<(), i32> {
         }))
         .with_node_status(Arc::new(StatusAdapter {
             hub: Arc::clone(&hub),
+            reachability: Arc::clone(&reachability),
+            inbound_reachable: inbound_reachable.clone(),
             pcp_listening: true,
+            max_clock_skew_sec: settings.max_clock_skew_sec as i64,
         }));
     let app = build_router(state);
     let http_listener = TcpListener::bind(http_addr).await.map_err(|_| {
@@ -293,10 +336,15 @@ impl AnnouncedProvider for AnnouncedAdapter {
     }
 }
 
-/// gossip ハブ → 全体状態 API(T031 基本形)の供給元。
+/// gossip ハブ + 到達性状態 → 全体状態 API(T031 基本形 + T048 拡張)の供給元。
 struct StatusAdapter {
     hub: Arc<GossipHub>,
+    reachability: Arc<ReachabilityState>,
+    /// 着信可否の共有状態(UPnP マッピング成否・直接待受 — T053)。
+    inbound_reachable: InboundReachable,
     pcp_listening: bool,
+    /// 時計ずれ警告のしきい値(受信検証と一致 — data-model §Settings)。
+    max_clock_skew_sec: i64,
 }
 
 impl NodeStatusProvider for StatusAdapter {
@@ -305,6 +353,15 @@ impl NodeStatusProvider for StatusAdapter {
     }
     fn established(&self) -> (usize, usize) {
         self.hub.established_counts()
+    }
+    fn all_peers_unreachable(&self) -> bool {
+        self.reachability.is_all_unreachable()
+    }
+    fn clock_skew(&self) -> ClockSkewStatus {
+        clock_skew_status(&self.hub.clock_skew_samples(), self.max_clock_skew_sec)
+    }
+    fn inbound_reachable(&self) -> bool {
+        self.inbound_reachable.get()
     }
 }
 
@@ -333,6 +390,35 @@ fn spawn_publish_bridge(
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
+            }
+        }
+    })
+}
+
+/// 全断→回復時に掲載中チャンネルを即時再発行するタスク(US3 シナリオ 3 — T047)。
+///
+/// [`ReachabilityState::recovered`] は全ピア到達不能からいずれかのピアと再確立した
+/// ときに解ける。回復のたびに現在の掲載中スナップショットを再発行する。
+fn spawn_recovery_republish(
+    reachability: Arc<ReachabilityState>,
+    engine: Arc<PublishEngine>,
+    snapshot: Arc<dyn Fn() -> Vec<ChannelListing> + Send + Sync>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = reachability.recovered() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    for listing in snapshot() {
+                        if let Err(e) = engine.publish_listing(&listing) {
+                            tracing::debug!(target: "publish", "回復時の再発行に失敗しました: {e}");
+                        }
+                    }
+                }
             }
         }
     })

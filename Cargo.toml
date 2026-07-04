@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = "0.8.9"
 encoding_rs = "0.8.35"
-igd-next = "0.17.1"
+igd-next = { version = "0.17.1", features = ["aio_tokio"] }
 nostr = "0.44.4"
 rand = "0.9"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
@@ -39,6 +39,10 @@ name = "gossip_frames"
 path = "tests/contract/gossip_frames.rs"
 
 [[test]]
+name = "pex"
+path = "tests/contract/pex.rs"
+
+[[test]]
 name = "local_api"
 path = "tests/contract/local_api.rs"
 
@@ -65,3 +69,11 @@ path = "tests/integration/announce_flow.rs"
 [[test]]
 name = "discover_flow"
 path = "tests/integration/discover_flow.rs"
+
+[[test]]
+name = "resilience"
+path = "tests/integration/resilience.rs"
+
+[[test]]
+name = "outbound_only"
+path = "tests/integration/outbound_only.rs"

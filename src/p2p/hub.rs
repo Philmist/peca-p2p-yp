@@ -46,6 +46,11 @@ struct PeerLink {
     addr: String,
     direction: Direction,
     tx: UnboundedSender<Message>,
+    /// 接続確立時に観測した相手の時計ずれ(相手申告 `ts` − 自ノード時刻、秒)。
+    ///
+    /// 未検証の申告値であり、時計ずれ自己診断(T048)にのみ用いる。イベント検証・
+    /// 接続可否には使わない(MUST NOT — Principle II / contracts §メッセージ種別)。
+    clock_skew_sec: i64,
 }
 
 /// 署名済みイベントを `EVENT` メッセージへ包む。
@@ -135,13 +140,24 @@ impl GossipHub {
     }
 
     /// established 接続の送信口を登録する。
-    pub fn register_peer(&self, conn_id: u64, addr: &str, direction: Direction, tx: UnboundedSender<Message>) {
+    ///
+    /// `clock_skew_sec` は接続確立時に観測した相手の時計ずれ(相手申告 `ts` − 自ノード時刻)。
+    /// 時計ずれ自己診断(T048)にのみ用いる未検証値。
+    pub fn register_peer(
+        &self,
+        conn_id: u64,
+        addr: &str,
+        direction: Direction,
+        tx: UnboundedSender<Message>,
+        clock_skew_sec: i64,
+    ) {
         lock(&self.peers).insert(
             conn_id,
             PeerLink {
                 addr: addr.to_string(),
                 direction,
                 tx,
+                clock_skew_sec,
             },
         );
     }
@@ -154,6 +170,13 @@ impl GossipHub {
     /// established 接続の相手アドレス一覧(status 表示・診断用。順序は不定)。
     pub fn established_addrs(&self) -> Vec<String> {
         lock(&self.peers).values().map(|l| l.addr.clone()).collect()
+    }
+
+    /// established 各ピアの時計ずれ標本(秒)。時計ずれ自己診断(T048)の中央値算出に使う。
+    ///
+    /// 相手申告 `ts` に基づく未検証値であり、通知のみに用いる(MUST NOT 検証・接続判断)。
+    pub fn clock_skew_samples(&self) -> Vec<i64> {
+        lock(&self.peers).values().map(|l| l.clock_skew_sec).collect()
     }
 
     /// established 接続数 `(inbound, outbound)`(T031 status API 用)。
@@ -324,8 +347,8 @@ mod tests {
         // 2 本の established 接続を登録(conn 1 = 受信元、conn 2 = 他ピア)
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        hub.register_peer(1, "peer1:7147", Direction::Inbound, tx1);
-        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2);
+        hub.register_peer(1, "peer1:7147", Direction::Inbound, tx1, 0);
+        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2, 0);
 
         let e = mk(&keys, D1, 1_700_000_050, ChannelStatus::Live, "x");
         hub.on_event(&e.as_json(), "peer1:7147", 1);
@@ -345,7 +368,7 @@ mod tests {
         let hub = hub_at(1_700_000_050);
         let keys = Keys::generate();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2);
+        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2, 0);
 
         let e = mk(&keys, D1, 1_700_000_050, ChannelStatus::Live, "x");
         hub.on_event(&e.as_json(), "peer1:7147", 1);
@@ -361,8 +384,8 @@ mod tests {
         let keys = Keys::generate();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        hub.register_peer(1, "peer1:7147", Direction::Inbound, tx1);
-        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2);
+        hub.register_peer(1, "peer1:7147", Direction::Inbound, tx1, 0);
+        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2, 0);
 
         let e = mk(&keys, D1, 1_700_000_050, ChannelStatus::Live, "x");
         let outcome = hub.publish_local(e);
@@ -378,13 +401,17 @@ mod tests {
         let (tx1, _r1) = mpsc::unbounded_channel();
         let (tx2, _r2) = mpsc::unbounded_channel();
         let (tx3, _r3) = mpsc::unbounded_channel();
-        hub.register_peer(1, "a:1", Direction::Inbound, tx1);
-        hub.register_peer(2, "b:1", Direction::Outbound, tx2);
-        hub.register_peer(3, "c:1", Direction::Outbound, tx3);
+        hub.register_peer(1, "a:1", Direction::Inbound, tx1, -2);
+        hub.register_peer(2, "b:1", Direction::Outbound, tx2, 5);
+        hub.register_peer(3, "c:1", Direction::Outbound, tx3, 400);
         assert_eq!(hub.established_counts(), (1, 2));
         let mut addrs = hub.established_addrs();
         addrs.sort();
         assert_eq!(addrs, vec!["a:1", "b:1", "c:1"]);
+        // 時計ずれ標本は登録した各ピアの値を返す(順不同)。
+        let mut skews = hub.clock_skew_samples();
+        skews.sort();
+        assert_eq!(skews, vec![-2, 5, 400]);
         hub.unregister_peer(2);
         assert_eq!(hub.established_counts(), (1, 1));
     }
@@ -394,7 +421,7 @@ mod tests {
         let hub = hub_at(1_700_000_050);
         let keys = Keys::generate();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2);
+        hub.register_peer(2, "peer2:7147", Direction::Outbound, tx2, 0);
         let e = mk(&keys, D1, 1_700_000_050, ChannelStatus::Live, "x");
         let tampered = e.as_json().replace("\"content\":\"\"", "\"content\":\"x\"");
         hub.on_event(&tampered, "peer1:7147", 1);

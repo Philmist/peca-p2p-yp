@@ -103,6 +103,7 @@ impl AnnouncerNode {
             Arc::clone(&hub),
             nonce,
             listen_port,
+            true, // PEX 有効
         ));
         let (sd_tx, sd_rx) = watch::channel(false);
         let mut handles = runtime.spawn(p2p_listener, sd_rx.clone());

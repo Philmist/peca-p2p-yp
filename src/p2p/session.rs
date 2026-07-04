@@ -28,6 +28,11 @@ pub const DEFAULT_MAX_BYTES_PER_SEC: usize = 256 * 1024;
 /// 受信レート上限(検査 2): 1 ピアあたり 200 メッセージ/秒。
 pub const DEFAULT_MAX_MSGS_PER_SEC: usize = 200;
 
+/// keepalive の PING 送信間隔(秒 — contracts/p2p-gossip.md §トランスポート)。
+pub const KEEPALIVE_INTERVAL_SECS: f64 = 60.0;
+/// keepalive の無応答切断しきい値(秒 — 120 秒間どのフレームも受信しなければ切断)。
+pub const KEEPALIVE_TIMEOUT_SECS: f64 = 120.0;
+
 /// 接続方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -184,6 +189,70 @@ impl RateLimiter {
     }
 }
 
+/// keepalive の判定([`Keepalive::poll`] が返す動作)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveAction {
+    /// 何もしない。
+    Idle,
+    /// PING を送信すべき(established 時のみ意味を持つ)。
+    SendPing,
+    /// 無応答しきい値を超過した — 切断すべき。
+    Timeout,
+}
+
+/// keepalive のタイミング判定(T046)。
+///
+/// トランスポート非依存で、注入クロック(単調秒)に対して純粋に判定する。
+/// 「何らかのフレームの受信」を生存の証拠とし([`Keepalive::on_recv`])、
+/// established 中はタイマー tick ごとに [`Keepalive::poll`] を呼んで
+/// PING 送信・無応答切断を決める。相手からの PONG も EVENT も PING も、
+/// すべて受信は生存の証拠として扱う(型を問わない)。
+#[derive(Debug, Clone)]
+pub struct Keepalive {
+    interval: f64,
+    timeout: f64,
+    last_recv: f64,
+    last_ping: f64,
+}
+
+impl Keepalive {
+    /// 既定のしきい値(60 秒間隔・120 秒タイムアウト)で作る。
+    pub fn new(now: f64) -> Self {
+        Self::with_params(KEEPALIVE_INTERVAL_SECS, KEEPALIVE_TIMEOUT_SECS, now)
+    }
+
+    /// しきい値を指定して作る(テスト用)。
+    pub fn with_params(interval: f64, timeout: f64, now: f64) -> Self {
+        Self {
+            interval,
+            timeout,
+            last_recv: now,
+            last_ping: now,
+        }
+    }
+
+    /// フレームを受信した(生存の証拠)。無応答タイマーをリセットする。
+    pub fn on_recv(&mut self, now: f64) {
+        self.last_recv = now;
+    }
+
+    /// タイマー tick で呼ぶ。無応答超過なら [`KeepaliveAction::Timeout`]、
+    /// PING 間隔を過ぎていれば [`KeepaliveAction::SendPing`](送信時刻を更新)。
+    ///
+    /// タイムアウト判定を PING 送信より先に評価する(既に切断すべき接続へ
+    /// PING を送らない)。
+    pub fn poll(&mut self, now: f64) -> KeepaliveAction {
+        if now - self.last_recv >= self.timeout {
+            return KeepaliveAction::Timeout;
+        }
+        if now - self.last_ping >= self.interval {
+            self.last_ping = now;
+            return KeepaliveAction::SendPing;
+        }
+        KeepaliveAction::Idle
+    }
+}
+
 /// gossip セッションの状態機械。
 ///
 /// トランスポートは持たず、受信済みフレーム([`Message`] + ワイヤバイト数)を
@@ -333,6 +402,14 @@ impl Session {
                 self.accept_peer_hello(hello)?;
                 self.state = SessionState::Established;
                 Ok(vec![SessionAction::Established])
+            }
+            // CLOSE はハンドシェイク中も正常切断として扱う。バージョン非互換
+            // (`incompatible`)・自己接続(`self_connect`)・着信上限(`going_away`)で
+            // 相手が HELLO_ACK 前に送る契約上の正当フローのため、セキュリティ
+            // イベントにしない(reason は上位へ通知 — 自己接続の学習に使う)。
+            (_, Message::Close { reason }) => {
+                self.state = SessionState::Closed;
+                Ok(vec![SessionAction::PeerClosed(reason)])
             }
             // 方向違反(outbound が HELLO、inbound が HELLO_ACK)を含め、
             // established 前の他メッセージはすべて順序違反として即切断。
@@ -498,6 +575,28 @@ mod tests {
     }
 
     #[test]
+    fn handshake_close_is_benign_peer_closed() {
+        // バージョン非互換等で相手が HELLO_ACK 前に送る CLOSE は正常切断
+        // (セキュリティイベントにしない)。
+        let mut s = Session::new_outbound(cfg(1), "p:12".into(), None);
+        s.start();
+        let actions = s
+            .on_frame(
+                16,
+                Message::Close {
+                    reason: close_reason::SELF_CONNECT.into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, SessionAction::PeerClosed(r) if r == close_reason::SELF_CONNECT)
+            )
+        );
+        assert_eq!(s.state(), SessionState::Closed);
+    }
+
+    #[test]
     fn established_delivers_and_closes() {
         let mut s = Session::new_inbound(cfg(1), "p:8".into(), None);
         s.on_frame(64, hello(1, 3)).unwrap();
@@ -565,6 +664,41 @@ mod tests {
         for i in 0..150u64 {
             s.on_frame(16, Message::Ping { nonce: i }).unwrap();
         }
+    }
+
+    // ---- keepalive(T046) ----
+
+    #[test]
+    fn keepalive_sends_ping_after_interval() {
+        let mut k = Keepalive::with_params(60.0, 120.0, 0.0);
+        // 間隔未満は Idle。
+        assert_eq!(k.poll(59.0), KeepaliveAction::Idle);
+        // 60 秒到達で PING。
+        assert_eq!(k.poll(60.0), KeepaliveAction::SendPing);
+        // PONG 等の受信で生存確認(無応答タイマーをリセット)。
+        k.on_recv(60.0);
+        // 直後は再送しない。
+        assert_eq!(k.poll(61.0), KeepaliveAction::Idle);
+        // 次の間隔で再び PING(受信済みのためタイムアウトはしない)。
+        assert_eq!(k.poll(120.0), KeepaliveAction::SendPing);
+    }
+
+    #[test]
+    fn keepalive_times_out_without_recv() {
+        let mut k = Keepalive::with_params(60.0, 120.0, 0.0);
+        // 120 秒どのフレームも受信しなければ Timeout(PING より優先)。
+        assert_eq!(k.poll(120.0), KeepaliveAction::Timeout);
+    }
+
+    #[test]
+    fn keepalive_recv_resets_timeout() {
+        let mut k = Keepalive::with_params(60.0, 120.0, 0.0);
+        // 100 秒時点でフレーム受信 → 無応答タイマーがリセットされる。
+        k.on_recv(100.0);
+        // 100+119 = 219 まではタイムアウトしない。
+        assert_ne!(k.poll(219.0), KeepaliveAction::Timeout);
+        // 100+120 = 220 でタイムアウト。
+        assert_eq!(k.poll(220.0), KeepaliveAction::Timeout);
     }
 
     #[test]

@@ -27,12 +27,13 @@ use tokio::task::JoinHandle;
 use peca_p2p_yp::event::schema::VerifyConfig;
 use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::event::view::DiscoveredChannel;
-use peca_p2p_yp::p2p::frame::{read_frame, write_frame, Hello, Message};
+use peca_p2p_yp::p2p::frame::{Hello, Message, read_frame, write_frame};
 use peca_p2p_yp::p2p::hub::GossipHub;
-use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig};
+use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
+use peca_p2p_yp::p2p::upnp::{self, InboundReachable};
 use peca_p2p_yp::security::SecurityLog;
-use peca_p2p_yp::store::{PeerSource, Store};
+use peca_p2p_yp::store::{PeerEndpoint, PeerSource, Store};
 
 /// mock の固定 HELLO nonce(実ノードの nonce と衝突しない値 — 自己接続と誤検出させない)。
 pub const MOCK_NONCE: u64 = 0x00CD_EFAB_1234_5678;
@@ -76,6 +77,8 @@ struct Shared {
     push_tx: broadcast::Sender<Value>,
     /// 自ノードの待受ポート(HELLO で申告)。
     listen_port: u16,
+    /// GET_PEERS 応答で返すアドレス列(PEX 検証用)。
+    pex_peers: Arc<Mutex<Vec<String>>>,
 }
 
 /// 契約参照実装としてのモックピア(TCP でダイヤルを受ける)。
@@ -98,6 +101,7 @@ impl MockPeer {
             received: Arc::new(Mutex::new(Vec::new())),
             push_tx,
             listen_port: port,
+            pex_peers: Arc::new(Mutex::new(Vec::new())),
         };
         let (sd_tx, sd_rx) = watch::channel(false);
         let accept = {
@@ -129,12 +133,20 @@ impl MockPeer {
 
     /// 接続中ノードへ非請求 EVENT を即時送出する(署名済み)。
     pub fn push_signed(&self, event: &Event) {
-        let _ = self.shared.push_tx.send(serde_json::to_value(event).unwrap());
+        let _ = self
+            .shared
+            .push_tx
+            .send(serde_json::to_value(event).unwrap());
     }
 
     /// これまでに受信した EVENT(生 JSON 値)。
     pub fn received(&self) -> Vec<Value> {
         self.shared.received.lock().unwrap().clone()
+    }
+
+    /// GET_PEERS 応答で返すアドレスを追加する(PEX 検証用)。
+    pub fn share_peer(&self, addr: &str) {
+        self.shared.pex_peers.lock().unwrap().push(addr.to_string());
     }
 }
 
@@ -233,8 +245,15 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
                             break;
                         }
                     }
+                    Message::GetPeers => {
+                        // 設定された PEX 候補を PEERS で返す(未設定なら空)。
+                        let peers = shared.pex_peers.lock().unwrap().clone();
+                        if write_frame(&mut writer, &Message::Peers { peers }).await.is_err() {
+                            break;
+                        }
+                    }
                     Message::Close { .. } => break,
-                    // SYNC_DONE・PONG・PEERS・GET_PEERS などは無視(前方互換)。
+                    // SYNC_DONE・PONG・PEERS などは無視(前方互換)。
                     _ => {}
                 }
             }
@@ -254,6 +273,11 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
 pub struct TestNode {
     hub: Arc<GossipHub>,
     peers: Arc<PeerManager>,
+    reachability: Arc<ReachabilityState>,
+    /// 着信可否の共有状態(main.rs と同じ配線 — 待受なしノードは常に不可)。
+    inbound: InboundReachable,
+    /// P2P 待受アドレス(待受ありノードのみ)。
+    listen_addr: Option<String>,
     shutdown: watch::Sender<bool>,
     _handles: Vec<JoinHandle<()>>,
     _dir: tempfile::TempDir,
@@ -262,6 +286,18 @@ pub struct TestNode {
 impl TestNode {
     /// 外向きのみのノードを起動する(nonce は自己接続回避のため引数指定)。
     pub async fn spawn(nonce: u64) -> TestNode {
+        Self::spawn_inner(nonce, false).await
+    }
+
+    /// P2P 待受ありの実ノードを起動する(複数実ノードのトポロジ構成用 — T049)。
+    ///
+    /// 待受アドレスは [`listen_addr`](TestNode::listen_addr) で得られ、他ノードの
+    /// [`add_manual_peer`](TestNode::add_manual_peer) に渡してメッシュ/チェーンを組む。
+    pub async fn spawn_listening(nonce: u64) -> TestNode {
+        Self::spawn_inner(nonce, true).await
+    }
+
+    async fn spawn_inner(nonce: u64, listening: bool) -> TestNode {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let peers = Arc::new(PeerManager::new(
             Arc::clone(&store),
@@ -275,28 +311,54 @@ impl TestNode {
             StoreConfig::default(),
             VerifyConfig::default(),
         );
+        // 待受ありなら 127.0.0.1 の任意ポートへバインドする。
+        let (listener, listen_port, listen_addr) = if listening {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("p2p bind");
+            let addr = l.local_addr().unwrap();
+            (Some(l), addr.port(), Some(addr.to_string()))
+        } else {
+            (None, 0, None)
+        };
         let runtime = Arc::new(P2pRuntime::new(
             Arc::clone(&peers),
             security,
             Arc::clone(&hub),
             nonce,
-            0, // 待受なし(外向きのみ)
+            listen_port,
+            true, // PEX 有効
         ));
+        let reachability = runtime.reachability();
         let (sd_tx, sd_rx) = watch::channel(false);
-        // 待受なし(listener = None)で外向き維持ループのみ起動する。
-        let handles = runtime.spawn(None, sd_rx);
+        let handles = runtime.spawn(listener, sd_rx);
+        // 着信可否は main.rs と同じ初期化(待受なし → 常に不可)。
+        let inbound = InboundReachable::new(upnp::decide_initial(listening, true));
         TestNode {
             hub,
             peers,
+            reachability,
+            inbound,
+            listen_addr,
             shutdown: sd_tx,
             _handles: handles,
             _dir: dir,
         }
     }
 
+    /// P2P 待受アドレス(`127.0.0.1:PORT` — [`spawn_listening`](TestNode::spawn_listening) 時のみ)。
+    pub fn listen_addr(&self) -> &str {
+        self.listen_addr.as_deref().expect("待受ありノードのみ")
+    }
+
+    /// 全ピア到達不能状態と回復通知の共有ハンドル(US3 障害耐性テスト用)。
+    pub fn reachability(&self) -> Arc<ReachabilityState> {
+        Arc::clone(&self.reachability)
+    }
+
     /// モックピアを手動ピアとして登録する(外向き接続の候補になる)。
     pub fn add_manual_peer(&self, addr: &str) {
-        self.peers.add_peer(addr, PeerSource::Manual).expect("手動ピア登録");
+        self.peers
+            .add_peer(addr, PeerSource::Manual)
+            .expect("手動ピア登録");
     }
 
     /// 現在の一覧スナップショット。
@@ -309,6 +371,33 @@ impl TestNode {
         self.hub.established_counts()
     }
 
+    /// 既知ピア一覧(PEX で獲得した候補の確認用)。
+    pub fn known_peers(&self) -> Vec<PeerEndpoint> {
+        self.peers.list_peers().unwrap_or_default()
+    }
+
+    /// 指定アドレスが既知ピアに現れるまで最大 `timeout` 待つ(PEX 候補登録の確認用)。
+    pub async fn wait_for_peer(&self, addr: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.known_peers().iter().any(|p| p.addr == addr) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 着信可否(外向きのみノードは常に `false` = 「外向き接続のみで参加中」)。
+    ///
+    /// main.rs と同じ [`InboundReachable`] 共有状態を経由して読む(待受なしのため
+    /// [`upnp::decide_initial`] の初期値 `false` のまま)。
+    pub fn inbound_reachable(&self) -> bool {
+        self.inbound.get()
+    }
+
     /// 共有ハブ(ローカル発行など細かな操作をテストから行う場合)。
     pub fn hub(&self) -> &Arc<GossipHub> {
         &self.hub
@@ -316,8 +405,10 @@ impl TestNode {
 
     /// 指定 `channel_id` が一覧に現れるまで最大 `timeout` 待つ(現れれば `true`)。
     pub async fn wait_for_channel(&self, channel_id: &str, timeout: Duration) -> bool {
-        self.wait_until(timeout, |rows| rows.iter().any(|c| c.channel_id == channel_id))
-            .await
+        self.wait_until(timeout, |rows| {
+            rows.iter().any(|c| c.channel_id == channel_id)
+        })
+        .await
     }
 
     /// 一覧が述語を満たすまで最大 `timeout` ポーリングする。
