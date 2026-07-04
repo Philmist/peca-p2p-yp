@@ -457,10 +457,19 @@ fn resolve_data_dir(overrides: &CliOverrides) -> Result<PathBuf, i32> {
     }
 }
 
-/// tracing のコンソール出力を初期化する(INFO 以上)。
+/// tracing のコンソール出力を初期化する。既定は INFO で、`RUST_LOG` は
+/// **INFO への追加指定**として重ねる(例: `RUST_LOG=pcp=debug` で通常ログ +
+/// PCP セッションのデバッグ出力。素の EnvFilter と違い既定ログは消えない)。
 fn init_tracing() {
+    let extra = std::env::var("RUST_LOG").unwrap_or_default();
+    let directives = if extra.is_empty() {
+        "info".to_string()
+    } else {
+        format!("info,{extra}")
+    };
+    let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(&directives);
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(filter)
         .with_target(false)
         .init();
 }

@@ -184,9 +184,9 @@ async fn index_txt_reflects_discovered_channel() {
         text.contains("198.51.100.1:7144"),
         "index.txt にトラッカー接続先(TIP)が含まれる: {text:?}"
     );
-    // 18 フィールド(`<>` 区切り 17 個)である。
+    // 19 フィールド(`<>` 区切り 18 個)である(実運用 YP 準拠 — contracts/http-yp.md)。
     let first_line = text.lines().next().expect("少なくとも 1 行");
-    assert_eq!(first_line.split("<>").count(), 18, "18 フィールド構成");
+    assert_eq!(first_line.split("<>").count(), 19, "19 フィールド構成");
 }
 
 // ---------------------------------------------------------------------------

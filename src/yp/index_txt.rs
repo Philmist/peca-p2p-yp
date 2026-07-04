@@ -1,21 +1,22 @@
-//! index.txt 生成(T042 — contracts/http-yp.md)
+//! index.txt 生成(T042 — contracts/http-yp.md、2026-07-04 実機 YP 検証で改訂)
 //!
-//! 18 フィールド(`<>` 区切り 17 個)のテキストを生成し、指定エンコーディングのバイト列で返す。
+//! 19 フィールド(`<>` 区切り 18 個)のテキストを生成し、指定エンコーディングのバイト列で返す。
 //! HTTP 配信ルート(GET/HEAD `/index.txt`)もここに含む。
 //!
-//! ## サニタイズ順序(contracts/http-yp.md §サニタイズ順序)
-//!   1. フィールド値から区切り列 `<>` を除去
-//!   2. エンコーディング変換で変換不能文字を `?` に置換
+//! ## サニタイズ(contracts/http-yp.md §サニタイズ)
+//! - 全文字列フィールド: `<`/`>` を `&lt;`/`&gt;` へエスケープ(index.txt 仕様 —
+//!   kumaryu/peercaststation wiki。`&` はエスケープしない。エスケープ後は値中に
+//!   `<>` 区切り列が現れない)
+//! - エンコーディング変換で変換不能文字を `?` に置換(`?` は区切りと衝突しない)
 //!
-//! この順序により `?` が `<>` 区切りを破壊しない。
-//!
-//! ## フィールドレイアウト(18 フィールド・区切り 17 個)
+//! ## フィールドレイアウト(19 フィールド・区切り 18 個 — 実運用 YP の index.txt 準拠)
 //! ```text
 //! CHANNEL_NAME<>ID<>TIP<>CONTACT_URL<>GENRE<>DETAIL<>LISTENER_NUM<>RELAY_NUM
 //! <>BITRATE<>TYPE<>TRACK_ARTIST<>TRACK_ALBUM<>TRACK_TITLE<>TRACK_CONTACT_URL
-//! <><>BROADCAST_TIME<><>COMMENT
+//! <>NAME_ENCODED<>BROADCAST_TIME<>click<>COMMENT<>DIRECT
 //! ```
-//! フィールド 15・17 は位置互換の予約で常に空。
+//! - NAME_ENCODED: チャンネル名の percent エンコード(出力エンコーディングのバイト列基準)
+//! - 17 番目は固定文字列 `click`、DIRECT は固定 `0`
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -46,7 +47,7 @@ pub fn generate(channels: &[DiscoveredChannel], encoding: IndexEncoding, now: u6
     }
     let mut text = String::new();
     for ch in channels {
-        text.push_str(&channel_line(ch, now));
+        text.push_str(&channel_line(ch, now, encoding));
         text.push('\n');
     }
     match encoding {
@@ -55,8 +56,8 @@ pub fn generate(channels: &[DiscoveredChannel], encoding: IndexEncoding, now: u6
     }
 }
 
-/// 1 チャンネル分の行(18 フィールド、`<>` 区切り 17 個)を生成する。
-fn channel_line(ch: &DiscoveredChannel, now: u64) -> String {
+/// 1 チャンネル分の行(19 フィールド、`<>` 区切り 18 個)を生成する。
+fn channel_line(ch: &DiscoveredChannel, now: u64, encoding: IndexEncoding) -> String {
     let l = &ch.listing;
 
     // フィールド 1: CHANNEL_NAME
@@ -65,7 +66,7 @@ fn channel_line(ch: &DiscoveredChannel, now: u64) -> String {
     let id = ch.channel_id.to_uppercase();
     // フィールド 3: TIP — firewalled は空文字列
     let tip = sanitize(l.tip.as_deref().unwrap_or(""));
-    // フィールド 4: CONTACT_URL
+    // フィールド 4: CONTACT_URL — URL とは限らない任意文字列(wiki 仕様)。エスケープのみ
     let contact = sanitize(l.contact.as_deref().unwrap_or(""));
     // フィールド 5: GENRE
     let genre = sanitize(l.genre.as_deref().unwrap_or(""));
@@ -94,22 +95,47 @@ fn channel_line(ch: &DiscoveredChannel, now: u64) -> String {
             String::new(),
         ),
     };
-    // フィールド 15: 予約(常に空)
+    // フィールド 15: NAME_ENCODED — チャンネル名(生値)の percent エンコード
+    let name_encoded = percent_encode_name(&l.title, encoding);
     // フィールド 16: BROADCAST_TIME
     let broadcast_time = format_broadcast_time(now, l.starts);
-    // フィールド 17: 予約(常に空)
+    // フィールド 17: 固定文字列 `click`
     // フィールド 18: COMMENT — v1 は常に空
+    // フィールド 19: DIRECT — 固定 `0`(直接再生の提供なし)
 
     format!(
-        "{name}<>{id}<>{tip}<>{contact}<>{genre}<>{detail}<>{listener_num}<>{relay_num}<>{bitrate}<>{content_type}<>{track_artist}<>{track_album}<>{track_title}<>{track_contact_url}<><>{broadcast_time}<><>"
+        "{name}<>{id}<>{tip}<>{contact}<>{genre}<>{detail}<>{listener_num}<>{relay_num}<>{bitrate}<>{content_type}<>{track_artist}<>{track_album}<>{track_title}<>{track_contact_url}<>{name_encoded}<>{broadcast_time}<>click<><>0"
     )
 }
 
-/// フィールド値から区切り列 `<>` を除去する(サニタイズ手順 1)。
-///
-/// Shift_JIS 変換不能文字の `?` 置換はエンコーディング変換時に行う(手順 2)。
+/// フィールド値のサニタイズ: `<`/`>` を `&lt;`/`&gt;` へエスケープする
+/// (index.txt 仕様 — kumaryu/peercaststation wiki「index.txtの仕様」。
+/// 仕様上エスケープ対象は `<`/`>` のみで `&` は触らない。全文字列フィールド共通。
+/// エスケープ後は値中に `<>` 区切り列が現れない)。
 fn sanitize(s: &str) -> String {
-    s.replace("<>", "")
+    s.replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// チャンネル名を percent エンコードする(NAME_ENCODED フィールド)。
+///
+/// 出力エンコーディングのバイト列を基準にエンコードする(実運用 YP と同じ形:
+/// UTF-8 なら `%E3%83%86…`、Shift_JIS なら `%83e%83X…` の古典形)。
+/// 非予約文字(英数字と `-`/`_`/`.`/`~`)はそのまま、それ以外は `%XX`(大文字 hex)。
+fn percent_encode_name(name: &str, encoding: IndexEncoding) -> String {
+    let bytes = match encoding {
+        IndexEncoding::Utf8 => name.as_bytes().to_vec(),
+        IndexEncoding::ShiftJis => encode_shift_jis(name),
+    };
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for b in bytes {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// BROADCAST_TIME を `H:MM` 形式にフォーマットする。
@@ -193,10 +219,10 @@ async fn handler(State(state): State<AppState>, req: Request<Body>) -> Response 
     // ここでは明示的に扱う)
     let is_head = *req.method() == Method::HEAD;
 
-    // エンコーディング設定を読み込む(失敗時は Shift_JIS にフォールバック)
+    // エンコーディング設定を読み込む(失敗時は既定の UTF-8 にフォールバック)
     let encoding = Settings::load(&state.store)
         .and_then(|s| s.index_encoding())
-        .unwrap_or(IndexEncoding::ShiftJis);
+        .unwrap_or(IndexEncoding::Utf8);
 
     // チャンネル一覧を取得(directory が未配線なら空一覧)
     let channels = state
@@ -272,10 +298,31 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_removes_delimiter() {
-        assert_eq!(sanitize("foo<>bar"), "foobar");
-        assert_eq!(sanitize("a<>b<>c"), "abc");
+    fn sanitize_escapes_lt_gt_only() {
+        assert_eq!(sanitize("foo<>bar"), "foo&lt;&gt;bar");
+        // wiki 仕様: エスケープ対象は `<`/`>` のみ。`&` は触らない
+        assert_eq!(sanitize("A&B"), "A&B");
+        assert_eq!(
+            sanitize("http://e.com/?a=1&b=2"),
+            "http://e.com/?a=1&b=2"
+        );
         assert_eq!(sanitize("no-delim"), "no-delim");
+    }
+
+    #[test]
+    fn percent_encode_matches_real_yp_forms() {
+        // UTF-8 モード: 実運用 YP の %E3%83… 形
+        assert_eq!(
+            percent_encode_name("テスト", IndexEncoding::Utf8),
+            "%E3%83%86%E3%82%B9%E3%83%88"
+        );
+        // Shift_JIS モード: 古典 peercast の %83e%83X%83g 形
+        assert_eq!(
+            percent_encode_name("テスト", IndexEncoding::ShiftJis),
+            "%83e%83X%83g"
+        );
+        // 非予約文字はそのまま
+        assert_eq!(percent_encode_name("ch-1.x", IndexEncoding::Utf8), "ch-1.x");
     }
 
     #[test]
@@ -287,10 +334,13 @@ mod tests {
     }
 
     #[test]
-    fn field_count_is_18() {
+    fn field_count_is_19() {
         let ch = minimal_channel("aabbccdd00112233445566778899aabb");
-        let line = channel_line(&ch, 3600);
-        assert_eq!(line.split("<>").count(), 18);
+        let line = channel_line(&ch, 3600, IndexEncoding::Utf8);
+        let fields: Vec<&str> = line.split("<>").collect();
+        assert_eq!(fields.len(), 19);
+        assert_eq!(fields[16], "click", "17 番目は固定文字列 click");
+        assert_eq!(fields[18], "0", "19 番目(DIRECT)は固定 0");
     }
 
     #[test]

@@ -5,9 +5,11 @@
 //! 待受サーバの起動エントリ [`serve`] を提供する。
 //!
 //! ## 責務
-//! - HELO(BroadcastID)→ OLEH 応答(gist 準拠の応答 atom + agent 名 `peca-p2p-yp/<semver>`)
+//! - HELO(sid・bcid)→ OLEH 応答(**自ノードの SessionID** + agent 名 `peca-p2p-yp/<semver>`。
+//!   sid のエコーはクライアント側の自己接続判定を誤発火させるため禁止 — 本家 PeerCast 互換)
 //! - BCST 解析(name/gnre/desc/url/bitr/type/titl/crea/albm + PCP_HOST)を [`RawChannelInfo`]
-//!   へ写し、[`ChannelRegistry`] へ upsert
+//!   へ写し、[`ChannelRegistry`] へ upsert。`chan`(情報)と `host`(リスナー数・トラッカー)は
+//!   **別々の BCST** で届きうるためセッション内でマージする(実機 PeerCastStation の挙動)
 //! - 1 セッション内の複数チャンネル(ChannelID 単位、≤ 16。超過は無視+`pcp_reject`)
 //! - 状態機械 announced→updating⇄…→ended。**playing=false / PCP_QUIT / TCP 異常切断**の
 //!   いずれでもチャンネルを即 ended とし、鮮度切れを待たない
@@ -144,8 +146,10 @@ pub struct AnnounceSession {
     source_addr: Option<SocketAddr>,
     state: Handshake,
     broadcast_id: Option<[u8; 16]>,
-    /// このセッションが掲載中の ChannelID → 初回受信時刻(started_at)。
-    channels: HashMap<[u8; 16], u64>,
+    /// このセッションが掲載中の ChannelID → 累積チャンネル情報。
+    /// PeerCastStation はチャンネル情報(`chan`)とホスト情報(`host`)を**別々の
+    /// BCST** で送るため、セッション側で 1 レコードへマージしてから registry へ渡す。
+    channels: HashMap<[u8; 16], RawChannelInfo>,
     rate: RateLimiter,
     clock: Box<dyn Fn() -> u64 + Send>,
 }
@@ -202,10 +206,31 @@ impl AnnounceSession {
         match self.state {
             Handshake::BeforeHelo => {
                 if atom.id().matches("helo") {
-                    let sid = required_guid(&atom, "sid")?;
-                    self.broadcast_id = Some(sid);
+                    tracing::debug!(
+                        target: "pcp",
+                        source = %self.source,
+                        sid = %guid_debug(&atom, "sid"),
+                        bcid = %guid_debug(&atom, "bcid"),
+                        children = %children_debug(&atom),
+                        "PCP_HELO 受信"
+                    );
+                    let sid = required_guid(&atom, "sid", "missing sid atom in helo")?;
+                    // セッション識別は bcid(BroadcastID)を優先する。HELO の sid は
+                    // 接続ごとの SessionID であり配信者の識別子ではない(bcid を
+                    // 送らないクライアントは sid で代用)。
+                    let bcid = atom
+                        .find("bcid")
+                        .and_then(Atom::payload)
+                        .filter(|p| p.len() == 16)
+                        .map(|p| {
+                            let mut g = [0u8; 16];
+                            g.copy_from_slice(p);
+                            g
+                        })
+                        .unwrap_or(sid);
+                    self.broadcast_id = Some(bcid);
                     self.state = Handshake::Established;
-                    Ok(vec![AnnounceAction::Send(self.build_oleh(&sid))])
+                    Ok(vec![AnnounceAction::Send(self.build_oleh(&atom))])
                 } else {
                     // HELO 前のその他 atom は無視(切断しない)。
                     tracing::debug!(target: "pcp", atom = %atom.id().name(), "HELO 前の atom を無視");
@@ -229,26 +254,51 @@ impl AnnounceSession {
     }
 
     /// BCST を解析してチャンネルを登録/更新/終了する。
+    ///
+    /// 実 PCP(PeerCastStation、2026-07-04 実機検証)は 1 チャンネルにつき
+    /// **`chan`(チャンネル情報)と `host`(リスナー数・トラッカー)を別々の BCST**
+    /// で送るため、どちらか一方だけの BCST は [`Self::channels`] の累積レコードへ
+    /// マージしてから upsert する。ChannelID の所在も実 PCP 準拠:
+    /// `chan` 直下は **`id`**、`bcst` 直下と `host` 内は `cid`。
     fn handle_bcst(&mut self, atom: &Atom) -> Result<Vec<AnnounceAction>, PcpDisconnect> {
-        let Some(chan) = atom.find("chan") else {
+        let chan = atom.find("chan");
+        // host は bcst 直下(実 PCP のホスト通知)または chan 内(単一 BCST に
+        // まとめるクライアント)のどちらでも受ける。
+        let host = chan
+            .and_then(|c| c.find("host"))
+            .or_else(|| atom.find("host"));
+        if chan.is_none() && host.is_none() {
             // チャンネル情報を伴わない BCST は無視する。
             return Ok(vec![]);
-        };
-        let cid = required_guid(chan, "cid")?;
+        }
+        tracing::debug!(
+            target: "pcp",
+            source = %self.source,
+            bcst = %children_debug(atom),
+            chan = %chan.map(children_debug).unwrap_or_default(),
+            host = %host.map(children_debug).unwrap_or_default(),
+            "PCP_BCST 受信"
+        );
 
-        let host = chan.find("host");
+        let cid_atom = chan
+            .and_then(|c| c.find("id"))
+            .or_else(|| atom.find("cid"))
+            .or_else(|| host.and_then(|h| h.find("cid")));
+        let Some(payload) = cid_atom.and_then(Atom::payload) else {
+            return Err(PcpDisconnect::reject("missing channel id in bcst"));
+        };
+        if payload.len() != 16 {
+            return Err(PcpDisconnect::reject("invalid guid length"));
+        }
+        let mut cid = [0u8; 16];
+        cid.copy_from_slice(payload);
+
+        // playing 判定は host を伴う BCST でのみ行う(chan のみの BCST は情報更新)。
         let flg1 = host
             .and_then(|h| h.find("flg1"))
             .and_then(Atom::as_i32)
             .unwrap_or(0) as u8;
-        // host が無ければ playing とみなす(announce。tracker 不明)。
-        let playing = match host {
-            Some(_) => flg1 & FLG1_RECV != 0,
-            None => true,
-        };
-        let firewalled = flg1 & FLG1_PUSH != 0;
-
-        if !playing {
+        if host.is_some() && flg1 & FLG1_RECV == 0 {
             // playing=false → その ChannelID のみ ended。
             if self.channels.remove(&cid).is_some() {
                 self.registry.end(&cid);
@@ -268,39 +318,54 @@ impl AnnounceSession {
         }
 
         let now = (self.clock)();
-        let started_at = *self.channels.entry(cid).or_insert(now);
+        let entry = self.channels.entry(cid).or_insert_with(|| RawChannelInfo {
+            channel_id: cid,
+            name: String::new(),
+            genre: String::new(),
+            description: String::new(),
+            contact_url: String::new(),
+            bitrate: 0,
+            content_type: String::new(),
+            track_title: String::new(),
+            track_creator: String::new(),
+            track_album: String::new(),
+            tracker: None,
+            listeners: -1,
+            relays_cnt: -1,
+            started_at: now,
+        });
+        if let Some(chan) = chan {
+            if let Some(info) = chan.find("info") {
+                let info = Some(info);
+                entry.name = child_str(info, "name");
+                entry.genre = child_str(info, "gnre");
+                entry.description = child_str(info, "desc");
+                entry.contact_url = child_str(info, "url");
+                entry.bitrate = child_i32(info, "bitr", 0);
+                entry.content_type = child_str(info, "type");
+            }
+            if let Some(trck) = chan.find("trck") {
+                let trck = Some(trck);
+                entry.track_title = child_str(trck, "titl");
+                entry.track_creator = child_str(trck, "crea");
+                entry.track_album = child_str(trck, "albm");
+            }
+        }
+        if let Some(host) = host {
+            let firewalled = flg1 & FLG1_PUSH != 0;
+            entry.tracker = if firewalled { None } else { build_tracker(host) };
+            entry.listeners = child_i32(Some(host), "numl", entry.listeners);
+            entry.relays_cnt = child_i32(Some(host), "numr", entry.relays_cnt);
+        }
+
         let state = if is_known {
             ChannelState::Updating
         } else {
             ChannelState::Announced
         };
-
-        let info = chan.find("info");
-        let trck = chan.find("trck");
-        let tracker = if firewalled {
-            None
-        } else {
-            host.and_then(build_tracker)
-        };
-
-        let raw = RawChannelInfo {
-            channel_id: cid,
-            name: child_str(info, "name"),
-            genre: child_str(info, "gnre"),
-            description: child_str(info, "desc"),
-            contact_url: child_str(info, "url"),
-            bitrate: child_i32(info, "bitr", 0),
-            content_type: child_str(info, "type"),
-            track_title: child_str(trck, "titl"),
-            track_creator: child_str(trck, "crea"),
-            track_album: child_str(trck, "albm"),
-            tracker,
-            listeners: child_i32(host, "numl", -1),
-            relays_cnt: child_i32(host, "numr", -1),
-            started_at,
-        };
         // 状態は registry が権威(既存有無で Announced/Updating を確定する)。
-        self.registry.upsert(AnnouncedChannel::from_raw(raw, state));
+        self.registry
+            .upsert(AnnouncedChannel::from_raw(entry.clone(), state));
         Ok(vec![])
     }
 
@@ -326,16 +391,28 @@ impl AnnounceSession {
             .log(SecurityCategory::PcpReject, &self.source, reason);
     }
 
-    /// OLEH 応答を組み立てる(sid エコー・agent 名・ver・接続元から観測した rip/port)。
-    fn build_oleh(&self, sid: &[u8; 16]) -> Atom {
+    /// OLEH 応答を組み立てる(自ノード SessionID・agent 名・ver・観測 rip・申告 port エコー)。
+    ///
+    /// `sid` には**自ノード自身の SessionID** を入れる。PCP クライアント
+    /// (本家 PeerCast / PeerCastStation)は OLEH の sid が自分の SessionID と
+    /// 一致すると自己接続と判定して切断するため、HELO の sid をエコーしてはならない。
+    /// `port` は HELO で申告された待受ポートのエコー(loopback 専用 YP のため
+    /// connect-back による到達性検証は行わない。申告が無ければ省略)。
+    fn build_oleh(&self, helo: &Atom) -> Atom {
         let mut children = vec![
-            Atom::bytes("sid", sid),
+            Atom::bytes("sid", node_session_id()),
             Atom::str("agnt", &agent_name()),
             Atom::i32("ver", PCP_PROTOCOL_VERSION),
         ];
         if let Some(SocketAddr::V4(v4)) = self.source_addr {
-            children.push(Atom::bytes("rip", &v4.ip().octets()));
-            children.push(Atom::u16v("port", v4.port()));
+            // PCP の IPv4 はリトルエンディアン格納(ワイヤ上はオクテット逆順)。
+            let o = v4.ip().octets();
+            children.push(Atom::bytes("rip", &[o[3], o[2], o[1], o[0]]));
+        }
+        if let Some(port) = helo.find("port").and_then(Atom::as_i32)
+            && (0..=65535).contains(&port)
+        {
+            children.push(Atom::u16v("port", port as u16));
         }
         Atom::parent("oleh", children)
     }
@@ -358,25 +435,72 @@ fn child_i32(parent: Option<&Atom>, name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
-/// PCP_HOST から `ip:port`(IPv4)を組む。ip が 4 バイトでない/port 不正なら `None`。
+/// PCP_HOST から `ip:port` を組む。ip が 4/16 バイトでない・port 不正なら `None`。
+/// PCP の IP atom はバイト逆順格納(IPv4 = 32bit 整数のリトルエンディアン、
+/// IPv6 も同様に 16 バイトを逆順で格納 — PeerCastStation 実機 2026-07-04 確認)。
+/// IPv6 は `[addr]:port` のブラケット形式で返す(SocketAddr 互換)。
 fn build_tracker(host: &Atom) -> Option<String> {
     let ip = host.find("ip")?.payload()?;
-    if ip.len() != 4 {
-        return None;
-    }
     let port = host.find("port")?.as_i32()?;
     if !(0..=65535).contains(&port) {
         return None;
     }
-    Some(format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port))
+    match ip.len() {
+        4 => Some(format!("{}.{}.{}.{}:{}", ip[3], ip[2], ip[1], ip[0], port)),
+        16 => {
+            let mut bytes = [0u8; 16];
+            for (dst, src) in bytes.iter_mut().zip(ip.iter().rev()) {
+                *dst = *src;
+            }
+            let addr = std::net::Ipv6Addr::from(bytes);
+            Some(format!("[{addr}]:{port}"))
+        }
+        _ => None,
+    }
+}
+
+/// 自ノードの PCP SessionID(プロセス起動ごとにランダム生成)。
+/// OLEH の sid として返す(クライアントの自己接続判定に使われる)。
+fn node_session_id() -> &'static [u8; 16] {
+    static ID: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    ID.get_or_init(rand::random)
+}
+
+/// GUID 子 atom のデバッグ表現(16 バイトなら hex、欠落・長さ不正はその旨)。
+fn guid_debug(parent: &Atom, name: &str) -> String {
+    match parent.find(name).and_then(Atom::payload) {
+        Some(p) if p.len() == 16 => p.iter().map(|b| format!("{b:02x}")).collect(),
+        Some(p) => format!("<len={}>", p.len()),
+        None => "<absent>".to_string(),
+    }
+}
+
+/// 親 atom の子構成のデバッグ表現(`名前(ペイロード長)` の列。親 atom は `[parent]`)。
+fn children_debug(atom: &Atom) -> String {
+    match atom.children() {
+        Some(children) => children
+            .iter()
+            .map(|c| match c.payload() {
+                Some(p) => format!("{}({})", c.id().name(), p.len()),
+                None => format!("{}[parent]", c.id().name()),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => "<data atom>".to_string(),
+    }
 }
 
 /// 親 atom から 16 バイト GUID を取り出す(欠落・長さ不正は `pcp_reject` 切断)。
-fn required_guid(parent: &Atom, name: &str) -> Result<[u8; 16], PcpDisconnect> {
+/// `missing` は欠落時のログ理由(どの atom の欠落か区別できる固定文字列)。
+fn required_guid(
+    parent: &Atom,
+    name: &str,
+    missing: &'static str,
+) -> Result<[u8; 16], PcpDisconnect> {
     let payload = parent
         .find(name)
         .and_then(Atom::payload)
-        .ok_or_else(|| PcpDisconnect::reject("missing guid atom"))?;
+        .ok_or_else(|| PcpDisconnect::reject(missing))?;
     if payload.len() != 16 {
         return Err(PcpDisconnect::reject("invalid guid length"));
     }
@@ -513,26 +637,31 @@ mod tests {
         Atom::parent("helo", vec![Atom::bytes("sid", sid)])
     }
 
+    /// 実 PCP の単一 BCST 形(chan の ID は `id`、host は bcst 直下、IP は LE 格納)。
     fn bcst(cid: &[u8; 16], name: &str, flg1: u8) -> Atom {
         Atom::parent(
             "bcst",
-            vec![Atom::parent(
-                "chan",
-                vec![
-                    Atom::bytes("cid", cid),
-                    Atom::parent("info", vec![Atom::str("name", name), Atom::i32("bitr", 500)]),
-                    Atom::parent(
-                        "host",
-                        vec![
-                            Atom::bytes("ip", &[192, 0, 2, 5]),
-                            Atom::u16v("port", 7144),
-                            Atom::i32("numl", 4),
-                            Atom::i32("numr", 1),
-                            Atom::u8v("flg1", flg1),
-                        ],
-                    ),
-                ],
-            )],
+            vec![
+                Atom::bytes("cid", cid),
+                Atom::parent(
+                    "chan",
+                    vec![
+                        Atom::bytes("id", cid),
+                        Atom::parent("info", vec![Atom::str("name", name), Atom::i32("bitr", 500)]),
+                    ],
+                ),
+                Atom::parent(
+                    "host",
+                    vec![
+                        Atom::bytes("cid", cid),
+                        Atom::bytes("ip", &[5, 2, 0, 192]), // 192.0.2.5(LE 格納)
+                        Atom::u16v("port", 7144),
+                        Atom::i32("numl", 4),
+                        Atom::i32("numr", 1),
+                        Atom::u8v("flg1", flg1),
+                    ],
+                ),
+            ],
         )
     }
 
@@ -546,11 +675,123 @@ mod tests {
         let registry = ChannelRegistry::new();
         let mut s = AnnounceSession::new(registry, sec, "127.0.0.1:40000".into());
         let actions = feed(&mut s, &helo(&[1u8; 16]));
-        assert_eq!(s.broadcast_id(), Some([1u8; 16]));
+        assert_eq!(s.broadcast_id(), Some([1u8; 16])); // bcid 無し → sid で代用
         assert_eq!(actions.len(), 1);
         let AnnounceAction::Send(oleh) = &actions[0];
         assert!(oleh.id().matches("oleh"));
         assert_eq!(oleh.find("agnt").and_then(|a| a.as_str()), Some(agent_name()));
+        // sid はエコーではなく自ノードの SessionID(エコーするとクライアントが
+        // 自己接続と誤判定して切断する)。
+        let oleh_sid = oleh.find("sid").and_then(Atom::payload).unwrap();
+        assert_eq!(oleh_sid.len(), 16);
+        assert_ne!(oleh_sid, &[1u8; 16][..]);
+    }
+
+    #[test]
+    fn bcid_identifies_session_and_declared_port_is_echoed() {
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry, sec, "127.0.0.1:40006".into());
+        let helo = Atom::parent(
+            "helo",
+            vec![
+                Atom::bytes("sid", &[1u8; 16]),
+                Atom::bytes("bcid", &[7u8; 16]),
+                Atom::u16v("port", 7144),
+            ],
+        );
+        let actions = feed(&mut s, &helo);
+        assert_eq!(s.broadcast_id(), Some([7u8; 16]));
+        let AnnounceAction::Send(oleh) = &actions[0];
+        // OLEH port は HELO 申告値のエコー(接続元の一時ポート 40006 ではない)。
+        assert_eq!(oleh.find("port").and_then(Atom::as_i32), Some(7144));
+    }
+
+    #[test]
+    fn separate_chan_and_host_bcsts_are_merged() {
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry.clone(), sec, "127.0.0.1:40007".into());
+        feed(&mut s, &helo(&[8u8; 16]));
+        let cid = [9u8; 16];
+        // PeerCastStation 実機の形: chan のみの BCST → host のみの BCST が別便で届く。
+        let chan_only = Atom::parent(
+            "bcst",
+            vec![
+                Atom::bytes("cid", &cid),
+                Atom::parent(
+                    "chan",
+                    vec![
+                        Atom::bytes("id", &cid),
+                        Atom::parent("info", vec![Atom::str("name", "A"), Atom::i32("bitr", 500)]),
+                    ],
+                ),
+            ],
+        );
+        let host_only = Atom::parent(
+            "bcst",
+            vec![
+                Atom::bytes("cid", &cid),
+                Atom::parent(
+                    "host",
+                    vec![
+                        Atom::bytes("cid", &cid),
+                        Atom::bytes("ip", &[5, 2, 0, 192]), // 192.0.2.5(LE 格納)
+                        Atom::u16v("port", 7144),
+                        Atom::i32("numl", 4),
+                        Atom::i32("numr", 1),
+                        Atom::u8v("flg1", FLG1_RECV),
+                    ],
+                ),
+            ],
+        );
+        feed(&mut s, &chan_only);
+        feed(&mut s, &host_only);
+        assert_eq!(s.tracked_channels(), 1);
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        // chan 便の情報が host 便で消えず、host 便の情報が加わる。
+        assert_eq!(snap[0].name, "A");
+        assert_eq!(snap[0].tracker.as_deref(), Some("192.0.2.5:7144"));
+    }
+
+    #[test]
+    fn ipv6_host_yields_bracketed_tracker() {
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry.clone(), sec, "127.0.0.1:40008".into());
+        feed(&mut s, &helo(&[10u8; 16]));
+        let cid = [11u8; 16];
+        // 2001:db8::1 のワイヤ表現(ネットワークオーダーの逆順格納)
+        let ip_wire: [u8; 16] = [
+            0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xb8, 0x0d, 0x01, 0x20,
+        ];
+        let bcst = Atom::parent(
+            "bcst",
+            vec![
+                Atom::bytes("cid", &cid),
+                Atom::parent(
+                    "chan",
+                    vec![
+                        Atom::bytes("id", &cid),
+                        Atom::parent("info", vec![Atom::str("name", "V6"), Atom::i32("bitr", 500)]),
+                    ],
+                ),
+                Atom::parent(
+                    "host",
+                    vec![
+                        Atom::bytes("cid", &cid),
+                        Atom::bytes("ip", &ip_wire),
+                        Atom::u16v("port", 7144),
+                        Atom::u8v("flg1", FLG1_RECV),
+                    ],
+                ),
+            ],
+        );
+        feed(&mut s, &bcst);
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tracker.as_deref(), Some("[2001:db8::1]:7144"));
     }
 
     #[test]

@@ -32,7 +32,8 @@ const DEFAULT_REPUBLISH_INTERVAL_SEC: u64 = 60;
 const DEFAULT_MAX_CLOCK_SKEW_SEC: u64 = 300;
 const DEFAULT_MIN_POW_BITS: u32 = 0;
 const DEFAULT_EVENT_STORE_MAX: u64 = 4096;
-const DEFAULT_INDEX_TXT_ENCODING: &str = "shift_jis";
+// 2026-07-04 実機検証で改訂: 現行 YP は UTF-8 が既定(contracts/http-yp.md)。
+const DEFAULT_INDEX_TXT_ENCODING: &str = "utf-8";
 
 // settings テーブルのキー名(data-model §Settings と一致)。
 const KEY_PCP_BIND: &str = "pcp_bind";
@@ -388,7 +389,7 @@ mod tests {
         assert_eq!(d.max_clock_skew_sec, 300);
         assert_eq!(d.min_pow_bits, 0);
         assert_eq!(d.event_store_max, 4096);
-        assert_eq!(d.index_txt_encoding, "shift_jis");
+        assert_eq!(d.index_txt_encoding, "utf-8");
     }
 
     #[test]
@@ -510,7 +511,7 @@ mod tests {
         assert!(matches!(s.validate(), Err(ConfigError::InvalidEncoding)));
         assert_eq!(
             Settings::default().index_encoding().unwrap(),
-            IndexEncoding::ShiftJis
+            IndexEncoding::Utf8
         );
     }
 

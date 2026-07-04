@@ -1,6 +1,7 @@
-//! index.txt ゴールデンテスト(T036 — contracts/http-yp.md §検証方法)
+//! index.txt ゴールデンテスト(T036 — contracts/http-yp.md §検証方法。
+//! 2026-07-04 実機 YP 検証で 19 フィールド形式に改訂)
 //!
-//! 既知 DiscoveredChannel 集合 → 18 フィールド(区切り `<>` 17 個)出力比較。
+//! 既知 DiscoveredChannel 集合 → 19 フィールド(区切り `<>` 18 個)出力比較。
 //!
 //! 検証ケース:
 //! - UTF-8 ゴールデン比較
@@ -8,9 +9,10 @@
 //! - 空一覧 → 空出力
 //! - firewalled チャンネル(TIP 空文字列)
 //! - ID の大文字化(内部小文字 → 出力大文字)
-//! - サニタイズ順序: `<>` 除去 → Shift_JIS 変換不能文字 `?` 置換
+//! - サニタイズ: テキストは `&`/`<`/`>` を HTML エスケープ → 変換不能文字 `?` 置換
 //! - BROADCAST_TIME 24 時間超(25 時間 30 分 → `25:30`、分 2 桁固定)
-//! - 15・17 番目の予約フィールドは常に空
+//! - NAME_ENCODED(15 番目)= チャンネル名の percent エンコード、17 番目 = `click`、
+//!   19 番目(DIRECT)= `0`
 //! - 不明フィールド: listeners/relays = -1、bitrate = 0
 
 use encoding_rs::SHIFT_JIS;
@@ -89,7 +91,7 @@ fn empty_list_produces_empty_output() {
     assert!(out_sjis.is_empty(), "空一覧(Shift_JIS)は空出力");
 }
 
-/// UTF-8 ゴールデン: 18 フィールドのレイアウトと内容を確認する。
+/// UTF-8 ゴールデン: 19 フィールドのレイアウトと内容を確認する。
 ///
 /// now = 1000 + 2*3600 + 5*60 = 8500 → BROADCAST_TIME = 2:05
 #[test]
@@ -104,7 +106,7 @@ fn utf8_golden_basic() {
     let line = text.trim_end_matches('\n');
 
     let fields: Vec<&str> = line.split("<>").collect();
-    assert_eq!(fields.len(), 18, "18 フィールドであること");
+    assert_eq!(fields.len(), 19, "19 フィールドであること");
 
     // フィールド 1: CHANNEL_NAME
     assert_eq!(fields[0], "テスト放送");
@@ -134,14 +136,19 @@ fn utf8_golden_basic() {
     assert_eq!(fields[12], "test song");
     // フィールド 14: TRACK_CONTACT_URL
     assert_eq!(fields[13], "");
-    // フィールド 15: 予約(常に空)
-    assert_eq!(fields[14], "", "15 番目の予約フィールドは常に空");
+    // フィールド 15: NAME_ENCODED(UTF-8 バイト列の percent エンコード)
+    assert_eq!(
+        fields[14], "%E3%83%86%E3%82%B9%E3%83%88%E6%94%BE%E9%80%81",
+        "15 番目はチャンネル名の percent エンコード"
+    );
     // フィールド 16: BROADCAST_TIME
     assert_eq!(fields[15], "2:05");
-    // フィールド 17: 予約(常に空)
-    assert_eq!(fields[16], "", "17 番目の予約フィールドは常に空");
+    // フィールド 17: 固定文字列 click
+    assert_eq!(fields[16], "click", "17 番目は固定文字列 click");
     // フィールド 18: COMMENT
     assert_eq!(fields[17], "");
+    // フィールド 19: DIRECT
+    assert_eq!(fields[18], "0", "19 番目(DIRECT)は固定 0");
 }
 
 /// Shift_JIS ゴールデン: 日本語文字列が正しく Shift_JIS エンコードされる。
@@ -155,7 +162,8 @@ fn shift_jis_golden_japanese() {
     let out = generate(&[ch], IndexEncoding::ShiftJis, now);
 
     // 期待する UTF-8 文字列を構築してから Shift_JIS に変換し比較する
-    let expected_utf8 = "テスト放送<>00000000000000000000000000000001<>192.168.1.1:7144<>http://example.com/<>テスト<>詳細説明<>5<>3<>128<>FLV<>test artist<>test album<>test song<><><>0:01<><>\n";
+    // (NAME_ENCODED は Shift_JIS バイト列基準の古典 percent 形 %83e%83X%83g…)
+    let expected_utf8 = "テスト放送<>00000000000000000000000000000001<>192.168.1.1:7144<>http://example.com/<>テスト<>詳細説明<>5<>3<>128<>FLV<>test artist<>test album<>test song<><>%83e%83X%83g%95%FA%91%97<>0:01<>click<><>0\n";
     let expected_bytes = to_sjis_bytes(expected_utf8);
     assert_eq!(out, expected_bytes, "Shift_JIS エンコードが一致する");
 }
@@ -172,7 +180,7 @@ fn firewalled_tip_is_empty() {
     let out = generate(&[ch], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
-    assert_eq!(fields.len(), 18);
+    assert_eq!(fields.len(), 19);
     assert_eq!(fields[2], "", "firewalled チャンネルの TIP は空文字列");
 }
 
@@ -187,22 +195,19 @@ fn id_is_uppercased_in_output() {
     let out = generate(&[ch], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
-    assert_eq!(fields.len(), 18);
+    assert_eq!(fields.len(), 19);
     assert_eq!(
         fields[1], "AABBCCDD00112233445566778899AABB",
         "hex ID が大文字化されている"
     );
 }
 
-/// サニタイズ順序: `<>` 除去(手順 1)→ Shift_JIS 変換不能文字 `?` 置換(手順 2)。
-///
-/// - タイトルに `<>` が含まれる場合、除去されてデリミタが増えない
-/// - タイトルに絵文字(Shift_JIS 変換不能)が含まれる場合、`?` に置換される
-/// - 両方含む場合、`<>` 除去が先に行われ `?` は `<>` と衝突しない
+/// サニタイズ: テキストフィールドの `<`/`>` は HTML エスケープされ、
+/// デリミタ解析を破壊しない(実運用 YP の出力形式)。
 #[test]
-fn sanitize_order_lt_gt_removed_before_encoding() {
+fn sanitize_delimiter_in_title_is_escaped() {
     let cid = "00000000000000000000000000000002";
-    // `<>` を含むタイトル → 除去後: "テスト放送"
+    // `<>` を含むタイトル → エスケープ後: "テスト&lt;&gt;放送"
     let mut listing = make_listing(cid);
     listing.title = "テスト<>放送".to_string();
     listing.tip = None;
@@ -216,9 +221,9 @@ fn sanitize_order_lt_gt_removed_before_encoding() {
     let out = generate(&[ch], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
-    // <> 除去後もフィールド数は 18 のまま(区切り解析が破壊されない)
-    assert_eq!(fields.len(), 18, "`<>` 除去後もフィールド数は 18");
-    assert_eq!(fields[0], "テスト放送", "`<>` が除去されている");
+    // エスケープ後もフィールド数は 19 のまま(区切り解析が破壊されない)
+    assert_eq!(fields.len(), 19, "エスケープ後もフィールド数は 19");
+    assert_eq!(fields[0], "テスト&lt;&gt;放送", "`<`/`>` がエスケープされている");
 }
 
 /// Shift_JIS 変換不能文字(絵文字)は `?` に置換される。
@@ -250,10 +255,10 @@ fn shift_jis_unencodable_becomes_question_mark() {
     assert!(text.contains("テスト🚀放送"), "UTF-8 では絵文字が保持される");
 }
 
-/// `<>` と Shift_JIS 変換不能文字が両方含まれる場合のサニタイズ順序確認。
+/// `<>` と Shift_JIS 変換不能文字が両方含まれる場合のサニタイズ確認。
 ///
-/// タイトル "A<>B🚀C" → `<>` 除去: "AB🚀C" → Shift_JIS: "AB?C"
-/// `?` は `<>` と衝突しないため、フィールド数は常に 18 を保つ。
+/// タイトル "A<>B🚀C" → エスケープ: "A&lt;&gt;B🚀C" → Shift_JIS: "A&lt;&gt;B?C"
+/// `?` は `<>` と衝突しないため、フィールド数は常に 19 を保つ。
 #[test]
 fn sanitize_both_lt_gt_and_unencodable() {
     let cid = "00000000000000000000000000000004";
@@ -274,7 +279,7 @@ fn sanitize_both_lt_gt_and_unencodable() {
     let line_bytes = &out_sjis[..pos];
     // '<>' = [0x3C, 0x3E] で分割してフィールド数を数える
     let separators = line_bytes.windows(2).filter(|w| w == &[0x3C, 0x3E]).count();
-    assert_eq!(separators, 17, "`<>` 除去後も区切りは 17 個(フィールド数 18)");
+    assert_eq!(separators, 18, "エスケープ後も区切りは 18 個(フィールド数 19)");
 }
 
 /// BROADCAST_TIME が 24 時間を超える場合: `25:30` 形式(分は 2 桁固定)。
@@ -295,7 +300,7 @@ fn broadcast_time_over_24_hours() {
     let out = generate(&[ch], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
-    assert_eq!(fields.len(), 18);
+    assert_eq!(fields.len(), 19);
     assert_eq!(fields[15], "25:30", "24 時間超の BROADCAST_TIME は時間部を拡張");
 }
 
@@ -316,7 +321,7 @@ fn broadcast_time_minutes_zero_padded() {
     let out = generate(&[ch], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
-    assert_eq!(fields.len(), 18);
+    assert_eq!(fields.len(), 19);
     assert_eq!(fields[15], "3:05", "分は 2 桁固定(ゼロ埋め)");
 }
 
@@ -339,7 +344,7 @@ fn unknown_counts_output_as_spec() {
     let out = generate(&[ch], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
-    assert_eq!(fields.len(), 18);
+    assert_eq!(fields.len(), 19);
     assert_eq!(fields[6], "-1", "LISTENER_NUM 不明は -1");
     assert_eq!(fields[7], "-1", "RELAY_NUM 不明は -1");
     assert_eq!(fields[8], "0", "BITRATE 不明は 0");
@@ -360,6 +365,6 @@ fn multiple_channels_produce_multiple_lines() {
     assert_eq!(lines.len(), 2, "2 チャンネル → 2 行");
     for line in &lines {
         let fields: Vec<&str> = line.split("<>").collect();
-        assert_eq!(fields.len(), 18, "各行は 18 フィールド");
+        assert_eq!(fields.len(), 19, "各行は 19 フィールド");
     }
 }

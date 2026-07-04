@@ -79,7 +79,7 @@ key-value(TEXT/TEXT)。主なキー:
 | p2p_inbound_max | `32` | 着信接続の上限 |
 | pex_enabled | `1` | ピア交換の有効/無効(FR-015) |
 | upnp_enabled | `1` | UPnP ポートマッピング試行(research R15) |
-| index_txt_encoding | `shift_jis` | `shift_jis` / `utf-8` |
+| index_txt_encoding | `utf-8` | `utf-8` / `shift_jis`(2026-07-04 実機検証で既定を UTF-8 へ改訂 — contracts/http-yp.md) |
 | freshness_window_sec | `600` | 鮮度判定窓(FR-006) |
 | republish_interval_sec | `60` | 掲載中の再発行間隔 |
 | max_clock_skew_sec | `300` | 受信イベントの未来方向時刻ずれ許容(spec Edge Case「時計のずれ」) |

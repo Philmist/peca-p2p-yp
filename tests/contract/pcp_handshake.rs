@@ -46,16 +46,19 @@ fn helo(sid: &[u8; 16]) -> Atom {
     )
 }
 
+/// 実 PCP の BCST 形(chan の ID は `id`、host は bcst 直下、IP は LE 格納 =
+/// ワイヤ上オクテット逆順)。contracts/pcp-announce.md 2026-07-04 実機検証改訂。
 #[allow(clippy::too_many_arguments)]
 fn bcst(cid: &[u8; 16], bcid: &[u8; 16], name: &str, bitrate: i32, flg1: u8) -> Atom {
     Atom::parent(
         "bcst",
         vec![
             Atom::u8v("ttl", 11), // 無視される atom
+            Atom::bytes("cid", cid),
             Atom::parent(
                 "chan",
                 vec![
-                    Atom::bytes("cid", cid),
+                    Atom::bytes("id", cid),
                     Atom::bytes("bcid", bcid),
                     Atom::parent(
                         "info",
@@ -76,16 +79,17 @@ fn bcst(cid: &[u8; 16], bcid: &[u8; 16], name: &str, bitrate: i32, flg1: u8) -> 
                             Atom::str("albm", "album"),
                         ],
                     ),
-                    Atom::parent(
-                        "host",
-                        vec![
-                            Atom::bytes("ip", &[192, 0, 2, 1]),
-                            Atom::i16("port", 7144),
-                            Atom::i32("numl", 5),
-                            Atom::i32("numr", 2),
-                            Atom::u8v("flg1", flg1),
-                        ],
-                    ),
+                ],
+            ),
+            Atom::parent(
+                "host",
+                vec![
+                    Atom::bytes("cid", cid),
+                    Atom::bytes("ip", &[1, 2, 0, 192]), // 192.0.2.1(LE 格納)
+                    Atom::i16("port", 7144),
+                    Atom::i32("numl", 5),
+                    Atom::i32("numr", 2),
+                    Atom::u8v("flg1", flg1),
                 ],
             ),
         ],
@@ -137,17 +141,22 @@ fn helo_produces_oleh_with_fixed_agent_name() {
     assert!(agnt.starts_with("peca-p2p-yp/"), "固定書式: {agnt}");
     assert_eq!(agnt, format!("peca-p2p-yp/{}", env!("CARGO_PKG_VERSION")));
 
-    // sid をエコーし、ver を含む
-    assert_eq!(oleh.find("sid").and_then(|a| a.payload()), Some(&sid[..]));
+    // sid は自ノードの SessionID(HELO sid のエコーはクライアントの自己接続判定を
+    // 誤発火させるため禁止 — 本家 PeerCast 互換)。ver を含む
+    let oleh_sid = oleh.find("sid").and_then(|a| a.payload()).expect("sid atom");
+    assert_eq!(oleh_sid.len(), 16);
+    assert_ne!(oleh_sid, &sid[..], "HELO sid をエコーしない");
     assert_eq!(
         oleh.find("ver").and_then(|a| a.as_i32()),
         Some(PCP_PROTOCOL_VERSION)
     );
-    // 接続元から観測した IP:port を rip/port として返す
+    // 接続元から観測した IP を rip(LE 格納 = オクテット逆順)、
+    // HELO で申告された待受ポートのエコーを port として返す
     assert_eq!(
         oleh.find("rip").and_then(|a| a.payload()),
-        Some(&[127u8, 0, 0, 1][..])
+        Some(&[1u8, 0, 0, 127][..])
     );
+    assert_eq!(oleh.find("port").and_then(|a| a.as_i32()), Some(7144));
 }
 
 // ---------------------------------------------------------------------------

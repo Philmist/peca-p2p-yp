@@ -17,10 +17,17 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
       → playing=false の BCST で当該チャンネルが ended / PCP_QUIT・切断で全チャンネル ended
 ```
 
-- `PCP_HELO` の BroadcastID(GUID)でセッションを識別する
+- `PCP_HELO` の BroadcastID(`bcid`、GUID)でセッションを識別する。`bcid` を送らない
+  クライアントは `sid` で代用する(`sid` は接続ごとの SessionID であり配信者の識別子ではない)
 - `PCP_OLEH` 応答には、参考資料 gist のハンドシェイク仕様に準拠した応答 atom
-  (agent 名・バージョン・接続元から観測した IP・ポート)を含める。agent 名は
+  (agent 名・バージョン・接続元から観測した IP)を含める。agent 名は
   `peca-p2p-yp/<semver>` を名乗る(互換性検証の識別のため固定書式とする)
+- `PCP_OLEH` の `sid` は**自ノード自身の SessionID**(プロセス起動ごとに生成)とし、
+  HELO の `sid` をエコーしてはならない(2026-07-04 実機検証で改訂): PCP クライアント
+  (本家 PeerCast / PeerCastStation)は OLEH の sid が自分の SessionID と一致すると
+  自己接続と判定して切断するため、エコー実装では掲載前に切断・再接続が繰り返される
+- `PCP_OLEH` の `port` は HELO で申告された待受ポートのエコー(申告が無ければ省略)。
+  loopback 専用 YP のため connect-back による到達性検証は行わない
 - **1 セッション内の複数チャンネル**: 1 つの PCP セッション(BroadcastID)は複数チャンネルの
   BCST を含みうる。チャンネルは ChannelID 単位で AnnouncedChannel(data-model.md)を構成し、
   1 セッションあたりの同時掲載チャンネル数は ≤ 16(超過分は無視+`pcp_reject` ログ)。
@@ -28,6 +35,17 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
 - `PCP_BCST` 内のチャンネル情報 atom(`name`/`gnre`/`desc`/`url`/`bitr`/`type`/
   `titl`/`crea`/`albm`)と `PCP_HOST`(グローバル IP:port、`numl`/`numr`、flg1)を
   data-model.md の AnnouncedChannel に写像する
+- **BCST の実構造**(2026-07-04 実機検証で改訂): ChannelID は `chan` 直下では
+  **`id`** atom、`bcst` 直下と `host` 内では `cid` atom に格納される(`chan` 内に
+  `cid` は存在しない)。PeerCastStation は 1 チャンネルにつき **`chan`(情報)と
+  `host`(リスナー数・トラッカー)を別々の BCST** で送るため、受理側はセッション内で
+  ChannelID 単位にマージしてから AnnouncedChannel を構成する。片方のみの BCST が
+  もう片方の既得情報を消してはならない
+- **IP アドレスの格納**: PCP の IP atom(`ip`/`rip`)はバイト逆順格納。IPv4(4 バイト)は
+  32bit 整数のリトルエンディアン = オクテット逆順(`d.c.b.a`)、IPv6(16 バイト)も同様に
+  ネットワークオーダーの逆順(2026-07-04 実機 PeerCastStation の IPv6 掲載で確認)。
+  送受信の双方で変換する。IPv6 の TIP は `[addr]:port` のブラケット形式で表現する
+  (SocketAddr 互換 — 30311 `tip` タグ・index.txt とも同形式)
 - 受信内容の変更検知(または受信そのもの)を契機にイベントを再発行し gossip へ伝搬する(contracts/nostr-events.md, p2p-gossip.md)
 - **セッション終了と ended**(2026-07-04 実装時改訂): `PCP_QUIT` または **TCP 切断
   (PCP_QUIT を伴わない異常切断を含む)** で当該セッションの**全チャンネル**を `ended` とし、

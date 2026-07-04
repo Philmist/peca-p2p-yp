@@ -262,37 +262,42 @@ impl PcpClient {
     }
 
     /// BCST を送る(配信開始・詳細変更の両方に使う)。
+    /// 実 PCP の形(chan の ID は `id`、host は bcst 直下、IP は LE 格納)。
     pub async fn broadcast(&mut self, cid: &[u8; 16], name: &str, genre: &str, desc: &str) {
         let bcst = Atom::parent(
             "bcst",
-            vec![Atom::parent(
-                "chan",
-                vec![
-                    Atom::bytes("cid", cid),
-                    Atom::bytes("bcid", &self.session_id),
-                    Atom::parent(
-                        "info",
-                        vec![
-                            Atom::str("name", name),
-                            Atom::str("gnre", genre),
-                            Atom::str("desc", desc),
-                            Atom::str("url", "https://example.com/"),
-                            Atom::i32("bitr", 500),
-                            Atom::str("type", "FLV"),
-                        ],
-                    ),
-                    Atom::parent(
-                        "host",
-                        vec![
-                            Atom::bytes("ip", &[198, 51, 100, 1]),
-                            Atom::i16("port", 7144),
-                            Atom::i32("numl", 2),
-                            Atom::i32("numr", 1),
-                            Atom::u8v("flg1", FLG1_RECV | FLG1_DIRECT),
-                        ],
-                    ),
-                ],
-            )],
+            vec![
+                Atom::bytes("cid", cid),
+                Atom::parent(
+                    "chan",
+                    vec![
+                        Atom::bytes("id", cid),
+                        Atom::bytes("bcid", &self.session_id),
+                        Atom::parent(
+                            "info",
+                            vec![
+                                Atom::str("name", name),
+                                Atom::str("gnre", genre),
+                                Atom::str("desc", desc),
+                                Atom::str("url", "https://example.com/"),
+                                Atom::i32("bitr", 500),
+                                Atom::str("type", "FLV"),
+                            ],
+                        ),
+                    ],
+                ),
+                Atom::parent(
+                    "host",
+                    vec![
+                        Atom::bytes("cid", cid),
+                        Atom::bytes("ip", &[1, 100, 51, 198]), // 198.51.100.1(LE 格納)
+                        Atom::i16("port", 7144),
+                        Atom::i32("numl", 2),
+                        Atom::i32("numr", 1),
+                        Atom::u8v("flg1", FLG1_RECV | FLG1_DIRECT),
+                    ],
+                ),
+            ],
         );
         self.stream
             .write_all(&bcst.to_bytes())
