@@ -14,7 +14,7 @@
 ```text
 accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
       → PCP_BCST(チャンネル情報)受信を継続処理
-      → playing=false の BCST または PCP_QUIT で ended
+      → playing=false の BCST で当該チャンネルが ended / PCP_QUIT・切断で全チャンネル ended
 ```
 
 - `PCP_HELO` の BroadcastID(GUID)でセッションを識別する
@@ -29,10 +29,12 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
   `titl`/`crea`/`albm`)と `PCP_HOST`(グローバル IP:port、`numl`/`numr`、flg1)を
   data-model.md の AnnouncedChannel に写像する
 - 受信内容の変更検知(または受信そのもの)を契機にイベントを再発行し gossip へ伝搬する(contracts/nostr-events.md, p2p-gossip.md)
-- **セッション終了と ended**: `playing=false` の BCST、`PCP_QUIT`、または **TCP 切断
-  (PCP_QUIT を伴わない異常切断を含む)** のいずれでも当該セッションの全チャンネルを
-  `ended` とし、`status=ended` の最終イベントを発行する(鮮度切れを待たない —
-  data-model.md AnnouncedChannel の状態遷移と同一)
+- **セッション終了と ended**(2026-07-04 実装時改訂): `PCP_QUIT` または **TCP 切断
+  (PCP_QUIT を伴わない異常切断を含む)** で当該セッションの**全チャンネル**を `ended` とし、
+  `status=ended` の最終イベントを発行する(鮮度切れを待たない — data-model.md
+  AnnouncedChannel の状態遷移と同一)。`playing=false` の BCST は**当該 ChannelID のみ**を
+  `ended` とする — BCST はチャンネル単位の信号であり、同一セッションで複数チャンネルを
+  掲載中に無関係な live チャンネルを巻き込まないため(単一チャンネル運用では従前と同一挙動)
 - 本ソフトウェアから切断する場合は `PCP_QUIT` を送る。BAN 相当機能(helo_disable)は実装しない
 
 ## 入力検証(Principle II)

@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>チャンネル一覧 — peca-p2p-yp</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 0.3rem 0.5rem; text-align: left; font-size: 0.9rem; }
+    th { background: #f0f0f0; }
+    .err { color: #b00; }
+    .ok { color: #060; }
+    .muted-row { color: #888; text-decoration: line-through; }
+    .warn { background: #fff3cd; }
+    .firewalled { color: #888; font-style: italic; }
+    .url-warn { color: #b00; font-weight: bold; }
+    .pending-persona { color: #b06000; font-style: italic; }
+    .state-announced { color: #060; }
+    .state-updating  { color: #660; }
+    .state-ended     { color: #888; }
+    button { cursor: pointer; }
+    #status-bar { background: #f8f8f8; border: 1px solid #ddd; padding: 0.4rem 0.7rem;
+      font-size: 0.85rem; margin-bottom: 1rem; border-radius: 4px; }
+    #status-bar span { margin-right: 1.2rem; }
+    #confirm-dialog { display: none; position: fixed; top: 30%; left: 50%; transform: translateX(-50%);
+      background: #fff; border: 1px solid #ccc; padding: 1rem; box-shadow: 0 4px 12px rgba(0,0,0,.2); z-index: 100; }
+    #confirm-dialog p { margin: 0 0 1rem; }
+    #confirm-dialog button { margin-right: 0.5rem; }
+    section { margin-bottom: 2rem; }
+    h2 { margin: 1.5rem 0 0.2rem; font-size: 1.1rem; border-bottom: 1px solid #ccc; padding-bottom: 0.2rem; }
+    .propagation { font-size: 0.85rem; color: #444; margin: 0.3rem 0; }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; トップ</a></p>
+  <h1>チャンネル一覧</h1>
+
+  <!-- ノードステータス -->
+  <div id="status-bar">
+    <span id="stat-pcp">PCP: —</span>
+    <span id="stat-in">IN: —</span>
+    <span id="stat-out">OUT: —</span>
+  </div>
+
+  <!-- 掲載中チャンネル -->
+  <section>
+    <h2>掲載中チャンネル(自ノード)</h2>
+    <div id="announced-status" class="muted">読み込み中...</div>
+    <p id="propagation-info" class="propagation" hidden></p>
+    <table id="announced-table" hidden>
+      <thead>
+        <tr>
+          <th>チャンネル名</th><th>状態</th><th>ジャンル</th><th>リスナー</th>
+          <th>ビットレート</th><th>種別</th><th>トラッカー</th><th>コンタクト</th><th>ペルソナ</th>
+        </tr>
+      </thead>
+      <tbody id="announced-body"></tbody>
+    </table>
+  </section>
+
+  <!-- 発見済みチャンネル -->
+  <section>
+    <h2>発見済みチャンネル(ネットワーク)</h2>
+    <div id="list-status" class="muted">読み込み中...</div>
+    <table id="channels-table" hidden>
+      <thead>
+        <tr>
+          <th>チャンネル名</th><th>ジャンル</th><th>リスナー</th><th>ビットレート</th>
+          <th>種別</th><th>放送時間</th><th>コンタクト</th><th>ペルソナ</th><th>TIP</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="channels-body"></tbody>
+    </table>
+  </section>
+
+  <!-- 未検証リンク確認ダイアログ -->
+  <div id="confirm-dialog">
+    <p id="confirm-msg">未検証リンクを開きますか？</p>
+    <button id="confirm-ok">開く</button>
+    <button id="confirm-cancel">キャンセル</button>
+  </div>
+
+  <noscript>この画面は JavaScript を利用します。</noscript>
+  <script>
+    let token = null;
+    let pendingUrl = null;
+
+    async function loadToken() {
+      const res = await fetch('/api/v1/token');
+      if (!res.ok) throw new Error('token');
+      token = (await res.json()).token;
+    }
+
+    // BROADCAST_TIME: started_at (unix 秒) から経過時間を H:MM 形式で返す
+    function fmtBroadcastTime(startsSec) {
+      if (startsSec === null || startsSec === undefined) return '—';
+      const diff = Math.max(0, Math.floor(Date.now() / 1000) - startsSec);
+      const h = Math.floor(diff / 3600);
+      const m = Math.floor((diff % 3600) / 60);
+      return h + ':' + String(m).padStart(2, '0');
+    }
+
+    function shortPubkey(pk) {
+      if (!pk) return '';
+      return pk.substring(0, 8) + '…';
+    }
+
+    function openConfirm(url) {
+      pendingUrl = url;
+      document.getElementById('confirm-msg').textContent =
+        '未検証リンク(http/https 以外)を開きますか？\n' + url;
+      document.getElementById('confirm-dialog').style.display = 'block';
+    }
+
+    document.getElementById('confirm-ok').addEventListener('click', () => {
+      document.getElementById('confirm-dialog').style.display = 'none';
+      if (pendingUrl) window.open(pendingUrl, '_blank', 'noopener,noreferrer');
+      pendingUrl = null;
+    });
+    document.getElementById('confirm-cancel').addEventListener('click', () => {
+      document.getElementById('confirm-dialog').style.display = 'none';
+      pendingUrl = null;
+    });
+
+    // ノードステータス(PCP / 確立ピア数)を取得して表示する
+    async function loadStatus() {
+      try {
+        const res = await fetch('/api/v1/status');
+        if (!res.ok) return;
+        const s = await res.json();
+        document.getElementById('stat-pcp').textContent =
+          'PCP: ' + (s.pcp_listening ? '待受中' : '停止');
+        document.getElementById('stat-in').textContent  = 'IN: '  + (s.established?.in  ?? 0);
+        document.getElementById('stat-out').textContent = 'OUT: ' + (s.established?.out ?? 0);
+      } catch (_) {}
+    }
+
+    // 掲載中チャンネル一覧(自ノード)を取得して表示する
+    async function loadAnnounced() {
+      const statusEl = document.getElementById('announced-status');
+      const propEl   = document.getElementById('propagation-info');
+      try {
+        const res = await fetch('/api/v1/announced');
+        if (!res.ok) { statusEl.textContent = 'エラー: ' + res.status; return; }
+        const data = await res.json();
+        const channels = data.channels ?? [];
+
+        if (channels.length === 0) {
+          statusEl.textContent = '掲載中のチャンネルはありません。';
+          return;
+        }
+        statusEl.textContent = '';
+
+        // 伝搬先ピア数
+        propEl.textContent = '伝搬先 established ピア数: ' + (data.propagation_peers ?? 0);
+        propEl.hidden = false;
+
+        const tbody = document.getElementById('announced-body');
+        tbody.innerHTML = '';
+        document.getElementById('announced-table').hidden = false;
+
+        for (const ch of channels) {
+          const tr = document.createElement('tr');
+
+          const stateLabel = { announced: '掲載中', updating: '更新中', ended: '終了' }[ch.state] ?? ch.state;
+          const stateClass = { announced: 'state-announced', updating: 'state-updating', ended: 'state-ended' }[ch.state] ?? '';
+
+          // トラッカー(空 = firewalled)
+          const trackerCell = ch.tracker
+            ? escHtml(ch.tracker)
+            : '<span class="firewalled">直接接続不可(firewalled)</span>';
+
+          // コンタクト URL
+          const contactCell = ch.contact_url
+            ? `<a href="${escHtml(ch.contact_url)}" target="_blank" rel="noopener noreferrer">${escHtml(ch.contact_url)}</a>`
+            : '';
+
+          // ペルソナ — null のとき掲載保留を明示
+          const personaCell = ch.persona_pubkey
+            ? `<span title="${escHtml(ch.persona_pubkey)}">${escHtml(shortPubkey(ch.persona_pubkey))}</span>`
+            : '<span class="pending-persona">ペルソナ未選択(掲載保留)</span>';
+
+          tr.innerHTML = `
+            <td>${escHtml(ch.name || '')}</td>
+            <td class="${stateClass}">${escHtml(stateLabel)}</td>
+            <td>${escHtml(ch.genre || '')}</td>
+            <td>${ch.listeners === -1 ? '不明' : ch.listeners}</td>
+            <td>${ch.bitrate_kbps === 0 ? '不明' : (ch.bitrate_kbps ?? '不明') + ' kbps'}</td>
+            <td>${escHtml(ch.content_type || '')}</td>
+            <td>${trackerCell}</td>
+            <td>${contactCell}</td>
+            <td>${personaCell}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+      } catch (e) {
+        statusEl.textContent = 'エラー: ' + e;
+      }
+    }
+
+    // 発見済みチャンネル一覧(ネットワーク)を取得して表示する
+    async function loadChannels() {
+      const statusEl = document.getElementById('list-status');
+      try {
+        const res = await fetch('/api/v1/channels');
+        if (!res.ok) { statusEl.textContent = 'エラー: ' + res.status; return; }
+        const channels = await res.json();
+        const tbody = document.getElementById('channels-body');
+        tbody.innerHTML = '';
+        if (channels.length === 0) {
+          statusEl.textContent = 'チャンネルはありません。';
+          return;
+        }
+        statusEl.textContent = '';
+        document.getElementById('channels-table').hidden = false;
+
+        for (const ch of channels) {
+          const tr = document.createElement('tr');
+
+          // TIP 空(firewalled)チャンネルの判定
+          const isFirewalled = !ch.tip;
+
+          // コンタクト URL 警告
+          let contactCell = '';
+          if (ch.contact_url) {
+            if (ch.url_warning) {
+              contactCell = `<span class="url-warn" title="警告: http/https 以外のURL">⚠</span>
+                <button class="open-url-btn" data-url="${escHtml(ch.contact_url)}">開く(要確認)</button>`;
+            } else {
+              contactCell = `<a href="${escHtml(ch.contact_url)}" target="_blank" rel="noopener noreferrer">${escHtml(ch.contact_url)}</a>`;
+            }
+          }
+
+          tr.innerHTML = `
+            <td>${escHtml(ch.title || '')}</td>
+            <td>${escHtml(ch.genre || '')}</td>
+            <td>${ch.listener_num === -1 ? '不明' : ch.listener_num}</td>
+            <td>${ch.bitrate === 0 ? '不明' : ch.bitrate + ' kbps'}</td>
+            <td>${escHtml(ch.content_type || '')}</td>
+            <td>${fmtBroadcastTime(ch.starts)}</td>
+            <td>${contactCell}</td>
+            <td title="${escHtml(ch.author_pubkey)}">${shortPubkey(ch.author_pubkey)}</td>
+            <td class="${isFirewalled ? 'firewalled' : ''}">${isFirewalled ? '直接視聴不可(トラッカー未公開)' : escHtml(ch.tip)}</td>
+            <td><button class="mute-btn" data-ch="${escHtml(ch.channel_id)}">ミュート</button></td>
+          `;
+          tbody.appendChild(tr);
+        }
+
+        // 未検証リンクを開くボタンのイベント
+        document.querySelectorAll('.open-url-btn').forEach(btn => {
+          btn.addEventListener('click', () => openConfirm(btn.dataset.url));
+        });
+
+        // ミュートボタンのイベント
+        document.querySelectorAll('.mute-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            if (!confirm('チャンネルをミュートしますか？\n' + btn.dataset.ch)) return;
+            const r = await fetch('/api/v1/mutes', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+              body: JSON.stringify({ kind: 'channel', value: btn.dataset.ch }),
+            });
+            if (r.ok) loadChannels();
+            else alert('ミュート失敗: ' + r.status);
+          });
+        });
+      } catch (e) {
+        statusEl.textContent = 'エラー: ' + e;
+      }
+    }
+
+    function escHtml(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    (async () => {
+      try { await loadToken(); } catch(_) {}
+      await Promise.all([loadStatus(), loadAnnounced(), loadChannels()]);
+    })();
+  </script>
+</body>
+</html>

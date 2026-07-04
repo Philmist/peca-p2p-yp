@@ -16,7 +16,10 @@ tokio = { version = "1.52.3", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-windows = { version = "0.62.2", default-features = false }
+windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [lints.rust]
 warnings = "deny"
@@ -25,7 +28,7 @@ warnings = "deny"
 cucumber = "0.23.0"
 http-body-util = "0.1"
 tempfile = "3"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full", "test-util"] }
 
 [[test]]
 name = "cucumber"
@@ -38,3 +41,27 @@ path = "tests/contract/gossip_frames.rs"
 [[test]]
 name = "local_api"
 path = "tests/contract/local_api.rs"
+
+[[test]]
+name = "pcp_handshake"
+path = "tests/contract/pcp_handshake.rs"
+
+[[test]]
+name = "event_30311"
+path = "tests/contract/event_30311.rs"
+
+[[test]]
+name = "event_validation"
+path = "tests/contract/event_validation.rs"
+
+[[test]]
+name = "index_txt"
+path = "tests/contract/index_txt.rs"
+
+[[test]]
+name = "announce_flow"
+path = "tests/integration/announce_flow.rs"
+
+[[test]]
+name = "discover_flow"
+path = "tests/integration/discover_flow.rs"

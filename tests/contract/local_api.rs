@@ -698,3 +698,84 @@ async fn export_peers_returns_verified_only_text_plain() {
     assert!(!text.contains("192.0.2.21:7147"));
     assert!(text.ends_with('\n'));
 }
+
+// ---------------------------------------------------------------------------
+// index.txt HTTP 契約(T042 — contracts/http-yp.md)
+// ---------------------------------------------------------------------------
+
+/// `GET /index.txt` は Host 検証・トークン不要で 200 を返す。
+/// `/api/v1` 保護層の外側にルートが配置されていることを確認する。
+#[tokio::test]
+async fn index_txt_get_bypasses_api_protection() {
+    let (security, _p, _d) = temp_security_log();
+    let app = web::build_router(test_state(security));
+    // Host ヘッダなし・X-Api-Token なしで GET → 200 であることを確認
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/index.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET /index.txt は /api/v1 保護層の外側のため Host/Token 不要"
+    );
+    // Content-Type は text/plain であること
+    let ctype = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("Content-Type ヘッダが必要")
+        .to_str()
+        .unwrap();
+    assert!(ctype.starts_with("text/plain"), "Content-Type: {ctype}");
+}
+
+/// `HEAD /index.txt` はボディなしで 200 を返す。
+#[tokio::test]
+async fn index_txt_head_returns_empty_body() {
+    let (security, _p, _d) = temp_security_log();
+    let app = web::build_router(test_state(security));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/index.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // HEAD ではボディが空
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(bytes.is_empty(), "HEAD のボディは空であること");
+}
+
+/// `POST /index.txt` は 405 Method Not Allowed を返す(GET/HEAD のみ受け付ける)。
+#[tokio::test]
+async fn index_txt_post_is_405() {
+    let (security, _p, _d) = temp_security_log();
+    let app = web::build_router(test_state(security));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/index.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "GET/HEAD 以外は 405"
+    );
+}

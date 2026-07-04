@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ペルソナ管理 — peca-p2p-yp</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 0.3rem 0.5rem; text-align: left; font-size: 0.9rem; }
+    th { background: #f0f0f0; }
+    .err { color: #b00; }
+    .ok { color: #060; }
+    .muted { color: #888; }
+    .unavailable { color: #b00; font-style: italic; }
+    .current-persona { background: #e6ffe6; font-weight: bold; }
+    .notice { background: #fff3cd; border: 1px solid #ffc107; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; }
+    button { cursor: pointer; }
+    .warning-box { background: #ffeeba; border: 1px solid #ffc107; padding: 0.7rem 1rem; margin: 0.5rem 0; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; トップ</a></p>
+  <h1>ペルソナ管理</h1>
+
+  <!-- 現在選択中ペルソナの常時明示 (contracts/local-api.md UI 要件 / ADR-0004 §7) -->
+  <div id="current-persona-banner" class="notice" hidden>
+    現在選択中のペルソナ: <strong id="current-persona-label">—</strong>
+    (<code id="current-persona-pubkey"></code>)
+  </div>
+  <div id="no-current-banner" class="notice">
+    現在、チャンネルに割り当てられているペルソナはありません。
+  </div>
+
+  <!-- リンク推定の注意文言 (ADR-0004 §7 — MUST 常設) -->
+  <div class="warning-box">
+    <strong>注意:</strong>
+    同一ノード・同一トラッカーから複数のペルソナで掲載すると、ネットワーク観測によりペルソナ間のリンクが推定されうることに留意してください。
+  </div>
+
+  <section>
+    <h2>新規ペルソナ作成</h2>
+    <label>表示名: <input id="new-label" type="text" maxlength="64" placeholder="ペルソナ名(最大 64 文字)"></label>
+    <button id="create-btn">作成</button>
+    <div id="create-result"></div>
+  </section>
+
+  <section>
+    <h2>ペルソナ一覧</h2>
+    <div id="list-status" class="muted">読み込み中...</div>
+    <table id="personas-table" hidden>
+      <thead>
+        <tr>
+          <th>公開鍵(短縮)</th><th>表示名</th><th>状態</th><th>作成日時</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="personas-body"></tbody>
+    </table>
+  </section>
+
+  <noscript>この画面は JavaScript を利用します。</noscript>
+  <script>
+    let token = null;
+    let currentPersonas = [];
+
+    async function loadToken() {
+      const res = await fetch('/api/v1/token');
+      if (!res.ok) throw new Error('token');
+      token = (await res.json()).token;
+    }
+
+    function shortPubkey(pk) {
+      if (!pk) return '';
+      return pk.substring(0, 16) + '…';
+    }
+
+    function fmtTime(sec) {
+      if (!sec) return '—';
+      return new Date(sec * 1000).toLocaleString();
+    }
+
+    async function loadPersonas() {
+      const statusEl = document.getElementById('list-status');
+      try {
+        const res = await fetch('/api/v1/personas');
+        if (!res.ok) { statusEl.textContent = 'エラー: ' + res.status; return; }
+        currentPersonas = await res.json();
+        const tbody = document.getElementById('personas-body');
+        tbody.innerHTML = '';
+
+        // 現在選択中ペルソナの表示
+        const currentActive = currentPersonas.find(p => p.channel_assigned && p.state === 'active');
+        if (currentActive) {
+          document.getElementById('current-persona-banner').hidden = false;
+          document.getElementById('no-current-banner').hidden = true;
+          document.getElementById('current-persona-label').textContent = currentActive.label;
+          document.getElementById('current-persona-pubkey').textContent = shortPubkey(currentActive.pubkey);
+        } else {
+          document.getElementById('current-persona-banner').hidden = true;
+          document.getElementById('no-current-banner').hidden = false;
+        }
+
+        if (currentPersonas.length === 0) {
+          statusEl.textContent = 'ペルソナはありません。';
+          document.getElementById('personas-table').hidden = true;
+          return;
+        }
+        statusEl.textContent = '';
+        document.getElementById('personas-table').hidden = false;
+
+        for (const p of currentPersonas) {
+          const tr = document.createElement('tr');
+          const isUnavailable = p.state === 'unavailable';
+          const isCurrent = p.channel_assigned && p.state === 'active';
+          if (isCurrent) tr.className = 'current-persona';
+
+          let stateLabel = p.state === 'active' ? '有効' : p.state === 'archived' ? 'アーカイブ' : '利用不可';
+          if (isUnavailable) stateLabel = '<span class="unavailable">利用不可(復号失敗)</span>';
+
+          let ops = '';
+          if (!isUnavailable) {
+            ops += `<button class="archive-btn" data-pk="${escHtml(p.pubkey)}" data-state="${escHtml(p.state)}">
+              ${p.state === 'archived' ? '有効化' : 'アーカイブ'}</button> `;
+            ops += `<button class="export-btn" data-pk="${escHtml(p.pubkey)}" data-label="${escHtml(p.label)}">nsec エクスポート</button> `;
+          }
+          ops += `<button class="delete-btn" data-pk="${escHtml(p.pubkey)}" data-label="${escHtml(p.label)}">破棄</button>`;
+
+          tr.innerHTML = `
+            <td title="${escHtml(p.pubkey)}">${shortPubkey(p.pubkey)}</td>
+            <td>${escHtml(p.label)}</td>
+            <td>${stateLabel}</td>
+            <td>${fmtTime(p.created_at)}</td>
+            <td>${ops}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+
+        // アーカイブ/有効化ボタン
+        document.querySelectorAll('.archive-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const newState = btn.dataset.state === 'archived' ? 'active' : 'archived';
+            const r = await fetch('/api/v1/personas/' + btn.dataset.pk, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+              body: JSON.stringify({ state: newState }),
+            });
+            if (r.ok) loadPersonas();
+            else alert('操作失敗: ' + r.status);
+          });
+        });
+
+        // nsec エクスポートボタン (contracts/local-api.md §export — 警告 + 確認)
+        document.querySelectorAll('.export-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const label = btn.dataset.label;
+            const warning =
+              `【警告】ペルソナ「${label}」の秘密鍵(nsec)をエクスポートします。\n\n` +
+              '・秘密鍵を知る者はこのペルソナとして掲載できます。\n' +
+              '・ペルソナを破棄した後は復元できず、これが唯一のバックアップ手段です。\n\n' +
+              '本当にエクスポートしますか？';
+            if (!confirm(warning)) return;
+            const r = await fetch('/api/v1/personas/' + btn.dataset.pk + '/export', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+              body: JSON.stringify({ confirm: true }),
+            });
+            if (r.ok) {
+              const data = await r.json();
+              alert('nsec:\n\n' + data.nsec + '\n\n' + (data.warning || '') +
+                '\n\n安全な場所に保管してください。この画面を閉じると再表示できません。');
+            } else {
+              alert('エクスポート失敗: ' + r.status);
+            }
+          });
+        });
+
+        // 破棄ボタン
+        document.querySelectorAll('.delete-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            if (!confirm(`ペルソナ「${btn.dataset.label}」を破棄しますか？\nこの操作は復元できません。`)) return;
+            const r = await fetch('/api/v1/personas/' + btn.dataset.pk + '?confirm=true', {
+              method: 'DELETE',
+              headers: { 'X-Api-Token': token },
+            });
+            if (r.ok) loadPersonas();
+            else alert('破棄失敗: ' + r.status);
+          });
+        });
+
+      } catch (e) {
+        statusEl.textContent = 'エラー: ' + e;
+      }
+    }
+
+    document.getElementById('create-btn').addEventListener('click', async () => {
+      const label = document.getElementById('new-label').value.trim();
+      if (!label) { document.getElementById('create-result').innerHTML = '<span class="err">表示名を入力してください。</span>'; return; }
+      const r = await fetch('/api/v1/personas', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+        body: JSON.stringify({ label }),
+      });
+      const resultEl = document.getElementById('create-result');
+      if (r.ok) {
+        const data = await r.json();
+        resultEl.innerHTML = '<span class="ok">作成しました: ' + escHtml(data.pubkey) + '</span>';
+        document.getElementById('new-label').value = '';
+        loadPersonas();
+      } else {
+        resultEl.innerHTML = '<span class="err">作成失敗: ' + r.status + '</span>';
+      }
+    });
+
+    function escHtml(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    (async () => {
+      try { await loadToken(); } catch(e) {}
+      await loadPersonas();
+    })();
+  </script>
+</body>
+</html>

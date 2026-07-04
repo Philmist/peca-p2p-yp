@@ -28,11 +28,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
+use crate::event::view::ChannelDirectory;
+use crate::identity::IdentityManager;
 use crate::security::{SecurityCategory, SecurityLog};
 use crate::store::Store;
 
+pub mod announced;
+pub mod channels;
+pub mod mutes;
 pub mod peers;
+pub mod personas;
 pub mod settings;
+
+use crate::web::announced::{AnnouncedProvider, NodeStatusProvider};
 
 /// `/api/v1` のボディサイズ上限(64KB。境界含む = 65536 バイトまで許容)。
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -59,6 +67,16 @@ pub struct AppState {
     pub allowed_hosts: Arc<HashSet<String>>,
     /// 接続元ごとのレート制限器。
     pub rate_limiter: Arc<RateLimiter>,
+    /// index.txt 専用レート制限器(10 req/秒 — contracts/http-yp.md)。
+    pub index_txt_rate_limiter: Arc<RateLimiter>,
+    /// チャンネル一覧の供給元(T039)。未配線時は `None`(空一覧として扱う)。
+    pub directory: Option<Arc<dyn ChannelDirectory>>,
+    /// ペルソナ管理(T028)。未配線時は `None`(ペルソナ API は 503 相当を返す)。
+    pub identity: Option<Arc<IdentityManager>>,
+    /// 掲載中チャンネルの供給元(T031)。未配線時は `None`(空一覧)。
+    pub announced: Option<Arc<dyn AnnouncedProvider>>,
+    /// ノード状態の供給元(T031)。未配線時は `None`(全て 0/false)。
+    pub node_status: Option<Arc<dyn NodeStatusProvider>>,
 }
 
 impl AppState {
@@ -71,6 +89,11 @@ impl AppState {
             token: Arc::from(generate_token().as_str()),
             allowed_hosts: Arc::new(loopback_hosts(http_port)),
             rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
+            index_txt_rate_limiter: Arc::new(RateLimiter::per_second(10)),
+            directory: None,
+            identity: None,
+            announced: None,
+            node_status: None,
         }
     }
 
@@ -88,7 +111,36 @@ impl AppState {
             token: Arc::from(token.into().as_str()),
             allowed_hosts: Arc::new(allowed_hosts),
             rate_limiter: Arc::new(rate_limiter),
+            index_txt_rate_limiter: Arc::new(RateLimiter::per_second(10)),
+            directory: None,
+            identity: None,
+            announced: None,
+            node_status: None,
         }
+    }
+
+    /// チャンネル一覧の供給元を配線する(起動配線・テストで使用)。
+    pub fn with_directory(mut self, directory: Arc<dyn ChannelDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    /// ペルソナ管理を配線する(起動配線・テストで使用)。
+    pub fn with_identity(mut self, identity: Arc<IdentityManager>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// 掲載中チャンネルの供給元を配線する(起動配線・テストで使用)。
+    pub fn with_announced(mut self, announced: Arc<dyn AnnouncedProvider>) -> Self {
+        self.announced = Some(announced);
+        self
+    }
+
+    /// ノード状態の供給元を配線する(起動配線・テストで使用)。
+    pub fn with_node_status(mut self, node_status: Arc<dyn NodeStatusProvider>) -> Self {
+        self.node_status = Some(node_status);
+        self
     }
 
     /// セッショントークン。
@@ -198,6 +250,7 @@ fn unix_now() -> u64 {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .nest("/api/v1", api_router(state.clone()))
+        .merge(crate::yp::index_txt::routes())
         .fallback(static_handler)
         .with_state(state)
 }
@@ -210,7 +263,11 @@ pub(crate) fn api_router(state: AppState) -> Router<AppState> {
             "/settings",
             get(settings::get_settings).put(settings::put_settings),
         )
+        .merge(channels::routes())
+        .merge(mutes::routes())
         .merge(peers::routes())
+        .merge(personas::routes())
+        .merge(announced::routes())
         // 未定義パスも保護層を通し定型 404 を返す(layer は未マッチ経路には及ばないため
         // fallback をルートとして持たせ、全 `/api/v1` パスで保護層が評価されるようにする)
         .fallback(api_not_found)
@@ -249,10 +306,14 @@ async fn static_handler(req: Request) -> Response {
     const INDEX_HTML: &str = include_str!("../../ui/index.html");
     const SETTINGS_HTML: &str = include_str!("../../ui/settings.html");
     const PEERS_HTML: &str = include_str!("../../ui/peers.html");
+    const CHANNELS_HTML: &str = include_str!("../../ui/channels.html");
+    const PERSONAS_HTML: &str = include_str!("../../ui/personas.html");
     let html = match req.uri().path() {
         "/" | "/index.html" => Some(INDEX_HTML),
         "/settings.html" => Some(SETTINGS_HTML),
         "/peers.html" => Some(PEERS_HTML),
+        "/channels.html" => Some(CHANNELS_HTML),
+        "/personas.html" => Some(PERSONAS_HTML),
         _ => None,
     };
     match html {

@@ -1,8 +1,9 @@
-//! 起動配線(T020)
+//! 起動配線(T020 + Phase 3/4 統合)
 //!
-//! 設定読込 → ストア → セキュリティログ → P2P(待受+外向き接続維持ループ)→ Web の
-//! 起動監視と graceful shutdown を行う。起動フローは config.rs / web/mod.rs / p2p/runtime.rs
-//! の公開 API を配線するのみで、業務ロジックは各モジュールが持つ。
+//! 設定読込 → ストア → セキュリティログ → gossip ハブ → P2P(待受+外向き維持)→
+//! PCP アナウンス待受 → 掲載エンジン(ペルソナ署名・再発行)→ Web の起動監視と
+//! graceful shutdown を行う。起動フローは各モジュールの公開 API を配線するのみで、
+//! 業務ロジックは各モジュールが持つ。
 //!
 //! 終了コード: 引数・設定の不正は 2、実行時の初期化・サーバ異常は 1。
 //! エラー文言は定型で内部情報を含めない(Principle II)。
@@ -10,16 +11,28 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
+use tokio::task::JoinHandle;
 
 use peca_p2p_yp::config::{self, CliOverrides, Settings};
+use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
+use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
+use peca_p2p_yp::event::store::StoreConfig;
+use peca_p2p_yp::identity::IdentityManager;
+use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
+use peca_p2p_yp::pcp::channel::{AnnouncedChannel, ChannelChange, ChannelRegistry, ChannelState};
 use peca_p2p_yp::security::SecurityLog;
 use peca_p2p_yp::store::Store;
+use peca_p2p_yp::web::announced::{AnnouncedProvider, AnnouncedSummary, NodeStatusProvider};
 use peca_p2p_yp::web::{AppState, build_router};
+
+/// 鮮度切れ・期限切れイベントの物理回収(sweep)周期。
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() {
@@ -67,6 +80,7 @@ async fn run() -> Result<(), i32> {
     // 6. バインドアドレスの確定(検証済み)。
     let p2p_addr = settings.p2p_addr().map_err(exit_config)?;
     let http_addr = settings.http_addr().map_err(exit_config)?;
+    let pcp_addr = settings.pcp_addr().map_err(exit_config)?;
 
     // 7. ピア管理(Settings の目標値を反映)。
     let peer_config = PeerManagerConfig {
@@ -76,14 +90,31 @@ async fn run() -> Result<(), i32> {
     };
     let peers = Arc::new(PeerManager::new(Arc::clone(&store), peer_config));
 
-    // 8. 起動時 nonce(自己接続検出用)と待受ポート。
+    // 8. gossip ハブ(EventStore・DedupCache・一覧ビュー・再伝搬 — T037/T039)。
+    let store_config = StoreConfig {
+        freshness_window_sec: settings.freshness_window_sec,
+        event_store_max: settings.event_store_max as usize,
+        ..StoreConfig::default()
+    };
+    let verify = VerifyConfig {
+        max_clock_skew_sec: settings.max_clock_skew_sec,
+        min_pow_bits: settings.min_pow_bits.min(255) as u8,
+    };
+    let hub = GossipHub::new(
+        Arc::clone(&store),
+        Arc::clone(&security),
+        store_config,
+        verify,
+    );
+
+    // 9. 起動時 nonce(自己接続検出用)と待受ポート。
     let nonce: u64 = rand::random();
     let listen_port = p2p_addr.map(|a| a.port()).unwrap_or(0);
 
-    // 9. graceful shutdown 伝播チャネル。
+    // 10. graceful shutdown 伝播チャネル。
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 10. P2P 待受のバインド(失敗は起動失敗)。空文字設定なら待受なし(外向きのみ)。
+    // 11. P2P 待受のバインド(失敗は起動失敗)。空文字設定なら待受なし(外向きのみ)。
     let p2p_listener = match p2p_addr {
         Some(addr) => Some(TcpListener::bind(addr).await.map_err(|_| {
             eprintln!("P2P 待受アドレスにバインドできませんでした");
@@ -92,24 +123,78 @@ async fn run() -> Result<(), i32> {
         None => None,
     };
 
-    // 11. P2P ランタイム起動。
+    // 12. P2P ランタイム起動(ハブへ受信処理・SYNC・再伝搬を委譲)。
     let runtime = Arc::new(P2pRuntime::new(
         Arc::clone(&peers),
         Arc::clone(&security),
+        Arc::clone(&hub),
         nonce,
         listen_port,
     ));
-    let p2p_handles = Arc::clone(&runtime).spawn(p2p_listener, shutdown_rx.clone());
+    let mut handles = Arc::clone(&runtime).spawn(p2p_listener, shutdown_rx.clone());
 
-    // 12. Web 起動。
-    let state = AppState::new(Arc::clone(&store), Arc::clone(&security), http_addr.port());
+    // 13. PCP アナウンス待受(loopback のみ — ADR-0006 決定 4)。
+    let registry = ChannelRegistry::new();
+    let pcp_listener = TcpListener::bind(pcp_addr).await.map_err(|_| {
+        eprintln!("PCP 待受アドレスにバインドできませんでした");
+        1
+    })?;
+    {
+        let registry = Arc::clone(&registry);
+        let security = Arc::clone(&security);
+        let sd = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            peca_p2p_yp::pcp::session::serve(pcp_listener, registry, security, sd).await;
+        }));
+    }
+
+    // 14. ペルソナ管理と掲載エンジン(T028/T029)。
+    let identity = Arc::new(IdentityManager::new(Arc::clone(&store)));
+    let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
+    let engine = Arc::new(PublishEngine::new(
+        Arc::clone(&identity),
+        sink,
+        settings.republish_interval_sec,
+    ));
+    // 14a. PCP 変更契機の即時発行(announced/updated → live、ended → 最終発行)。
+    handles.push(spawn_publish_bridge(
+        registry.subscribe(),
+        Arc::clone(&engine),
+        shutdown_rx.clone(),
+    ));
+    // 14b. 周期再発行ループ(掲載中スナップショット)。
+    let snapshot_registry = Arc::clone(&registry);
+    let snapshot: Arc<dyn Fn() -> Vec<ChannelListing> + Send + Sync> = Arc::new(move || {
+        snapshot_registry
+            .snapshot()
+            .iter()
+            .filter(|c| c.state != ChannelState::Ended)
+            .map(AnnouncedChannel::to_listing)
+            .collect()
+    });
+    handles.push(Arc::clone(&engine).spawn_republish_loop(snapshot, shutdown_rx.clone()));
+    // 14c. 鮮度切れ・期限切れイベントの物理回収。
+    handles.push(spawn_sweep_loop(Arc::clone(&hub), shutdown_rx.clone()));
+
+    // 15. Web 起動(一覧・ペルソナ・掲載状態の供給元を注入)。
+    let state = AppState::new(Arc::clone(&store), Arc::clone(&security), http_addr.port())
+        .with_directory(Arc::clone(&hub) as Arc<_>)
+        .with_identity(Arc::clone(&identity))
+        .with_announced(Arc::new(AnnouncedAdapter {
+            registry: Arc::clone(&registry),
+            identity: Arc::clone(&identity),
+        }))
+        .with_node_status(Arc::new(StatusAdapter {
+            hub: Arc::clone(&hub),
+            pcp_listening: true,
+        }));
     let app = build_router(state);
     let http_listener = TcpListener::bind(http_addr).await.map_err(|_| {
         eprintln!("HTTP 待受アドレスにバインドできませんでした");
         1
     })?;
 
-    // 13. 起動サマリ(バインドアドレス・既知ピア数のみ。内部情報なし)。
+    // 16. 起動サマリ(バインドアドレス・既知ピア数のみ。内部情報なし)。
     let known_peers = store.count_peers().unwrap_or(0);
     let p2p_desc = p2p_addr
         .map(|a| a.to_string())
@@ -118,13 +203,14 @@ async fn run() -> Result<(), i32> {
         target: "startup",
         http = %http_addr,
         p2p = %p2p_desc,
+        pcp = %pcp_addr,
         outbound_target = settings.p2p_outbound_target,
         inbound_max = settings.p2p_inbound_max,
         known_peers,
         "起動しました(停止は Ctrl+C)"
     );
 
-    // 14. serve + graceful shutdown(Ctrl+C で全サブシステムへ伝播)。
+    // 17. serve + graceful shutdown(Ctrl+C で全サブシステムへ伝播)。
     //     レート制限の接続元取得に connect-info が必須(T019 申し送り)。
     let serve = axum::serve(
         http_listener,
@@ -138,8 +224,8 @@ async fn run() -> Result<(), i32> {
 
     let serve_result = serve.await;
 
-    // 15. P2P ループの終了を待つ(shutdown を検知して自走終了する)。
-    for handle in p2p_handles {
+    // 18. 各サブシステムの終了を待つ(shutdown を検知して自走終了する)。
+    for handle in handles {
         let _ = handle.await;
     }
 
@@ -149,6 +235,126 @@ async fn run() -> Result<(), i32> {
     }
     tracing::info!(target: "startup", "停止しました");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 配線アダプタ(業務ロジックなし — lib の trait を bin で結線する)
+// ---------------------------------------------------------------------------
+
+/// [`PublishEngine`] → [`GossipHub`] の発行受け口。
+struct HubSink(Arc<GossipHub>);
+
+impl EventSink for HubSink {
+    fn publish_local(&self, event: nostr::Event) -> bool {
+        self.0.publish_local(event).should_propagate()
+    }
+}
+
+/// PCP レジストリ + ペルソナ割当 → 掲載状態 API(T031)の供給元。
+struct AnnouncedAdapter {
+    registry: Arc<ChannelRegistry>,
+    identity: Arc<IdentityManager>,
+}
+
+impl AnnouncedProvider for AnnouncedAdapter {
+    fn list(&self) -> Vec<AnnouncedSummary> {
+        self.registry
+            .snapshot()
+            .into_iter()
+            .map(|ch| {
+                let channel_id = ch.channel_id_hex();
+                let persona_pubkey = self
+                    .identity
+                    .persona_for_channel(&channel_id)
+                    .ok()
+                    .flatten();
+                AnnouncedSummary {
+                    channel_id,
+                    name: ch.name,
+                    genre: ch.genre,
+                    description: ch.description,
+                    contact_url: ch.contact_url,
+                    bitrate_kbps: ch.bitrate_kbps as u64,
+                    content_type: ch.content_type,
+                    tracker: ch.tracker.unwrap_or_default(),
+                    listeners: ch.listeners,
+                    relays: ch.relays_cnt,
+                    started_at: ch.started_at,
+                    state: match ch.state {
+                        ChannelState::Announced => "announced",
+                        ChannelState::Updating => "updating",
+                        ChannelState::Ended => "ended",
+                    }
+                    .to_string(),
+                    persona_pubkey,
+                }
+            })
+            .collect()
+    }
+}
+
+/// gossip ハブ → 全体状態 API(T031 基本形)の供給元。
+struct StatusAdapter {
+    hub: Arc<GossipHub>,
+    pcp_listening: bool,
+}
+
+impl NodeStatusProvider for StatusAdapter {
+    fn pcp_listening(&self) -> bool {
+        self.pcp_listening
+    }
+    fn established(&self) -> (usize, usize) {
+        self.hub.established_counts()
+    }
+}
+
+/// PCP 変更通知を掲載エンジンの発行へ橋渡しするタスク。
+fn spawn_publish_bridge(
+    mut rx: broadcast::Receiver<ChannelChange>,
+    engine: Arc<PublishEngine>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                msg = rx.recv() => match msg {
+                    Ok(ChannelChange::Announced(ch)) | Ok(ChannelChange::Updated(ch)) => {
+                        if let Err(e) = engine.publish_listing(&ch.to_listing()) {
+                            tracing::warn!(target: "publish", "掲載の発行に失敗しました: {e}");
+                        }
+                    }
+                    Ok(ChannelChange::Ended(ch)) => {
+                        if let Err(e) = engine.publish_ended(&ch.to_listing()) {
+                            tracing::warn!(target: "publish", "終了イベントの発行に失敗しました: {e}");
+                        }
+                    }
+                    // 取りこぼし(Lagged)は次の周期再発行が回復する。
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    })
+}
+
+/// 鮮度切れ・期限切れイベントの物理回収ループ。
+fn spawn_sweep_loop(hub: Arc<GossipHub>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+        ticker.tick().await; // 起動直後の即時 tick は読み捨てる
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = ticker.tick() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    hub.sweep();
+                }
+            }
+        }
+    })
 }
 
 /// data-dir を解決する。`--data-dir` 未指定時は `%APPDATA%\peca-p2p-yp`。

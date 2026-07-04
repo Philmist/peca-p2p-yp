@@ -4,9 +4,11 @@
 //! TCP 待受・外向き接続維持ループへ配線する。担うのは **HELLO/HELLO_ACK 交換による
 //! established 到達 → established 維持 → 切断検出 → fail_count 反映と再接続バックオフ**まで。
 //!
-//! established 後の EVENT 伝搬・接続時同期(SYNC)・keepalive の周期送信は Phase 4 以降
-//! (T037/T038/T046)の責務のため、本ランタイムでは受信データメッセージ
-//! ([`SessionAction::Deliver`])を破棄する(接続維持のためだけに読み続ける)。
+//! established 後の EVENT 伝搬・接続時同期(SYNC)は [`crate::p2p::hub::GossipHub`] と
+//! 本ランタイムが連携して担う(T037/T038)。各 established 接続は送信キュー(mpsc)を
+//! ハブへ登録し、pump は「ソケット受信」と「送信キュー」を多重化して駆動する。
+//! keepalive の周期送信・無応答切断は Phase 5(T046)の責務のため、本ランタイムでは
+//! 受信 PING に PONG を返すのみとする。
 //!
 //! graceful shutdown は [`tokio::sync::watch`] で全ループ・全接続へ伝播する。
 
@@ -17,13 +19,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::p2p::frame::{Message, close_reason, read_frame, write_frame};
+use crate::p2p::hub::GossipHub;
 use crate::p2p::peers::{CandidateMode, InboundOutcome, OutboundOutcome, PeerManager};
 use crate::p2p::session::{Direction, Session, SessionAction, SessionConfig};
-use crate::security::SecurityLog;
+use crate::p2p::sync::{self, SyncCounter};
+use crate::security::{SecurityCategory, SecurityLog};
 
 /// 外向き接続維持ループの周期。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -32,6 +37,8 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 pub struct P2pRuntime {
     peers: Arc<PeerManager>,
     security: Arc<SecurityLog>,
+    /// gossip ハブ(受信処理・再伝搬・一覧供給・SYNC 供給)。
+    hub: Arc<GossipHub>,
     /// 自ノードの起動時 nonce(自己接続検出用 — HELLO で申告)。
     nonce: u64,
     /// 自ノードの待受ポート(HELLO で申告。待受無効時は 0)。
@@ -56,20 +63,29 @@ fn unix_now() -> i64 {
 
 impl P2pRuntime {
     /// ランタイムを作成する。
+    ///
+    /// `hub` は受信処理・再伝搬・SYNC 供給・一覧供給を担う共有ハブ(T037)。
     pub fn new(
         peers: Arc<PeerManager>,
         security: Arc<SecurityLog>,
+        hub: Arc<GossipHub>,
         nonce: u64,
         listen_port: u16,
     ) -> Self {
         Self {
             peers,
             security,
+            hub,
             nonce,
             listen_port,
             backoff: Mutex::new(HashMap::new()),
             start: Instant::now(),
         }
+    }
+
+    /// 共有ハブへの参照(main 配線・status API 用)。
+    pub fn hub(&self) -> &Arc<GossipHub> {
+        &self.hub
     }
 
     /// 起動時基点からの単調経過秒。
@@ -281,8 +297,9 @@ impl P2pRuntime {
 
     /// 確立済みトランスポート上でセッションを駆動する。established に達したら `true`。
     ///
-    /// outbound の HELLO は呼び出し側が送信済みの前提。以降フレームを読み続けて状態機械へ渡す。
-    /// established 後の受信データは破棄する(伝搬・同期は Phase 4)。
+    /// outbound の HELLO は呼び出し側が送信済みの前提。ソケット受信と、ハブに登録した
+    /// 送信キュー(再伝搬・PONG・SYNC 応答の平滑送信)を多重化して駆動する。
+    /// established 直後に SYNC_REQ を送り、受信 EVENT はハブの受信パイプラインへ渡す。
     async fn pump<R, W>(
         &self,
         mut session: Session,
@@ -297,11 +314,28 @@ impl P2pRuntime {
         W: AsyncWrite + Unpin,
     {
         let mut established = false;
+        // 送信キュー: 他接続からの再伝搬・PONG・SYNC 応答の平滑送信を本接続へ流す。
+        let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Message>();
+        let mut conn_id: Option<u64> = None;
+        let store_max = self.hub.store_config().event_store_max;
+        let mut sync_counter = SyncCounter::new(store_max);
+
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
                     send_close(&mut writer, close_reason::GOING_AWAY).await;
                     break;
+                }
+                // ハブ・他接続からの送信要求(established 後のみ流入する)。
+                queued = outbox_rx.recv() => {
+                    match queued {
+                        Some(msg) => {
+                            if write_frame(&mut writer, &msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break, // 送信口がすべて閉じた(通常起きない)
+                    }
                 }
                 res = read_frame(&mut reader) => {
                     let frame = match res {
@@ -329,10 +363,24 @@ impl P2pRuntime {
                                     }
                                     SessionAction::Established => {
                                         established = true;
+                                        let id = self.hub.next_conn_id();
+                                        conn_id = Some(id);
+                                        self.hub.register_peer(id, addr, direction, outbox_tx.clone());
                                         self.on_established(direction, addr);
+                                        // established 直後に SYNC_REQ(since = now − 鮮度窓)。
+                                        let since = sync::sync_req_since(
+                                            unix_now_u64(),
+                                            self.hub.store_config().freshness_window_sec,
+                                        );
+                                        sync_counter.begin();
+                                        let _ = outbox_tx.send(Message::SyncReq { since });
                                     }
-                                    // EVENT/SYNC_REQ/PEERS/PING 等は Phase 4 以降で処理する。
-                                    SessionAction::Deliver(_) => {}
+                                    SessionAction::Deliver(msg) => {
+                                        if !self.handle_deliver(msg, addr, conn_id, &outbox_tx, &mut sync_counter).await {
+                                            stop = true;
+                                            break;
+                                        }
+                                    }
                                     SessionAction::PeerClosed(_) => {
                                         stop = true;
                                         break;
@@ -353,7 +401,60 @@ impl P2pRuntime {
                 }
             }
         }
+        if let Some(id) = conn_id {
+            self.hub.unregister_peer(id);
+        }
         established
+    }
+
+    /// established 後の受信メッセージを処理する。継続してよければ `true`、切断すべきなら `false`。
+    async fn handle_deliver(
+        &self,
+        message: Message,
+        addr: &str,
+        conn_id: Option<u64>,
+        outbox_tx: &mpsc::UnboundedSender<Message>,
+        sync_counter: &mut SyncCounter,
+    ) -> bool {
+        match message {
+            Message::Event { event } => {
+                // 検査 6: SYNC 応答量の上限(1 回の SYNC_REQ 応答が event_store_max 件超で切断)。
+                if sync_counter.on_event() {
+                    self.security.log(
+                        SecurityCategory::P2pRateLimited,
+                        addr,
+                        "sync response exceeded event_store_max",
+                    );
+                    return false;
+                }
+                // 伝搬規則 1〜4: 検証→重複判定→格納→受信元を除く再伝搬(ハブが担う)。
+                let raw = event.to_string();
+                let id = conn_id.unwrap_or(0);
+                self.hub.on_event(&raw, addr, id);
+                true
+            }
+            Message::SyncReq { since } => {
+                // 応答イベントを平滑化して本接続へ送る(MUST — 受信側レート上限以下)。
+                let (messages, count) = self.hub.sync_response(since, unix_now_u64());
+                let tx = outbox_tx.clone();
+                tokio::spawn(async move {
+                    sync::stream_sync_response(messages, count, tx).await;
+                });
+                true
+            }
+            Message::SyncDone { .. } => {
+                sync_counter.on_done();
+                true
+            }
+            Message::Ping { nonce } => {
+                // keepalive 応答(周期送信・無応答切断は T046)。
+                let _ = outbox_tx.send(Message::Pong { nonce });
+                true
+            }
+            // PONG・PEERS・GET_PEERS は本タスクでは処理しない(keepalive 追跡は T046、
+            // PEX は Phase 6)。前方互換のため受信しても切断しない。
+            _ => true,
+        }
     }
 
     fn on_established(&self, direction: Direction, addr: &str) {
@@ -371,6 +472,14 @@ impl P2pRuntime {
     }
 }
 
+/// 現在の unix 時刻(秒)。SYNC の `since` 計算用。
+fn unix_now_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// CLOSE を送る(ベストエフォート — 失敗は無視)。
 async fn send_close<W: AsyncWrite + Unpin>(writer: &mut W, reason: &'static str) {
     let _ = write_frame(
@@ -385,6 +494,8 @@ async fn send_close<W: AsyncWrite + Unpin>(writer: &mut W, reason: &'static str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::schema::VerifyConfig;
+    use crate::event::store::StoreConfig;
     use crate::p2p::peers::PeerManagerConfig;
     use crate::store::{PeerSource, Store};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -392,11 +503,17 @@ mod tests {
     /// テスト用ランタイムと、その SecurityLog ファイルを保持する tempdir ガードを返す。
     fn runtime(nonce: u64, listen_port: u16) -> (Arc<P2pRuntime>, tempfile::TempDir) {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let peers = Arc::new(PeerManager::new(store, PeerManagerConfig::default()));
+        let peers = Arc::new(PeerManager::new(Arc::clone(&store), PeerManagerConfig::default()));
         let dir = tempfile::tempdir().unwrap();
         let security = Arc::new(SecurityLog::new(dir.path().join("security.log")).unwrap());
+        let hub = GossipHub::new(
+            store,
+            Arc::clone(&security),
+            StoreConfig::default(),
+            VerifyConfig::default(),
+        );
         (
-            Arc::new(P2pRuntime::new(peers, security, nonce, listen_port)),
+            Arc::new(P2pRuntime::new(peers, security, hub, nonce, listen_port)),
             dir,
         )
     }
