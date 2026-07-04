@@ -126,7 +126,7 @@ gossip 受信・自ノード発行の両方のイベントを保持し、SYNC_RE
 |------|------|
 | キー | `(kind, pubkey, d タグ)` |
 | 置換 | 同一キーは `created_at` が最大のイベントのみ保持(last-write-wins。同値なら event id 辞書順大)。**既に保持している同一 event id の再受信は格納・再伝搬とも行わない**(DedupCache 期限切れ後のループ再発を防ぐ第二の防壁 — contracts/p2p-gossip.md §伝搬規則 3) |
-| 除去 | `expiration` 超過 / `status=ended` / `now - created_at > freshness_window_sec` で削除し、以後再伝搬しない(FR-006, research R2) |
+| 除去 | `expiration` 超過 / `status=ended` / `now - created_at > freshness_window_sec` で供給・表示から即時除外し、以後再伝搬しない(FR-006, research R2)。ただし `status=ended` は即時物理削除せず **tombstone として鮮度切れ・`expiration` 到達まで保持**する — 即時削除すると、ended のみ受信したノードで鮮度窓内の古い live イベントのリプレイが空スロットへ格納され、置換の単調性(ADR-0005 StoreMonotonic — `docs/formal/gossip_propagation.tla` で検証済み)に反するため。物理回収は鮮度切れ/`expiration` 超過時に行う |
 | 容量 | `event_store_max`(既定 4,096)。超過時は created_at が古い順に破棄 |
 | 供給 | 接続時同期(SYNC_REQ)には live かつ鮮度窓内のイベントのみを返す |
 

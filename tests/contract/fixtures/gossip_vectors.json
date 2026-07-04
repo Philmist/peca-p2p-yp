@@ -1,0 +1,26 @@
+{
+  "description": "P2P gossip ワイヤプロトコル契約テストベクタ(contracts/p2p-gossip.md)。本実装(src/p2p/frame.rs)とモックピア(T033)の両方に同一のものを適用し、契約書とモック実装の乖離を検出する。valid_messages は encode→decode の往復で構造的に等価であること、forward_compat は未知フィールド/未知 feature を無視して正しい種別へデコードできること、invalid_frames は p2p_invalid_frame として拒否されることを検査する。",
+  "valid_messages": [
+    { "name": "hello_v1", "message": { "type": "HELLO", "version": 1, "listen_port": 7147, "features": [], "nonce": 123456789, "ts": 1720000000 } },
+    { "name": "hello_max_nonce", "message": { "type": "HELLO", "version": 1, "listen_port": 0, "features": [], "nonce": 18446744073709551615, "ts": 4102444800 } },
+    { "name": "hello_ack_v1", "message": { "type": "HELLO_ACK", "version": 1, "listen_port": 7148, "features": [], "nonce": 987654321, "ts": 1720000001 } },
+    { "name": "event_nested", "message": { "type": "EVENT", "event": { "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "created_at": 1720000000, "kind": 30311, "tags": [["d", "cccccccccccccccccccccccccccccccc"], ["status", "live"], ["title", "テスト配信"]], "content": "", "sig": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } } },
+    { "name": "sync_req_large_since", "message": { "type": "SYNC_REQ", "since": 4102444800 } },
+    { "name": "sync_done", "message": { "type": "SYNC_DONE", "count": 42 } },
+    { "name": "get_peers", "message": { "type": "GET_PEERS" } },
+    { "name": "peers", "message": { "type": "PEERS", "peers": ["198.51.100.1:7147", "[2001:db8::1]:7147"] } },
+    { "name": "ping", "message": { "type": "PING", "nonce": 9876543210 } },
+    { "name": "pong", "message": { "type": "PONG", "nonce": 9876543210 } },
+    { "name": "close_incompatible", "message": { "type": "CLOSE", "reason": "incompatible" } }
+  ],
+  "forward_compat": [
+    { "name": "hello_extra_field", "decodes_as": "HELLO", "message": { "type": "HELLO", "version": 1, "listen_port": 7147, "features": [], "nonce": 1, "ts": 1720000000, "future_field": "無視されるべき値", "future_obj": { "a": 1 } } },
+    { "name": "hello_unknown_feature", "decodes_as": "HELLO", "message": { "type": "HELLO", "version": 1, "listen_port": 7147, "features": ["future_feature_x", "future_feature_y"], "nonce": 2, "ts": 1720000000 } }
+  ],
+  "invalid_frames": [
+    { "name": "unknown_type", "message": { "type": "WAT", "foo": 1 } },
+    { "name": "missing_type", "message": { "version": 1, "listen_port": 7147 } },
+    { "name": "wrong_field_type", "message": { "type": "PING", "nonce": "not_a_number" } },
+    { "name": "not_json", "raw_utf8": "{ this is not valid json" }
+  ]
+}

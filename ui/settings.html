@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>設定 — peca-p2p-yp</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 1.5rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.3rem; }
+    .row { display: flex; align-items: center; gap: .75rem; margin: .4rem 0; }
+    .row label { flex: 0 0 220px; font-family: monospace; }
+    .row input[type=text], .row input[type=number] { flex: 1; padding: .25rem; }
+    .note { color: #555; font-size: .85rem; }
+    .bind { color: #a15c00; }
+    #msg { margin: .75rem 0; padding: .6rem; border-radius: 4px; display: none; }
+    #msg.ok { background: #e6f4ea; display: block; }
+    #msg.err { background: #fce8e6; display: block; }
+    #restart { background: #fff4d6; padding: .6rem; border-radius: 4px; margin: .75rem 0; display: none; }
+    button { padding: .4rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>設定</h1>
+  <p class="note"><a href="/">← 一覧へ戻る</a> — data-model §Settings の全キーを閲覧・変更できます。</p>
+  <p class="note bind">バインド系キー(pcp_bind / http_bind / p2p_bind)の変更は再起動後に反映されます。
+  pcp_bind / http_bind は loopback アドレス(127.0.0.1 等)のみ指定できます。</p>
+
+  <div id="msg"></div>
+  <div id="restart"></div>
+
+  <form id="form"></form>
+  <div class="row">
+    <button id="save" type="button">保存</button>
+  </div>
+
+  <script>
+    // バインド系(変更で再起動が必要)。
+    const BIND_KEYS = ["pcp_bind", "http_bind", "p2p_bind"];
+    let token = null;
+
+    // 同一オリジンでセッショントークンを取得する(Host 検証下)。
+    async function fetchToken() {
+      const r = await fetch("/api/v1/token");
+      if (!r.ok) throw new Error("token");
+      token = (await r.json()).token;
+    }
+
+    // 値の型から入力欄の種別を決める。
+    function inputFor(key, value) {
+      if (typeof value === "boolean") {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = value;
+        cb.dataset.key = key;
+        cb.dataset.kind = "bool";
+        return cb;
+      }
+      const inp = document.createElement("input");
+      if (typeof value === "number") {
+        inp.type = "number";
+        inp.dataset.kind = "number";
+      } else {
+        inp.type = "text";
+        inp.dataset.kind = "string";
+      }
+      inp.value = value;
+      inp.dataset.key = key;
+      return inp;
+    }
+
+    async function loadSettings() {
+      const r = await fetch("/api/v1/settings");
+      const s = await r.json();
+      const form = document.getElementById("form");
+      form.innerHTML = "";
+      for (const key of Object.keys(s)) {
+        const row = document.createElement("div");
+        row.className = "row";
+        const label = document.createElement("label");
+        label.textContent = key;
+        if (BIND_KEYS.includes(key)) label.classList.add("bind");
+        row.appendChild(label);
+        row.appendChild(inputFor(key, s[key]));
+        form.appendChild(row);
+      }
+    }
+
+    // フォームから更新オブジェクトを組み立てる(型を復元)。
+    function collect() {
+      const body = {};
+      for (const el of document.querySelectorAll("[data-key]")) {
+        const key = el.dataset.key;
+        if (el.dataset.kind === "bool") body[key] = el.checked;
+        else if (el.dataset.kind === "number") body[key] = Number(el.value);
+        else body[key] = el.value;
+      }
+      return body;
+    }
+
+    function showMsg(text, ok) {
+      const m = document.getElementById("msg");
+      m.textContent = text;
+      m.className = ok ? "ok" : "err";
+    }
+
+    async function save() {
+      const r = await fetch("/api/v1/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "X-Api-Token": token },
+        body: JSON.stringify(collect()),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        showMsg("保存に失敗しました: " + (data.error || r.status), false);
+        return;
+      }
+      showMsg("保存しました。", true);
+      const restart = document.getElementById("restart");
+      if (data.restart_required) {
+        restart.style.display = "block";
+        restart.textContent = "再起動が必要です(変更: " + data.restart_keys.join(", ") + ")。";
+      } else {
+        restart.style.display = "none";
+      }
+    }
+
+    document.getElementById("save").addEventListener("click", save);
+    (async () => {
+      try {
+        await fetchToken();
+        await loadSettings();
+      } catch (e) {
+        showMsg("初期化に失敗しました。", false);
+      }
+    })();
+  </script>
+</body>
+</html>

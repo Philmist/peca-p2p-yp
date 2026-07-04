@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ピア管理 — peca-p2p-yp</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 0.3rem 0.5rem; text-align: left; font-size: 0.9rem; }
+    th { background: #f0f0f0; }
+    textarea { width: 100%; box-sizing: border-box; }
+    .err { color: #b00; }
+    .ok { color: #060; }
+    .muted { color: #888; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; トップ</a></p>
+  <h1>ピア管理</h1>
+
+  <section>
+    <h2>貼り付け一括登録</h2>
+    <p>接続先ピアのアドレスを <code>host:port</code> 形式で 1 行 1 件貼り付けてください
+    (IPv6 は <code>[2001:db8::1]:7147</code> のブラケット表記)。不正な行は個別に報告され、
+    正しい行のみ登録されます。</p>
+    <textarea id="addrs" rows="6" placeholder="198.51.100.10:7147&#10;[2001:db8::1]:7147"></textarea>
+    <p><button id="add-btn">登録</button> <a href="/api/v1/peers/export" id="export-link">エクスポート(verified のみ)</a></p>
+    <div id="add-result"></div>
+  </section>
+
+  <section>
+    <h2>登録済みピア</h2>
+    <div id="list-status" class="muted">読み込み中...</div>
+    <table id="peers-table" hidden>
+      <thead>
+        <tr>
+          <th>アドレス</th><th>取得元</th><th>検証済</th><th>接続中</th>
+          <th>有効</th><th>最終成功</th><th>連続失敗</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="peers-body"></tbody>
+    </table>
+  </section>
+
+  <noscript>この画面は JavaScript を利用します。</noscript>
+  <script>
+    let token = null;
+
+    // セッショントークン取得(変更系リクエストに必要)。
+    async function loadToken() {
+      const res = await fetch('/api/v1/token');
+      if (!res.ok) throw new Error('token');
+      token = (await res.json()).token;
+    }
+
+    function fmtTime(sec) {
+      if (sec === null || sec === undefined) return '—';
+      return new Date(sec * 1000).toLocaleString();
+    }
+
+    async function loadPeers() {
+      const status = document.getElementById('list-status');
+      const table = document.getElementById('peers-table');
+      const body = document.getElementById('peers-body');
+      try {
+        const res = await fetch('/api/v1/peers');
+        if (!res.ok) throw new Error('list');
+        const peers = await res.json();
+        body.innerHTML = '';
+        if (peers.length === 0) {
+          status.textContent = '登録済みのピアはありません。';
+          table.hidden = true;
+          return;
+        }
+        for (const p of peers) {
+          const tr = document.createElement('tr');
+          tr.appendChild(cell(p.addr));
+          tr.appendChild(cell(p.source));
+          tr.appendChild(cell(p.verified ? '✓' : ''));
+          tr.appendChild(cell(p.connected ? '✓' : ''));
+          tr.appendChild(cell(p.enabled ? '有効' : '無効'));
+          tr.appendChild(cell(fmtTime(p.last_ok_at)));
+          tr.appendChild(cell(String(p.fail_count)));
+
+          const ops = document.createElement('td');
+          const toggle = document.createElement('button');
+          toggle.textContent = p.enabled ? '無効化' : '有効化';
+          toggle.onclick = () => setEnabled(p.id, !p.enabled);
+          const del = document.createElement('button');
+          del.textContent = '削除';
+          del.onclick = () => removePeer(p.id);
+          ops.appendChild(toggle);
+          ops.appendChild(document.createTextNode(' '));
+          ops.appendChild(del);
+          tr.appendChild(ops);
+          body.appendChild(tr);
+        }
+        status.textContent = '';
+        table.hidden = false;
+      } catch (e) {
+        status.textContent = '一覧の取得に失敗しました。';
+      }
+    }
+
+    function cell(text) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      return td;
+    }
+
+    async function addPeers() {
+      const result = document.getElementById('add-result');
+      const raw = document.getElementById('addrs').value;
+      const addrs = raw.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+      if (addrs.length === 0) { result.textContent = 'アドレスを入力してください。'; return; }
+      try {
+        const res = await fetch('/api/v1/peers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+          body: JSON.stringify({ addrs }),
+        });
+        if (!res.ok) { result.textContent = '登録に失敗しました。'; return; }
+        const data = await res.json();
+        result.innerHTML = '';
+        const ok = document.createElement('div');
+        ok.className = 'ok';
+        ok.textContent = `${data.added.length} 件を登録しました。`;
+        result.appendChild(ok);
+        for (const err of data.errors) {
+          const e = document.createElement('div');
+          e.className = 'err';
+          e.textContent = `不正: ${err.addr}`;
+          result.appendChild(e);
+        }
+        document.getElementById('addrs').value = '';
+        loadPeers();
+      } catch (e) {
+        result.textContent = '登録に失敗しました。';
+      }
+    }
+
+    async function setEnabled(id, enabled) {
+      await fetch(`/api/v1/peers/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+        body: JSON.stringify({ enabled }),
+      });
+      loadPeers();
+    }
+
+    async function removePeer(id) {
+      await fetch(`/api/v1/peers/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-Api-Token': token },
+      });
+      loadPeers();
+    }
+
+    document.getElementById('add-btn').onclick = addPeers;
+
+    (async () => {
+      try { await loadToken(); } catch (e) {}
+      loadPeers();
+    })();
+  </script>
+</body>
+</html>
