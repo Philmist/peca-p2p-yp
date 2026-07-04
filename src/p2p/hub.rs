@@ -20,13 +20,13 @@ use nostr::Event;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::event::schema::{VerifyConfig, VerifyReject};
+use crate::event::schema::{ChannelListing, VerifyConfig, VerifyReject};
 use crate::event::store::{InsertOutcome, StoreConfig};
 use crate::event::view::{ChannelDirectory, DiscoveredChannel};
 use crate::p2p::frame::Message;
 use crate::p2p::ingest::IngestState;
 use crate::p2p::session::Direction;
-use crate::security::SecurityLog;
+use crate::security::{self, SecurityCategory, SecurityLog};
 use crate::store::Store;
 
 fn unix_now() -> u64 {
@@ -204,6 +204,18 @@ impl GossipHub {
         let result = { lock(&self.state).ingest(raw_json, source, now) };
         match result {
             Ok(Some(event)) => {
+                // URL 警告判定の発動を記録する(FR-012 — data-model §SecurityEvent
+                // `url_warning`)。表示側(channels API / UI)の警告フラグとは独立に、
+                // ネットワーク境界での検出をセキュリティイベントとして残す。
+                if let Ok(listing) = ChannelListing::from_event(&event)
+                    && security::url_needs_warning(listing.contact.as_deref().unwrap_or(""))
+                {
+                    self.security.log(
+                        SecurityCategory::UrlWarning,
+                        source,
+                        "contact url scheme is not http/https",
+                    );
+                }
                 // 格納成功 → 受信元を除く established 全ピアへ再伝搬(伝搬規則 4)
                 self.broadcast_event(&event, Some(conn_id));
             }
@@ -298,6 +310,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     const D1: &str = "0123456789abcdef0123456789abcdef";
+    const D2: &str = "0123456789abcdef0123456789abcdee";
 
     fn listing(d: &str, status: ChannelStatus, title: &str) -> ChannelListing {
         ChannelListing {
@@ -323,11 +336,14 @@ mod tests {
     }
 
     fn hub_at(now: u64) -> Arc<GossipHub> {
-        let clock = Arc::new(StdAtomicU64::new(now));
-        let store = Arc::new(Store::open_in_memory().unwrap());
         let dir = tempfile::tempdir().unwrap();
         // tempdir をリークさせてログファイルを生かす(テスト内のみ)。
-        let path = dir.keep().join("sec.log");
+        hub_at_with_log(now, dir.keep().join("sec.log"))
+    }
+
+    fn hub_at_with_log(now: u64, path: std::path::PathBuf) -> Arc<GossipHub> {
+        let clock = Arc::new(StdAtomicU64::new(now));
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let security = Arc::new(SecurityLog::new(path).unwrap());
         let cfg = StoreConfig::default();
         let c2 = Arc::clone(&clock);
@@ -426,6 +442,34 @@ mod tests {
         let tampered = e.as_json().replace("\"content\":\"\"", "\"content\":\"x\"");
         hub.on_event(&tampered, "peer1:7147", 1);
         assert!(rx2.try_recv().is_err(), "検証失敗は伝搬しない");
+    }
+
+    #[tokio::test]
+    async fn warned_contact_url_is_logged_on_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sec.log");
+        let hub = hub_at_with_log(1_700_000_050, path.clone());
+        let keys = Keys::generate();
+
+        // http/https 以外のコンタクト URL を持つ検証済みイベント → url_warning を記録。
+        let mut l = listing(D1, ChannelStatus::Live, "x");
+        l.contact = Some("javascript:alert(1)".into());
+        let e = l.sign(&keys, 1_700_000_050, 0).unwrap();
+        hub.on_event(&e.as_json(), "peer1:7147", 1);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("url_warning"), "記録内容: {content}");
+
+        // http/https の URL では発火しない。
+        let mut l2 = listing(D2, ChannelStatus::Live, "y");
+        l2.contact = Some("https://example.com/".into());
+        let e2 = l2.sign(&keys, 1_700_000_051, 0).unwrap();
+        hub.on_event(&e2.as_json(), "peer1:7147", 1);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content.matches("url_warning").count(),
+            1,
+            "正当な URL では url_warning を記録しない: {content}"
+        );
     }
 
     #[test]

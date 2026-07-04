@@ -139,6 +139,12 @@ impl MockPeer {
             .send(serde_json::to_value(event).unwrap());
     }
 
+    /// 接続中ノードへ非請求 EVENT として生 JSON 値を即時送出する
+    /// (署名不正・過大イベント等の悪性入力の注入に使う — T055)。
+    pub fn push_value(&self, value: Value) {
+        let _ = self.shared.push_tx.send(value);
+    }
+
     /// これまでに受信した EVENT(生 JSON 値)。
     pub fn received(&self) -> Vec<Value> {
         self.shared.received.lock().unwrap().clone()
@@ -278,6 +284,11 @@ pub struct TestNode {
     inbound: InboundReachable,
     /// P2P 待受アドレス(待受ありノードのみ)。
     listen_addr: Option<String>,
+    /// 永続ストア(ミュート等の利用者操作をテストから行う — T055)。
+    store: Arc<Store>,
+    /// セキュリティイベントログ(flush 用)とそのファイルパス(検証用 — T055)。
+    security: Arc<SecurityLog>,
+    security_path: std::path::PathBuf,
     shutdown: watch::Sender<bool>,
     _handles: Vec<JoinHandle<()>>,
     _dir: tempfile::TempDir,
@@ -304,7 +315,8 @@ impl TestNode {
             PeerManagerConfig::default(),
         ));
         let dir = tempfile::tempdir().unwrap();
-        let security = Arc::new(SecurityLog::new(dir.path().join("security.log")).unwrap());
+        let security_path = dir.path().join("security.log");
+        let security = Arc::new(SecurityLog::new(&security_path).unwrap());
         let hub = GossipHub::new(
             Arc::clone(&store),
             Arc::clone(&security),
@@ -321,7 +333,7 @@ impl TestNode {
         };
         let runtime = Arc::new(P2pRuntime::new(
             Arc::clone(&peers),
-            security,
+            Arc::clone(&security),
             Arc::clone(&hub),
             nonce,
             listen_port,
@@ -338,9 +350,37 @@ impl TestNode {
             reachability,
             inbound,
             listen_addr,
+            store,
+            security,
+            security_path,
             shutdown: sd_tx,
             _handles: handles,
             _dir: dir,
+        }
+    }
+
+    /// 永続ストア(ミュート登録など利用者側の緩和操作をテストから行う — T055)。
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// セキュリティイベントログの現在の内容(JSON Lines)。集約分は flush してから読む。
+    pub fn security_log_text(&self) -> String {
+        self.security.flush();
+        std::fs::read_to_string(&self.security_path).unwrap_or_default()
+    }
+
+    /// 指定カテゴリのセキュリティイベントが記録されるまで最大 `timeout` 待つ。
+    pub async fn wait_for_security(&self, category: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.security_log_text().contains(category) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

@@ -24,6 +24,8 @@ mod us2;
 mod us3;
 #[path = "steps/outbound_only.rs"]
 mod outbound_only;
+#[path = "steps/security.rs"]
+mod security;
 
 /// 全フィーチャ共通の World。ストーリー実装時に必要なフィールドを追加する。
 #[derive(Debug, Default, World)]
@@ -36,12 +38,31 @@ pub struct AppWorld {
     us3: Option<us3::Us3World>,
     /// 着信不可ノード参加シナリオの状態。各シナリオの Given で初期化する(T054)。
     outbound: Option<outbound_only::OutboundWorld>,
+    /// セキュリティシナリオの状態。各シナリオの Given で初期化する(T055)。
+    security: Option<security::SecurityWorld>,
 }
 
-#[tokio::main]
-async fn main() {
-    AppWorld::cucumber()
-        .fail_on_skipped()
-        .run_and_exit("tests/features")
-        .await;
+/// ステップの async 未来型は debug ビルドで巨大になり、Windows 既定の main スレッド
+/// スタック(1MB)を超える(STATUS_STACK_OVERFLOW)。大きいスタックのスレッドで
+/// ランタイムを駆動する。
+fn main() {
+    const STACK_SIZE: usize = 16 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK_SIZE)
+                .build()
+                .expect("tokio ランタイム構築")
+                .block_on(async {
+                    AppWorld::cucumber()
+                        .fail_on_skipped()
+                        .run_and_exit("tests/features")
+                        .await;
+                });
+        })
+        .expect("cucumber スレッド起動")
+        .join()
+        .expect("cucumber スレッド終了");
 }

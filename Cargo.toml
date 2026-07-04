@@ -77,3 +77,7 @@ path = "tests/integration/resilience.rs"
 [[test]]
 name = "outbound_only"
 path = "tests/integration/outbound_only.rs"
+
+[[test]]
+name = "scale"
+path = "tests/integration/scale.rs"
