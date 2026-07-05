@@ -93,7 +93,9 @@ docs/agents/domain.md の単一コンテキスト構成)。
 | 0005 | 形式的検証「該当」・伝搬 4 不変条件・DedupCache ≥ 鮮度窓の連動 | 一致(`docs/formal/gossip_propagation.tla` + TLC 結果あり。Phase 7 で伝搬規則の変更なし → 再検査不要) |
 | 0006 | 平文 TCP・plain HTTP 受容・`pcp_bind`/`http_bind` loopback 強制・LAN 公開オプトイン v1 非実装 | 一致(`src/config.rs` 検証拒否・`src/web/settings.rs` 400 応答・オプトイン実装なし) |
 
-ADR-0007(ライセンス — T063)は未作成のため突合対象外(T057 README とあわせて残タスク)。
+ADR-0007(ライセンス — T063)は 2026-07-05 に作成済み(MIT 確定・`LICENSE` 配置・constitution
+v1.1.1 反映)。突合: 実装との衝突なし(連携はプロセス間 TCP のみ・クリーンルーム実装の維持)。
+残タスクは T057 README(ライセンス表記は ADR-0007 に従う)。
 
 ### docs/formal/
 

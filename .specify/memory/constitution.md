@@ -1,7 +1,7 @@
 <!--
 ## Sync Impact Report
 
-**Version Change**: 1.0.0 → 1.1.0
+**Version Change**: 1.0.0 → 1.1.0 → 1.1.1（1.1.1: LICENSE 方針を MIT で確定 — ADR-0007、2026-07-05。原則変更なしの patch）
 **Modified Principles**:
   - I  — 既知脆弱性リリース禁止を深刻度しきい値ベースへ緩和
   - III — レビュー要求を人数非依存に一般化（ゲート=MUST / 独立性=SHOULD）
@@ -17,7 +17,7 @@
   - ✅ `.specify/templates/tasks-template.md` — Security hardeningフェーズは既に存在。Formal Verification タスクを追加フェーズとして利用可能
 **Follow-up TODOs（未完）**:
   - ✅ SAST_TOOL: Rust 確定に伴い Clippy + cargo audit を選定。ADR-0001 追補（2026-07-03）に記録済み
-  - ⏳ LICENSE: 公開前に許容的ライセンスを ADR で確定（MIT 相当想定、GPL 結合回避）
+  - ✅ LICENSE: MIT に確定。ADR-0007（2026-07-05）に根拠を記録し `LICENSE` を配置済み
   - ⏳ PRIVACY: 配信者IP・視聴メタデータの取り扱い方針を要件定義段階で検討
   - ⏳ INTEROP: プロトコル互換性・相互運用方針を要件定義段階で検討
   - ⏳ THREAT_MODEL: Sybil/汚染の具体的緩和策を設計フェーズで ADR 化
@@ -201,10 +201,12 @@ Principle Iのユーザー安全が実際の実装に反映されることを保
 - 原則に反する実装が発見された場合は、即座に是正しなければならない
 - コンスティテューションの有効性は、beta リリース時および以降の各マイナーリリース時にレビューする
 
-**ライセンス方針（暫定）**:
-本プロジェクトは PeerCastStation 等と TCP 経由の API 連携に留まり GPL の結合著作物には
-当たらないとの判断のもと、公開前に許容的ライセンス（MIT 相当を想定）を別 ADR で確定する。
+**ライセンス方針（確定 — ADR-0007）**:
+本プロジェクトは MIT License で公開する（`LICENSE`、`Copyright (c) 2026 Philmist`）。
+PeerCastStation（GPLv3-or-later）との連携はプロセス間 TCP のみであり、かつ実装はプロトコルの
+事実のみを用いたクリーンルーム実装であるため、GPL の結合著作物にも著作権的派生物にも当たらない。
+根拠と維持すべき実装上の線引きは `docs/adr/0007-license.md` を正とする。
 
 ランタイム開発ガイダンスは `docs/agents/domain.md` を参照。
 
-**Version**: 1.1.0 | **Ratified**: 2026-07-02 | **Last Amended**: 2026-07-02
+**Version**: 1.1.1 | **Ratified**: 2026-07-02 | **Last Amended**: 2026-07-05
