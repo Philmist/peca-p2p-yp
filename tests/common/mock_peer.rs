@@ -282,8 +282,8 @@ pub struct TestNode {
     reachability: Arc<ReachabilityState>,
     /// 着信可否の共有状態(main.rs と同じ配線 — 待受なしノードは常に不可)。
     inbound: InboundReachable,
-    /// P2P 待受アドレス(待受ありノードのみ)。
-    listen_addr: Option<String>,
+    /// P2P 待受アドレス(待受ありノードのみ。複数リスナーは ADR-0008)。
+    listen_addrs: Vec<String>,
     /// 永続ストア(ミュート等の利用者操作をテストから行う — T055)。
     store: Arc<Store>,
     /// セキュリティイベントログ(flush 用)とそのファイルパス(検証用 — T055)。
@@ -297,7 +297,7 @@ pub struct TestNode {
 impl TestNode {
     /// 外向きのみのノードを起動する(nonce は自己接続回避のため引数指定)。
     pub async fn spawn(nonce: u64) -> TestNode {
-        Self::spawn_inner(nonce, false).await
+        Self::spawn_inner(nonce, 0).await
     }
 
     /// P2P 待受ありの実ノードを起動する(複数実ノードのトポロジ構成用 — T049)。
@@ -305,10 +305,18 @@ impl TestNode {
     /// 待受アドレスは [`listen_addr`](TestNode::listen_addr) で得られ、他ノードの
     /// [`add_manual_peer`](TestNode::add_manual_peer) に渡してメッシュ/チェーンを組む。
     pub async fn spawn_listening(nonce: u64) -> TestNode {
-        Self::spawn_inner(nonce, true).await
+        Self::spawn_inner(nonce, 1).await
     }
 
-    async fn spawn_inner(nonce: u64, listening: bool) -> TestNode {
+    /// P2P 待受 2 本の実ノードを起動する(複数リスナー = デュアルスタック相当 — ADR-0008)。
+    ///
+    /// IPv6 が使えない環境でも動くよう、127.0.0.1 の任意 2 ポートで「リスナーごとの
+    /// accept ループ」を等価に検証する。各待受アドレスは [`listen_addrs`](TestNode::listen_addrs)。
+    pub async fn spawn_dual_listening(nonce: u64) -> TestNode {
+        Self::spawn_inner(nonce, 2).await
+    }
+
+    async fn spawn_inner(nonce: u64, listener_count: usize) -> TestNode {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let peers = Arc::new(PeerManager::new(
             Arc::clone(&store),
@@ -323,14 +331,19 @@ impl TestNode {
             StoreConfig::default(),
             VerifyConfig::default(),
         );
-        // 待受ありなら 127.0.0.1 の任意ポートへバインドする。
-        let (listener, listen_port, listen_addr) = if listening {
+        // 待受ありなら 127.0.0.1 の任意ポートへ指定本数バインドする。
+        // 申告 listen_port は先頭リスナーのポート(main.rs と同じ — ADR-0008 決定3)。
+        let mut listeners = Vec::new();
+        let mut listen_addrs = Vec::new();
+        for _ in 0..listener_count {
             let l = TcpListener::bind("127.0.0.1:0").await.expect("p2p bind");
-            let addr = l.local_addr().unwrap();
-            (Some(l), addr.port(), Some(addr.to_string()))
-        } else {
-            (None, 0, None)
-        };
+            listen_addrs.push(l.local_addr().unwrap().to_string());
+            listeners.push(l);
+        }
+        let listen_port = listeners
+            .first()
+            .map(|l| l.local_addr().unwrap().port())
+            .unwrap_or(0);
         let runtime = Arc::new(P2pRuntime::new(
             Arc::clone(&peers),
             Arc::clone(&security),
@@ -341,7 +354,8 @@ impl TestNode {
         ));
         let reachability = runtime.reachability();
         let (sd_tx, sd_rx) = watch::channel(false);
-        let handles = runtime.spawn(listener.into_iter().collect(), sd_rx);
+        let listening = !listeners.is_empty();
+        let handles = runtime.spawn(listeners, sd_rx);
         // 着信可否は main.rs と同じ初期化(待受なし → 常に不可)。
         let inbound = InboundReachable::new(upnp::decide_initial(listening, true));
         TestNode {
@@ -349,7 +363,7 @@ impl TestNode {
             peers,
             reachability,
             inbound,
-            listen_addr,
+            listen_addrs,
             store,
             security,
             security_path,
@@ -384,9 +398,14 @@ impl TestNode {
         }
     }
 
-    /// P2P 待受アドレス(`127.0.0.1:PORT` — [`spawn_listening`](TestNode::spawn_listening) 時のみ)。
+    /// P2P 待受アドレス(`127.0.0.1:PORT` — 待受ありノードのみ。複数時は先頭)。
     pub fn listen_addr(&self) -> &str {
-        self.listen_addr.as_deref().expect("待受ありノードのみ")
+        self.listen_addrs.first().expect("待受ありノードのみ")
+    }
+
+    /// 全 P2P 待受アドレス(複数リスナーの検証用 — ADR-0008)。
+    pub fn listen_addrs(&self) -> &[String] {
+        &self.listen_addrs
     }
 
     /// 全ピア到達不能状態と回復通知の共有ハンドル(US3 障害耐性テスト用)。

@@ -24,7 +24,7 @@ use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::identity::IdentityManager;
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
-use peca_p2p_yp::p2p::runtime::P2pRuntime;
+use peca_p2p_yp::p2p::runtime::{P2pRuntime, bind_listener};
 use peca_p2p_yp::p2p::upnp::{self, InboundReachable};
 use peca_p2p_yp::pcp::channel::{AnnouncedChannel, ChannelChange, ChannelRegistry, ChannelState};
 use peca_p2p_yp::security::SecurityLog;
@@ -119,34 +119,44 @@ async fn run() -> Result<(), i32> {
     // 11. P2P 待受のバインド(ADR-0008: カンマ区切りの複数アドレスを個別にバインド)。
     //     一部の失敗は WARN で記録して残りで続行する(決定2)。空設定なら待受なし
     //     (外向きのみ — FR-016)。指定が非空なのに一つも上がらなければ起動失敗。
-    let want_listen = !p2p_addr.is_empty();
     let mut p2p_listeners = Vec::new();
-    for addr in p2p_addr {
-        match TcpListener::bind(addr).await {
-            Ok(l) => p2p_listeners.push(l),
+    // 成功したバインドの実アドレス(申告ポート・起動サマリ・UPnP 判定に使う)。
+    let mut p2p_bound: Vec<SocketAddr> = Vec::new();
+    for addr in &p2p_addr {
+        match bind_listener(*addr) {
+            Ok(l) => {
+                if let Ok(bound) = l.local_addr() {
+                    p2p_bound.push(bound);
+                }
+                p2p_listeners.push(l);
+            }
             Err(e) => {
                 tracing::warn!(target: "startup", %addr, error = %e, "P2P 待受アドレスにバインドできませんでした");
             }
         }
     }
-    if want_listen && p2p_listeners.is_empty() {
+    if !p2p_addr.is_empty() && p2p_listeners.is_empty() {
         eprintln!("P2P 待受アドレスにバインドできませんでした(全て失敗)");
         return Err(1);
     }
 
     // 申告 listen_port は成功した先頭バインドのポート(ADR-0008 決定3)。待受なしは 0。
-    let listen_port = p2p_listeners
-        .first()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(0);
+    let listen_port = p2p_bound.first().map(|a| a.port()).unwrap_or(0);
+    // ポートが揃っていない場合、他ピアへ申告されるのは先頭ポートのみ(決定3 — 非推奨
+    // 構成のため黙殺せず WARN する)。
+    if p2p_bound.iter().any(|a| a.port() != listen_port) {
+        tracing::warn!(
+            target: "startup",
+            announced = listen_port,
+            "p2p_bind のポートが揃っていません。他ピアへ申告されるのは先頭ポートのみです"
+        );
+    }
     // 起動サマリ用の待受アドレス表記(spawn で listeners を move する前に確定させる)。
-    let p2p_desc = if p2p_listeners.is_empty() {
+    let p2p_desc = if p2p_bound.is_empty() {
         "無効(外向きのみ)".to_string()
     } else {
-        p2p_listeners
+        p2p_bound
             .iter()
-            .filter_map(|l| l.local_addr().ok())
             .map(|a| a.to_string())
             .collect::<Vec<_>>()
             .join(",")
@@ -168,10 +178,12 @@ async fn run() -> Result<(), i32> {
 
     // 12a. 着信可否の共有状態(UPnP — T053 / FR-016)。待受なしは常に到達不能、
     //      待受あり + UPnP 無効は直接待受として到達可能、待受あり + UPnP 有効は
-    //      マッピング成功まで到達不能(タスクが更新する)。
-    let inbound_reachable =
-        InboundReachable::new(upnp::decide_initial(has_listener, settings.upnp_enabled));
-    if has_listener && settings.upnp_enabled {
+    //      マッピング成功まで到達不能(タスクが更新する)。UPnP は IPv4 NAT のみを
+    //      対象とするため(ADR-0008 決定3)、IPv4 リスナーが無ければマッピングを
+    //      行わず(死んだマッピング・誤った到達可能表示を防ぐ)直接待受として扱う。
+    let use_upnp = settings.upnp_enabled && p2p_bound.iter().any(|a| a.is_ipv4());
+    let inbound_reachable = InboundReachable::new(upnp::decide_initial(has_listener, use_upnp));
+    if use_upnp {
         let reachable = inbound_reachable.clone();
         let sd = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {

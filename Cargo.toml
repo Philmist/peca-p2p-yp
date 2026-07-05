@@ -13,6 +13,7 @@ rand = "0.9"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+socket2 = "0.6"
 tokio = { version = "1.52.3", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
@@ -78,6 +79,10 @@ path = "tests/integration/resilience.rs"
 [[test]]
 name = "outbound_only"
 path = "tests/integration/outbound_only.rs"
+
+[[test]]
+name = "dual_listener"
+path = "tests/integration/dual_listener.rs"
 
 [[test]]
 name = "scale"

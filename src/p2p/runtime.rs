@@ -92,6 +92,34 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// P2P 待受用の [`TcpListener`] を作る(ADR-0008 決定 1)。
+///
+/// IPv6 アドレスには `IPV6_V6ONLY=1` を明示設定し、「1 リスナー = 1 アドレスファミリ」を
+/// 全プラットフォームで固定する。Linux は既定(`bindv6only=0`)で `[::]` がデュアル
+/// スタックになるため、明示しないと既定値 `0.0.0.0:7147,[::]:7147` の 2 本目が
+/// `EADDRINUSE` で失敗し IPv6 待受が失われる(Windows は既定 `V6ONLY=1` で影響なし)。
+///
+/// tokio ランタイム上で呼ぶこと(`TcpListener::from_std` の要件)。
+pub fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    // tokio の TcpListener::bind と同等(Unix では TIME_WAIT 中の再起動を許容)。
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
 impl P2pRuntime {
     /// ランタイムを作成する。
     ///
@@ -751,6 +779,22 @@ mod tests {
             )),
             dir,
         )
+    }
+
+    /// `0.0.0.0` と `[::]` を同一ポートでバインドできること(ADR-0008 決定 1)。
+    ///
+    /// Linux 既定(`bindv6only=0`)では `IPV6_V6ONLY=1` を明示しない限り 2 本目が
+    /// `EADDRINUSE` になるため、デュアルスタック既定値の回帰テストとして機能する。
+    #[tokio::test]
+    async fn wildcard_v4_and_v6_coexist_on_same_port() {
+        // IPv6 スタックが無い環境ではスキップ。
+        if bind_listener("[::]:0".parse().unwrap()).is_err() {
+            return;
+        }
+        let v4 = bind_listener("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        bind_listener(format!("[::]:{port}").parse().unwrap())
+            .expect("IPV6_V6ONLY=1 により v4 ワイルドカードと同一ポートで共存できる");
     }
 
     /// duplex で inbound / outbound セッションを相互に駆動し、双方が established に達することを確認する。
