@@ -11,3 +11,10 @@ Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Single-context layout — `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Formatter
+
+### Rustfmt
+
+You should run `cargo fmt -- --check` before `git commit`.
+Our CI (GitHub Actions) run `cargo fmt --check`.
