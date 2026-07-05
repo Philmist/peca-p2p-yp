@@ -341,7 +341,7 @@ impl TestNode {
         ));
         let reachability = runtime.reachability();
         let (sd_tx, sd_rx) = watch::channel(false);
-        let handles = runtime.spawn(listener, sd_rx);
+        let handles = runtime.spawn(listener.into_iter().collect(), sd_rx);
         // 着信可否は main.rs と同じ初期化(待受なし → 常に不可)。
         let inbound = InboundReachable::new(upnp::decide_initial(listening, true));
         TestNode {

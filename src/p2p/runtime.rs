@@ -141,12 +141,14 @@ impl P2pRuntime {
         }
     }
 
-    /// 待受(任意)と外向き維持ループを起動し、その JoinHandle を返す。
+    /// 待受(任意・複数)と外向き維持ループを起動し、その JoinHandle を返す。
     ///
-    /// `listener` が `None`(`p2p_bind` 空)なら外向き接続のみを行う(FR-016)。
+    /// `listeners` が空(`p2p_bind` 空、または全バインド失敗)なら外向き接続のみを
+    /// 行う(FR-016)。複数リスナー(IPv4/IPv6 デュアルスタック — ADR-0008)は
+    /// リスナーごとに独立の accept ループを起動する。
     pub fn spawn(
         self: Arc<Self>,
-        listener: Option<TcpListener>,
+        listeners: Vec<TcpListener>,
         shutdown: watch::Receiver<bool>,
     ) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::new();
@@ -159,7 +161,7 @@ impl P2pRuntime {
             }));
         }
 
-        if let Some(listener) = listener {
+        for listener in listeners {
             let me = Arc::clone(&self);
             let sd = shutdown.clone();
             handles.push(tokio::spawn(async move {

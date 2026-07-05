@@ -23,7 +23,10 @@
   <h1>設定</h1>
   <p class="note"><a href="/">← 一覧へ戻る</a> — data-model §Settings の全キーを閲覧・変更できます。</p>
   <p class="note bind">IPアドレス系の設定(pcp_bind / http_bind / p2p_bind)の変更は再起動後に反映されます。
-  pcp_bind / http_bind は loopback アドレス(127.0.0.1 等)のみ指定できます。</p>
+  pcp_bind / http_bind は loopback アドレス(127.0.0.1 等)のみ指定できます。
+  p2p_bind はカンマ区切りで複数アドレスを指定でき、IPv4/IPv6 を同時に待ち受けられます
+  (例: <code>0.0.0.0:7147,[::]:7147</code>)。空文字にすると待受無効(外向き接続のみ)になります。
+  複数指定時、他ピアへ申告されるポートは先頭アドレスのポートのみのため、全アドレスで同一ポートの使用を推奨します。</p>
 
   <div id="msg"></div>
   <div id="restart"></div>
