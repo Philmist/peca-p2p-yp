@@ -28,6 +28,10 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
   自己接続と判定して切断するため、エコー実装では掲載前に切断・再接続が繰り返される
 - `PCP_OLEH` の `port` は HELO で申告された待受ポートのエコー(申告が無ければ省略)。
   loopback 専用 YP のため connect-back による到達性検証は行わない
+- `PCP_OLEH` の `rip` は**接続元のアドレスファミリに応じて 4/16 バイト**で必ず返す
+  (2026-07-05 実機検証で改訂): PeerCastStation は OLEH の `rip`+`port` の組で当該
+  ファミリのポート開放を確認するため、IPv6 接続(`[::1]` 待受)で `rip` を省略すると
+  IPv6 側を firewalled と判定し、PUSH フラグ付き BCST(TIP 非掲載)になる
 - **1 セッション内の複数チャンネル**: 1 つの PCP セッション(BroadcastID)は複数チャンネルの
   BCST を含みうる。チャンネルは ChannelID 単位で AnnouncedChannel(data-model.md)を構成し、
   1 セッションあたりの同時掲載チャンネル数は ≤ 16(超過分は無視+`pcp_reject` ログ)。

@@ -277,6 +277,7 @@ impl AnnounceSession {
             bcst = %children_debug(atom),
             chan = %chan.map(children_debug).unwrap_or_default(),
             host = %host.map(children_debug).unwrap_or_default(),
+            host_vals = %host.map(host_values_debug).unwrap_or_default(),
             "PCP_BCST 受信"
         );
 
@@ -356,6 +357,14 @@ impl AnnounceSession {
             entry.tracker = if firewalled { None } else { build_tracker(host) };
             entry.listeners = child_i32(Some(host), "numl", entry.listeners);
             entry.relays_cnt = child_i32(Some(host), "numr", entry.relays_cnt);
+            tracing::debug!(
+                target: "pcp",
+                source = %self.source,
+                firewalled,
+                tracker = entry.tracker.as_deref().unwrap_or("<none>"),
+                listeners = entry.listeners,
+                "PCP_HOST 解析"
+            );
         }
 
         let state = if is_known {
@@ -404,10 +413,20 @@ impl AnnounceSession {
             Atom::str("agnt", &agent_name()),
             Atom::i32("ver", PCP_PROTOCOL_VERSION),
         ];
-        if let Some(SocketAddr::V4(v4)) = self.source_addr {
-            // PCP の IPv4 はリトルエンディアン格納(ワイヤ上はオクテット逆順)。
-            let o = v4.ip().octets();
-            children.push(Atom::bytes("rip", &[o[3], o[2], o[1], o[0]]));
+        // PCP の IP atom はバイト逆順格納(IPv4/IPv6 とも — contracts/pcp-announce.md)。
+        // IPv6 接続でも rip を返すこと: PeerCastStation は OLEH の rip+port の組で
+        // 当該アドレスファミリのポート開放を確認するため、rip 欠落は firewalled 扱いになる。
+        match self.source_addr {
+            Some(SocketAddr::V4(v4)) => {
+                let o = v4.ip().octets();
+                children.push(Atom::bytes("rip", &[o[3], o[2], o[1], o[0]]));
+            }
+            Some(SocketAddr::V6(v6)) => {
+                let mut o = v6.ip().octets();
+                o.reverse();
+                children.push(Atom::bytes("rip", &o));
+            }
+            None => {}
         }
         if let Some(port) = helo.find("port").and_then(Atom::as_i32)
             && (0..=65535).contains(&port)
@@ -473,6 +492,48 @@ fn guid_debug(parent: &Atom, name: &str) -> String {
         Some(p) => format!("<len={}>", p.len()),
         None => "<absent>".to_string(),
     }
+}
+
+/// IP atom ペイロードのデバッグ表現(バイト逆順をデコード。長さ不正は `<len=N>`)。
+fn ip_debug(p: &[u8]) -> String {
+    match p.len() {
+        4 => format!("{}.{}.{}.{}", p[3], p[2], p[1], p[0]),
+        16 => {
+            let mut bytes = [0u8; 16];
+            for (dst, src) in bytes.iter_mut().zip(p.iter().rev()) {
+                *dst = *src;
+            }
+            std::net::Ipv6Addr::from(bytes).to_string()
+        }
+        _ => format!("<len={}>", p.len()),
+    }
+}
+
+/// PCP_HOST の値レベルのデバッグ表現(ip はデコード済みアドレス、flg1 は 16 進、
+/// その他の整数 atom は 10 進)。firewalled 判定の切り分け用。
+fn host_values_debug(host: &Atom) -> String {
+    let Some(children) = host.children() else {
+        return "<data atom>".to_string();
+    };
+    children
+        .iter()
+        .map(|c| {
+            let name = c.id().name();
+            let Some(p) = c.payload() else {
+                return format!("{name}[parent]");
+            };
+            if name == "ip" {
+                format!("ip={}", ip_debug(p))
+            } else if name == "flg1" {
+                format!("flg1={:#04x}", p.first().copied().unwrap_or(0))
+            } else if let Some(v) = c.as_i32() {
+                format!("{name}={v}")
+            } else {
+                format!("{}({})", name, p.len())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 親 atom の子構成のデバッグ表現(`名前(ペイロード長)` の列。親 atom は `[parent]`)。
@@ -705,6 +766,22 @@ mod tests {
         let AnnounceAction::Send(oleh) = &actions[0];
         // OLEH port は HELO 申告値のエコー(接続元の一時ポート 40006 ではない)。
         assert_eq!(oleh.find("port").and_then(Atom::as_i32), Some(7144));
+    }
+
+    #[test]
+    fn ipv6_source_yields_reversed_16byte_rip() {
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        // [::1] 待受時の接続元。rip が無いと PeerCastStation が IPv6 側を
+        // firewalled と判定して PUSH フラグ付き BCST になる(2026-07-05 実機)。
+        let mut s = AnnounceSession::new(registry, sec, "[::1]:40008".into());
+        let actions = feed(&mut s, &helo(&[2u8; 16]));
+        let AnnounceAction::Send(oleh) = &actions[0];
+        let rip = oleh.find("rip").and_then(Atom::payload).unwrap();
+        // ::1 = 15 個の 0 の後に 1 → 逆順格納では先頭が 1。
+        let mut expected = [0u8; 16];
+        expected[0] = 1;
+        assert_eq!(rip, &expected);
     }
 
     #[test]
