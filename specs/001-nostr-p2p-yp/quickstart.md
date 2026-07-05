@@ -42,8 +42,9 @@ cargo test --test cucumber     # Gherkin シナリオ(spec.md 対応。実装前
 ```powershell
 # ノード A(既定ポート)
 .\peca-p2p-yp.exe
-# ノード B(ポートをずらして起動。設定またはコマンドラインで p2p/http/pcp を変更)
-.\peca-p2p-yp.exe --p2p-bind 0.0.0.0:7157 --http-bind 127.0.0.1:7190 --pcp-bind 127.0.0.1:7156
+# ノード B(ポートをずらして起動。--data-dir も必ず分ける — 既定の
+# %APPDATA%\peca-p2p-yp を複数プロセスで共有すると SQLite が衝突する)
+.\peca-p2p-yp.exe --p2p-bind 0.0.0.0:7157 --http-bind 127.0.0.1:7190 --pcp-bind 127.0.0.1:7156 --data-dir <ノード B 用ディレクトリ>
 # ノード B の UI(127.0.0.1:7190)でピア「127.0.0.1:7147」を登録 → A-B が established になる
 ```
 
@@ -64,8 +65,11 @@ cargo test --test cucumber     # Gherkin シナリオ(spec.md 対応。実装前
 2. UI の一覧に手順 3 のチャンネルが表示されることを確認(接続時同期 SYNC_REQ により
    接続直後でも取得できる。5 秒以内)
 3. YP ブラウザの取得先に `http://127.0.0.1:7190/index.txt`(ノード B の HTTP ポート)を設定し、
-   一覧表示と文字化けの有無を確認(Shift_JIS 既定 — research R5 のリスク解消ポイント)
+   一覧表示と文字化けの有無を確認(**UTF-8 既定** — research R5 の実機検証で現行 YP
+   ブラウザは UTF-8 を解釈することを確認済み(2026-07-04 改訂)。`shift_jis` は設定で選択可)
 4. 一覧のトラッカー情報(TIP)経由で PeerCastStation の視聴が開始できることを確認
+   (TIP はグローバル IP のため、同一 LAN 内からの視聴はルーターの NAT ループバック
+   対応に依存する。検証結果は ADR-0002 に記録済み)
 
 ## 5. 継続性の検証(US3 / SC-002)
 
