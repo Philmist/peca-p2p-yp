@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{header, Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode, header};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -606,7 +606,14 @@ async fn put_peer_toggles_enabled() {
     assert_eq!(json["enabled"], false);
 
     // 永続化を確認
-    assert!(!state.store.get_peer("192.0.2.6:7147").unwrap().unwrap().enabled);
+    assert!(
+        !state
+            .store
+            .get_peer("192.0.2.6:7147")
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
 }
 
 #[tokio::test]

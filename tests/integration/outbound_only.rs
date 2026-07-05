@@ -14,7 +14,7 @@ use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 #[path = "../common/mock_peer.rs"]
 mod mock_peer;
 
-use mock_peer::{unix_now, MockPeer, TestNode};
+use mock_peer::{MockPeer, TestNode, unix_now};
 
 // ---------------------------------------------------------------------------
 // 補助
@@ -100,7 +100,8 @@ async fn outbound_only_announce_propagates_to_peer() {
     );
 
     // ローカル発行 → established ピア(モック)へ伝搬する(掲載機能)。
-    node.hub().publish_local(signed(&keys, CH_ANNOUNCE, "配信A"));
+    node.hub()
+        .publish_local(signed(&keys, CH_ANNOUNCE, "配信A"));
     assert!(
         wait_mock_received(&mock, CH_ANNOUNCE, Duration::from_secs(5)).await,
         "外向き接続のみでも掲載イベントが伝搬先ピアへ届くべき(US1 / SC-009)"
@@ -121,7 +122,8 @@ async fn outbound_only_discovers_via_sync() {
     node.add_manual_peer(mock.addr());
 
     assert!(
-        node.wait_for_channel(CH_DISCOVER, Duration::from_secs(5)).await,
+        node.wait_for_channel(CH_DISCOVER, Duration::from_secs(5))
+            .await,
         "外向き接続のみでも SYNC で発見したチャンネルが一覧へ現れるべき(US2 / SC-009)"
     );
 }

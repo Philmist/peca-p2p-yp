@@ -162,7 +162,10 @@ impl Settings {
         let stored = store.all_settings()?;
         let d = Settings::default();
         let s = |key: &str, default: &str| -> String {
-            stored.get(key).cloned().unwrap_or_else(|| default.to_string())
+            stored
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| default.to_string())
         };
         Ok(Settings {
             pcp_bind: s(KEY_PCP_BIND, &d.pcp_bind),
@@ -172,7 +175,11 @@ impl Settings {
             p2p_inbound_max: parse_or(&stored, KEY_P2P_INBOUND_MAX, d.p2p_inbound_max),
             pex_enabled: parse_bool_or(&stored, KEY_PEX_ENABLED, d.pex_enabled),
             upnp_enabled: parse_bool_or(&stored, KEY_UPNP_ENABLED, d.upnp_enabled),
-            freshness_window_sec: parse_or(&stored, KEY_FRESHNESS_WINDOW_SEC, d.freshness_window_sec),
+            freshness_window_sec: parse_or(
+                &stored,
+                KEY_FRESHNESS_WINDOW_SEC,
+                d.freshness_window_sec,
+            ),
             republish_interval_sec: parse_or(
                 &stored,
                 KEY_REPUBLISH_INTERVAL_SEC,
@@ -190,11 +197,17 @@ impl Settings {
         store.set_setting(KEY_PCP_BIND, &self.pcp_bind)?;
         store.set_setting(KEY_HTTP_BIND, &self.http_bind)?;
         store.set_setting(KEY_P2P_BIND, &self.p2p_bind)?;
-        store.set_setting(KEY_P2P_OUTBOUND_TARGET, &self.p2p_outbound_target.to_string())?;
+        store.set_setting(
+            KEY_P2P_OUTBOUND_TARGET,
+            &self.p2p_outbound_target.to_string(),
+        )?;
         store.set_setting(KEY_P2P_INBOUND_MAX, &self.p2p_inbound_max.to_string())?;
         store.set_setting(KEY_PEX_ENABLED, bool_to_str(self.pex_enabled))?;
         store.set_setting(KEY_UPNP_ENABLED, bool_to_str(self.upnp_enabled))?;
-        store.set_setting(KEY_FRESHNESS_WINDOW_SEC, &self.freshness_window_sec.to_string())?;
+        store.set_setting(
+            KEY_FRESHNESS_WINDOW_SEC,
+            &self.freshness_window_sec.to_string(),
+        )?;
         store.set_setting(
             KEY_REPUBLISH_INTERVAL_SEC,
             &self.republish_interval_sec.to_string(),
@@ -342,11 +355,7 @@ fn parse_bool_or(
 }
 
 fn bool_to_str(b: bool) -> &'static str {
-    if b {
-        "1"
-    } else {
-        "0"
-    }
+    if b { "1" } else { "0" }
 }
 
 fn parse_bind(key: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
@@ -423,7 +432,9 @@ mod tests {
     #[test]
     fn load_falls_back_on_unparseable_value() {
         let store = Store::open_in_memory().unwrap();
-        store.set_setting("p2p_outbound_target", "not-a-number").unwrap();
+        store
+            .set_setting("p2p_outbound_target", "not-a-number")
+            .unwrap();
         store.set_setting("pex_enabled", "maybe").unwrap();
         let s = Settings::load(&store).unwrap();
         assert_eq!(s.p2p_outbound_target, 8); // 既定へフォールバック

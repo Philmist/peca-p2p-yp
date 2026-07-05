@@ -143,12 +143,12 @@ fn incoming_rejects_over_max_count() {
 #[test]
 fn incoming_rejects_malformed_forms() {
     let peers = vec![
-        "not-an-addr".to_string(),                 // ポートなし
-        "host:0".to_string(),                       // ポート 0
-        "host:70000".to_string(),                   // ポート範囲外
-        "2001:db8::1:7147".to_string(),             // IPv6 ブラケットなし複数コロン
-        format!("{}:7147", "a".repeat(256)),        // 長さ >256
-        String::new(),                              // 空
+        "not-an-addr".to_string(),           // ポートなし
+        "host:0".to_string(),                // ポート 0
+        "host:70000".to_string(),            // ポート範囲外
+        "2001:db8::1:7147".to_string(),      // IPv6 ブラケットなし複数コロン
+        format!("{}:7147", "a".repeat(256)), // 長さ >256
+        String::new(),                       // 空
     ];
     let result = pex::validate_incoming_peers(&peers, no_self, PEX_MAX_PEERS);
     assert!(result.accepted.is_empty(), "不正形式は 1 件も採用しない");
@@ -179,9 +179,9 @@ fn incoming_accepts_valid_ipv4_and_bracketed_ipv6() {
 fn incoming_excludes_self_and_duplicates() {
     let self_canon = "203.0.113.5:7147".to_string();
     let peers = vec![
-        "203.0.113.5:7147".to_string(),  // 自アドレス
-        "198.51.100.7:7147".to_string(), // 正当
-        "198.51.100.7:7147".to_string(), // 重複
+        "203.0.113.5:7147".to_string(),     // 自アドレス
+        "198.51.100.7:7147".to_string(),    // 正当
+        "198.51.100.7:7147".to_string(),    // 重複
         "[2001:DB8::0:1]:7147".to_string(), // 正規化して次と重複
         "[2001:db8::1]:7147".to_string(),   // 上と canonical 一致
     ];

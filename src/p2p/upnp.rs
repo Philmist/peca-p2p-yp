@@ -83,7 +83,13 @@ async fn try_map(listen_port: u16) -> Result<(), ()> {
     let ip = local_ip().ok_or(())?;
     let local = SocketAddr::new(ip, listen_port);
     gateway
-        .add_port(PortMappingProtocol::TCP, listen_port, local, LEASE_SECS, MAPPING_DESC)
+        .add_port(
+            PortMappingProtocol::TCP,
+            listen_port,
+            local,
+            LEASE_SECS,
+            MAPPING_DESC,
+        )
         .await
         .map_err(|_| ())
 }

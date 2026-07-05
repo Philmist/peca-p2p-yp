@@ -309,7 +309,11 @@ mod tests {
     fn dpapi_roundtrip() {
         let plain = b"secret-bytes-0123456789abcdef";
         let enc = dpapi::protect(plain).unwrap();
-        assert_ne!(enc.as_slice(), plain, "暗号化 BLOB は平文と一致してはならない");
+        assert_ne!(
+            enc.as_slice(),
+            plain,
+            "暗号化 BLOB は平文と一致してはならない"
+        );
         let dec = dpapi::unprotect(&enc).unwrap();
         assert_eq!(dec.as_slice(), plain);
     }

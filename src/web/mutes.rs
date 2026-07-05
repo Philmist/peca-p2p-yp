@@ -20,11 +20,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::store::{MuteEntry, MuteKind};
 
-use super::{error_response, AppState};
+use super::{AppState, error_response};
 
 /// `mutes` エンドポイント群のサブルーター。[`super::api_router`] が `.merge` する。
 pub(crate) fn routes() -> Router<AppState> {

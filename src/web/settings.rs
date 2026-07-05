@@ -12,16 +12,16 @@
 //! LAN 公開オプトインは v1 非実装のため、§保護方針の警告 2 項目は扱わない
 //! (ADR-0006 決定 4)。
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 
 use crate::config::{ConfigError, Settings};
 
-use super::{error_response, AppState};
+use super::{AppState, error_response};
 
 /// バインド系キー(変更時に再起動が必要)。
 const BIND_KEYS: [&str; 3] = ["pcp_bind", "http_bind", "p2p_bind"];
@@ -76,7 +76,9 @@ fn validation_error_response(e: ConfigError) -> Response {
         ConfigError::InvalidEncoding => "invalid_encoding",
         ConfigError::InvalidArgument => "invalid_request",
         // ストア障害のみ 500、それ以外の検証エラーは 400
-        ConfigError::Store(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        ConfigError::Store(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
     };
     error_response(StatusCode::BAD_REQUEST, code)
 }

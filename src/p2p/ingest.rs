@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use nostr::Event;
 
-use crate::event::schema::{verify_incoming, EventSummary, VerifyConfig, VerifyReject};
+use crate::event::schema::{EventSummary, VerifyConfig, VerifyReject, verify_incoming};
 use crate::event::store::{DedupCache, EventStore, InsertOutcome, StoreConfig};
 use crate::event::view::{self, DiscoveredChannel, MuteSet, SourceMap};
 use crate::store::MuteEntry;
@@ -52,7 +52,12 @@ impl IngestState {
     }
 
     /// EventStore とその設定を差し替えて作る(テスト用 — 時刻注入した store を渡す)。
-    pub fn with_parts(store: EventStore, dedup: DedupCache, verify: VerifyConfig, store_config: StoreConfig) -> Self {
+    pub fn with_parts(
+        store: EventStore,
+        dedup: DedupCache,
+        verify: VerifyConfig,
+        store_config: StoreConfig,
+    ) -> Self {
         Self {
             store,
             dedup,
@@ -69,7 +74,12 @@ impl IngestState {
     /// - `Err(reject)`: 受信検証に失敗(呼び出し側がセキュリティイベントを記録する)
     ///
     /// `source` は受信元ピアの正規アドレス(source_peers 記録用)。
-    pub fn ingest(&mut self, raw_json: &str, source: &str, now: u64) -> Result<Option<Event>, VerifyReject> {
+    pub fn ingest(
+        &mut self,
+        raw_json: &str,
+        source: &str,
+        now: u64,
+    ) -> Result<Option<Event>, VerifyReject> {
         // 1. 受信検証(サイズ→署名→形式→時刻→内容→PoW)
         let verified = verify_incoming(raw_json, &self.verify, now)?;
         let event = verified.event;
@@ -186,8 +196,8 @@ mod tests {
     use crate::event::schema::{ChannelListing, ChannelStatus};
     use crate::event::store::{DedupCache, EventStore, RejectReason, StoreConfig};
     use nostr::{JsonUtil, Keys};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const D1: &str = "0123456789abcdef0123456789abcdef";
     const D2: &str = "0123456789abcdef0123456789abcdee";
@@ -244,9 +254,17 @@ mod tests {
         let mut st = state_at(Arc::clone(&clock));
         let keys = Keys::generate();
         let e = mk(&keys, D1, 1_700_000_050, ChannelStatus::Live, "x");
-        assert!(st.ingest(&e.as_json(), "peer:1", 1_700_000_050).unwrap().is_some());
+        assert!(
+            st.ingest(&e.as_json(), "peer:1", 1_700_000_050)
+                .unwrap()
+                .is_some()
+        );
         // 2 回目(同一 id)は DedupCache で破棄 → 再伝搬しない
-        assert!(st.ingest(&e.as_json(), "peer:2", 1_700_000_050).unwrap().is_none());
+        assert!(
+            st.ingest(&e.as_json(), "peer:2", 1_700_000_050)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -268,9 +286,17 @@ mod tests {
         let keys = Keys::generate();
         let newer = mk(&keys, D1, 1_700_000_090, ChannelStatus::Live, "new");
         let older = mk(&keys, D1, 1_700_000_080, ChannelStatus::Live, "old");
-        assert!(st.ingest(&newer.as_json(), "p1", 1_700_000_100).unwrap().is_some());
+        assert!(
+            st.ingest(&newer.as_json(), "p1", 1_700_000_100)
+                .unwrap()
+                .is_some()
+        );
         // 旧版(別 id・同キー)は格納も再伝搬もしない
-        assert!(st.ingest(&older.as_json(), "p2", 1_700_000_100).unwrap().is_none());
+        assert!(
+            st.ingest(&older.as_json(), "p2", 1_700_000_100)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -282,7 +308,11 @@ mod tests {
         let outcome = st.publish_local(e.clone());
         assert!(outcome.should_propagate());
         // 自分のイベントがピアからエコーされても DedupCache で破棄
-        assert!(st.ingest(&e.as_json(), "peer:1", 1_700_000_050).unwrap().is_none());
+        assert!(
+            st.ingest(&e.as_json(), "peer:1", 1_700_000_050)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -327,7 +357,11 @@ mod tests {
         let mut st = state_at(Arc::clone(&clock));
         let keys = Keys::generate();
         let e = mk(&keys, D1, created, ChannelStatus::Live, "x");
-        assert!(st.ingest(&e.as_json(), "p", created + 10).unwrap().is_some());
+        assert!(
+            st.ingest(&e.as_json(), "p", created + 10)
+                .unwrap()
+                .is_some()
+        );
         // 直接ストアの第二の防壁を確認(Dedupを迂回した経路の不変条件)
         assert_eq!(
             crate::event::store::InsertOutcome::Rejected(RejectReason::DuplicateId),

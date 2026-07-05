@@ -32,7 +32,9 @@ pub fn sync_req_since(now: u64, freshness_window_sec: u64) -> i64 {
 
 /// メッセージのワイヤ概算バイト数(長さ前置 4 バイト込み)。平滑化の計量用。
 fn est_wire_bytes(message: &Message) -> usize {
-    serde_json::to_vec(message).map(|v| v.len() + 4).unwrap_or(4)
+    serde_json::to_vec(message)
+        .map(|v| v.len() + 4)
+        .unwrap_or(4)
 }
 
 /// SYNC 応答(EVENT の列 + 末尾 SYNC_DONE)を平滑化して `tx` へ送る。
@@ -150,8 +152,12 @@ mod tests {
     async fn small_response_sends_all_then_done() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let msgs = vec![
-            Message::Event { event: json!({"a":1}) },
-            Message::Event { event: json!({"a":2}) },
+            Message::Event {
+                event: json!({"a":1}),
+            },
+            Message::Event {
+                event: json!({"a":2}),
+            },
         ];
         stream_sync_response(msgs, 2, tx).await;
         let m1 = rx.recv().await.unwrap();
@@ -167,6 +173,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         // 受信側が消えていても panic せず戻る。
-        stream_sync_response(vec![Message::Event { event: json!({"a":1}) }], 1, tx).await;
+        stream_sync_response(
+            vec![Message::Event {
+                event: json!({"a":1}),
+            }],
+            1,
+            tx,
+        )
+        .await;
     }
 }

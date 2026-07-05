@@ -318,7 +318,10 @@ mod tests {
             Some(&[0xAB; 16][..])
         );
         let info = decoded.find("info").unwrap();
-        assert_eq!(info.find("name").and_then(|a| a.as_str()).as_deref(), Some("A"));
+        assert_eq!(
+            info.find("name").and_then(|a| a.as_str()).as_deref(),
+            Some("A")
+        );
     }
 
     #[test]
@@ -349,10 +352,7 @@ mod tests {
         bytes.extend_from_slice(b"big\0");
         bytes.extend_from_slice(&((MAX_ATOM_PAYLOAD as u32) + 1).to_le_bytes());
         // ペイロードは 1 バイトも付いていないが、長さ前置だけで拒否される。
-        assert_eq!(
-            Atom::try_decode(&bytes),
-            Err(AtomError::PayloadTooLarge)
-        );
+        assert_eq!(Atom::try_decode(&bytes), Err(AtomError::PayloadTooLarge));
     }
 
     #[test]
@@ -387,10 +387,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"par\0");
         bytes.extend_from_slice(&(PARENT_FLAG | (MAX_CHILDREN as u32 + 1)).to_le_bytes());
-        assert_eq!(
-            Atom::try_decode(&bytes),
-            Err(AtomError::TooManyChildren)
-        );
+        assert_eq!(Atom::try_decode(&bytes), Err(AtomError::TooManyChildren));
     }
 
     #[test]

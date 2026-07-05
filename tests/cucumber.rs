@@ -16,16 +16,16 @@ use cucumber::World;
 #[path = "common/mock_peer.rs"]
 pub(crate) mod mock_peer;
 
+#[path = "steps/outbound_only.rs"]
+mod outbound_only;
+#[path = "steps/security.rs"]
+mod security;
 #[path = "steps/us1.rs"]
 mod us1;
 #[path = "steps/us2.rs"]
 mod us2;
 #[path = "steps/us3.rs"]
 mod us3;
-#[path = "steps/outbound_only.rs"]
-mod outbound_only;
-#[path = "steps/security.rs"]
-mod security;
 
 /// 全フィーチャ共通の World。ストーリー実装時に必要なフィールドを追加する。
 #[derive(Debug, Default, World)]

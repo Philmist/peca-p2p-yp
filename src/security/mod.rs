@@ -121,7 +121,9 @@ pub fn url_needs_warning(url: &str) -> bool {
 
 /// 指定長の小文字 hex 文字列か(イベント id・pubkey・チャンネル GUID の形式検証用)。
 pub fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // ---------------------------------------------------------------------------
@@ -327,8 +329,8 @@ impl SecurityLog {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn all_12_categories_have_unique_names() {

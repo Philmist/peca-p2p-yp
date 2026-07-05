@@ -176,7 +176,10 @@ impl GossipHub {
     ///
     /// 相手申告 `ts` に基づく未検証値であり、通知のみに用いる(MUST NOT 検証・接続判断)。
     pub fn clock_skew_samples(&self) -> Vec<i64> {
-        lock(&self.peers).values().map(|l| l.clock_skew_sec).collect()
+        lock(&self.peers)
+            .values()
+            .map(|l| l.clock_skew_sec)
+            .collect()
     }
 
     /// established 接続数 `(inbound, outbound)`(T031 status API 用)。
@@ -227,7 +230,8 @@ impl GossipHub {
     }
 
     fn log_reject(&self, reject: &VerifyReject, source: &str) {
-        self.security.log(reject.category(), source, reject.detail());
+        self.security
+            .log(reject.category(), source, reject.detail());
     }
 
     /// イベントを established 全ピアへ送る。`exclude` の接続へは送らない(再伝搬時の受信元)。
@@ -349,10 +353,18 @@ mod tests {
         let c2 = Arc::clone(&clock);
         let estore = EventStore::with_clock(cfg, Box::new(move || c2.load(Ordering::SeqCst)));
         let c3 = Arc::clone(&clock);
-        let dedup = DedupCache::with_clock(cfg.freshness_window_sec, Box::new(move || c3.load(Ordering::SeqCst)));
+        let dedup = DedupCache::with_clock(
+            cfg.freshness_window_sec,
+            Box::new(move || c3.load(Ordering::SeqCst)),
+        );
         let state = IngestState::with_parts(estore, dedup, VerifyConfig::default(), cfg);
         let c4 = Arc::clone(&clock);
-        GossipHub::with_state_and_clock(store, security, state, Box::new(move || c4.load(Ordering::SeqCst)))
+        GossipHub::with_state_and_clock(
+            store,
+            security,
+            state,
+            Box::new(move || c4.load(Ordering::SeqCst)),
+        )
     }
 
     #[tokio::test]

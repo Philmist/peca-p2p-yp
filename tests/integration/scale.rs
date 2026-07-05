@@ -30,16 +30,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nostr::{Event, Keys};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 
 use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 
 #[path = "../common/mock_peer.rs"]
 mod mock_peer;
 
-use mock_peer::{unix_now, TestNode};
+use mock_peer::{TestNode, unix_now};
 
 /// 接続度(Settings `p2p_outbound_target` 既定値 = 8。変更しない — SC-008)。
 const DEGREE: usize = 8;
@@ -189,7 +189,9 @@ async fn run_scale(cfg: ScaleConfig) -> ScaleStats {
                     }
                     let latency = {
                         let table = publish_at.lock().unwrap();
-                        table.get(&row.channel_id).map(|t| t.elapsed().as_secs_f64())
+                        table
+                            .get(&row.channel_id)
+                            .map(|t| t.elapsed().as_secs_f64())
                     };
                     if let Some(latency) = latency {
                         seen.insert(row.channel_id.clone());

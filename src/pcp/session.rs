@@ -354,7 +354,11 @@ impl AnnounceSession {
         }
         if let Some(host) = host {
             let firewalled = flg1 & FLG1_PUSH != 0;
-            entry.tracker = if firewalled { None } else { build_tracker(host) };
+            entry.tracker = if firewalled {
+                None
+            } else {
+                build_tracker(host)
+            };
             entry.listeners = child_i32(Some(host), "numl", entry.listeners);
             entry.relays_cnt = child_i32(Some(host), "numr", entry.relays_cnt);
             tracing::debug!(
@@ -708,7 +712,10 @@ mod tests {
                     "chan",
                     vec![
                         Atom::bytes("id", cid),
-                        Atom::parent("info", vec![Atom::str("name", name), Atom::i32("bitr", 500)]),
+                        Atom::parent(
+                            "info",
+                            vec![Atom::str("name", name), Atom::i32("bitr", 500)],
+                        ),
                     ],
                 ),
                 Atom::parent(
@@ -727,7 +734,9 @@ mod tests {
     }
 
     fn feed(session: &mut AnnounceSession, atom: &Atom) -> Vec<AnnounceAction> {
-        session.on_atom(atom.to_bytes().len(), atom.clone()).unwrap()
+        session
+            .on_atom(atom.to_bytes().len(), atom.clone())
+            .unwrap()
     }
 
     #[test]
@@ -740,7 +749,10 @@ mod tests {
         assert_eq!(actions.len(), 1);
         let AnnounceAction::Send(oleh) = &actions[0];
         assert!(oleh.id().matches("oleh"));
-        assert_eq!(oleh.find("agnt").and_then(|a| a.as_str()), Some(agent_name()));
+        assert_eq!(
+            oleh.find("agnt").and_then(|a| a.as_str()),
+            Some(agent_name())
+        );
         // sid はエコーではなく自ノードの SessionID(エコーするとクライアントが
         // 自己接続と誤判定して切断する)。
         let oleh_sid = oleh.find("sid").and_then(Atom::payload).unwrap();
@@ -851,7 +863,10 @@ mod tests {
                     "chan",
                     vec![
                         Atom::bytes("id", &cid),
-                        Atom::parent("info", vec![Atom::str("name", "V6"), Atom::i32("bitr", 500)]),
+                        Atom::parent(
+                            "info",
+                            vec![Atom::str("name", "V6"), Atom::i32("bitr", 500)],
+                        ),
                     ],
                 ),
                 Atom::parent(

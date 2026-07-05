@@ -223,7 +223,10 @@ fn sanitize_delimiter_in_title_is_escaped() {
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
     // エスケープ後もフィールド数は 19 のまま(区切り解析が破壊されない)
     assert_eq!(fields.len(), 19, "エスケープ後もフィールド数は 19");
-    assert_eq!(fields[0], "テスト&lt;&gt;放送", "`<`/`>` がエスケープされている");
+    assert_eq!(
+        fields[0], "テスト&lt;&gt;放送",
+        "`<`/`>` がエスケープされている"
+    );
 }
 
 /// Shift_JIS 変換不能文字(絵文字)は `?` に置換される。
@@ -252,7 +255,10 @@ fn shift_jis_unencodable_becomes_question_mark() {
     // UTF-8 出力では 🚀 がそのまま含まれる
     let out_utf8 = generate(&[ch2], IndexEncoding::Utf8, now);
     let text = std::str::from_utf8(&out_utf8).unwrap();
-    assert!(text.contains("テスト🚀放送"), "UTF-8 では絵文字が保持される");
+    assert!(
+        text.contains("テスト🚀放送"),
+        "UTF-8 では絵文字が保持される"
+    );
 }
 
 /// `<>` と Shift_JIS 変換不能文字が両方含まれる場合のサニタイズ確認。
@@ -275,11 +281,17 @@ fn sanitize_both_lt_gt_and_unencodable() {
     let out_sjis = generate(&[ch], IndexEncoding::ShiftJis, now);
     // Shift_JIS バイト列なので行区切り LF を探してフィールド数を検証
     // `<>` は ASCII(0x3C 0x3E)のため Shift_JIS でもバイトパターンは同じ
-    let pos = out_sjis.iter().position(|&b| b == b'\n').unwrap_or(out_sjis.len());
+    let pos = out_sjis
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(out_sjis.len());
     let line_bytes = &out_sjis[..pos];
     // '<>' = [0x3C, 0x3E] で分割してフィールド数を数える
     let separators = line_bytes.windows(2).filter(|w| w == &[0x3C, 0x3E]).count();
-    assert_eq!(separators, 18, "エスケープ後も区切りは 18 個(フィールド数 19)");
+    assert_eq!(
+        separators, 18,
+        "エスケープ後も区切りは 18 個(フィールド数 19)"
+    );
 }
 
 /// BROADCAST_TIME が 24 時間を超える場合: `25:30` 形式(分は 2 桁固定)。
@@ -301,7 +313,10 @@ fn broadcast_time_over_24_hours() {
     let text = std::str::from_utf8(&out).unwrap();
     let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
     assert_eq!(fields.len(), 19);
-    assert_eq!(fields[15], "25:30", "24 時間超の BROADCAST_TIME は時間部を拡張");
+    assert_eq!(
+        fields[15], "25:30",
+        "24 時間超の BROADCAST_TIME は時間部を拡張"
+    );
 }
 
 /// 分が 1 桁の場合も 2 桁固定でゼロ埋めされる。
@@ -331,8 +346,8 @@ fn unknown_counts_output_as_spec() {
     let cid = "00000000000000000000000000000007";
     let mut listing = make_listing(cid);
     listing.current_participants = UNKNOWN_COUNT; // -1
-    listing.relays = UNKNOWN_COUNT;               // -1
-    listing.bitrate_kbps = None;                  // → 0
+    listing.relays = UNKNOWN_COUNT; // -1
+    listing.bitrate_kbps = None; // → 0
     listing.tip = None;
     listing.track = None;
     listing.summary = None;

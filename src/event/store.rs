@@ -381,8 +381,8 @@ mod tests {
     use super::*;
     use crate::event::schema::{ChannelListing, ChannelStatus};
     use nostr::Keys;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn listing(d: &str, status: ChannelStatus, title: &str) -> ChannelListing {
         ChannelListing {
@@ -413,10 +413,7 @@ mod tests {
     }
 
     fn store_at(config: StoreConfig, clock: Arc<AtomicU64>) -> EventStore {
-        EventStore::with_clock(
-            config,
-            Box::new(move || clock.load(Ordering::SeqCst)),
-        )
+        EventStore::with_clock(config, Box::new(move || clock.load(Ordering::SeqCst)))
     }
 
     #[test]
@@ -431,7 +428,10 @@ mod tests {
         assert_eq!(store.insert(older.clone()), InsertOutcome::Stored);
         assert_eq!(store.insert(newer.clone()), InsertOutcome::Replaced);
         assert_eq!(
-            store.get(30311, &keys.public_key().to_hex(), D1).unwrap().id,
+            store
+                .get(30311, &keys.public_key().to_hex(), D1)
+                .unwrap()
+                .id,
             newer.id
         );
         // 古いイベント(別 id)を後から入れても後退しない
@@ -463,7 +463,10 @@ mod tests {
         assert_eq!(store.insert(small.clone()), InsertOutcome::Stored);
         assert_eq!(store.insert(large.clone()), InsertOutcome::Replaced);
         assert_eq!(
-            store.get(30311, &keys.public_key().to_hex(), D1).unwrap().id,
+            store
+                .get(30311, &keys.public_key().to_hex(), D1)
+                .unwrap()
+                .id,
             large.id
         );
         // 大 id が既にある状態で小 id(別 id・同 created)は劣後
@@ -616,7 +619,8 @@ mod tests {
     fn dedup_detects_duplicate_until_expiry() {
         let clock = Arc::new(AtomicU64::new(1000));
         let clock2 = Arc::clone(&clock);
-        let mut cache = DedupCache::with_clock(600, Box::new(move || clock2.load(Ordering::SeqCst)));
+        let mut cache =
+            DedupCache::with_clock(600, Box::new(move || clock2.load(Ordering::SeqCst)));
 
         let id = "abc";
         assert!(!cache.check_and_insert(id)); // 初回 = 未知

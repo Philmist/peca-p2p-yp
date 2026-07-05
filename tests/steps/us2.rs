@@ -10,14 +10,14 @@ use std::time::Duration;
 use cucumber::{given, then, when};
 use nostr::{Event, Keys};
 
+use peca_p2p_yp::config::IndexEncoding;
 use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 use peca_p2p_yp::event::view::DiscoveredChannel;
-use peca_p2p_yp::config::IndexEncoding;
 use peca_p2p_yp::yp::index_txt::generate;
 
 use crate::AppWorld;
 
-use crate::mock_peer::{unix_now, MockPeer, TestNode};
+use crate::mock_peer::{MockPeer, TestNode, unix_now};
 
 const CH_LIVE: &str = "0123456789abcdef0123456789abcdef";
 const CH_STALE: &str = "0123456789abcdef0123456789abcde0";
@@ -55,7 +55,12 @@ impl std::fmt::Debug for Us2World {
     }
 }
 
-fn listing(channel_id: &str, title: &str, status: ChannelStatus, tip: Option<&str>) -> ChannelListing {
+fn listing(
+    channel_id: &str,
+    title: &str,
+    status: ChannelStatus,
+    tip: Option<&str>,
+) -> ChannelListing {
     ChannelListing {
         channel_id: channel_id.into(),
         title: title.into(),
@@ -124,7 +129,13 @@ async fn stale_event_received(world: &mut AppWorld) {
     {
         let c = ctx(world);
         // 鮮度窓(600 秒)超のイベント + 接続確認用の live イベント。
-        mock.serve_signed(&signed(&c.keys, CH_STALE, "鮮度切れ", unix_now() - 700, Some(TIP)));
+        mock.serve_signed(&signed(
+            &c.keys,
+            CH_STALE,
+            "鮮度切れ",
+            unix_now() - 700,
+            Some(TIP),
+        ));
         mock.serve_signed(&signed(&c.keys, CH_LIVE, "現行", unix_now(), Some(TIP)));
         c.mock = Some(mock);
         c.node = Some(node);
@@ -175,9 +186,16 @@ async fn channel_listed_within_5s(world: &mut AppWorld) {
         "5 秒以内に一覧へ表示されるべき(SC-004)"
     );
     let rows = node.snapshot();
-    let row = rows.iter().find(|c| c.channel_id == CH_LIVE).expect("一覧に存在");
+    let row = rows
+        .iter()
+        .find(|c| c.channel_id == CH_LIVE)
+        .expect("一覧に存在");
     assert_eq!(row.listing.title, "配信A", "名称が表示される");
-    assert_eq!(row.listing.genre.as_deref(), Some("game"), "ジャンルが表示される");
+    assert_eq!(
+        row.listing.genre.as_deref(),
+        Some("game"),
+        "ジャンルが表示される"
+    );
 }
 
 #[then("出力にはチャンネル ID とトラッカー接続先が含まれる")]

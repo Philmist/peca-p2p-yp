@@ -24,17 +24,17 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::p2p::peers::parse_addr;
 use crate::store::{PeerEndpoint, PeerSource};
 
-use super::{error_response, AppState};
+use super::{AppState, error_response};
 
 /// `peers` エンドポイント群のサブルーター。[`super::api_router`] が `.merge` する。
 pub(crate) fn routes() -> Router<AppState> {
@@ -135,11 +135,7 @@ struct EnabledUpdate {
 }
 
 /// `PUT /api/v1/peers/{id}` — enabled 変更。
-async fn set_enabled(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    body: Bytes,
-) -> Response {
+async fn set_enabled(State(state): State<AppState>, Path(id): Path<i64>, body: Bytes) -> Response {
     let update: EnabledUpdate = match serde_json::from_slice(&body) {
         Ok(u) => u,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -178,11 +174,7 @@ async fn export_peers(State(state): State<AppState>) -> Response {
                 body.push_str(&peer.addr);
                 body.push('\n');
             }
-            (
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                body,
-            )
-                .into_response()
+            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
         }
         Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }

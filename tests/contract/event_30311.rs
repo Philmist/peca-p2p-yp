@@ -54,7 +54,8 @@ fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
 fn peca_value<'a>(event: &'a Event, sub: &str) -> Option<&'a str> {
     event.tags.iter().find_map(|tag| {
         let s = tag.as_slice();
-        if s.first().map(String::as_str) == Some("peca") && s.get(1).map(String::as_str) == Some(sub)
+        if s.first().map(String::as_str) == Some("peca")
+            && s.get(1).map(String::as_str) == Some(sub)
         {
             s.get(2).map(String::as_str)
         } else {

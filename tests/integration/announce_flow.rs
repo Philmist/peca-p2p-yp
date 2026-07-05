@@ -13,10 +13,10 @@ use peca_p2p_yp::config::IndexEncoding;
 use peca_p2p_yp::event::schema::{VerifyConfig, verify_incoming};
 use peca_p2p_yp::yp::index_txt::generate;
 
-#[path = "../common/mock_peer.rs"]
-mod mock_peer;
 #[path = "../common/announcer.rs"]
 mod announcer;
+#[path = "../common/mock_peer.rs"]
+mod mock_peer;
 
 use announcer::{AnnouncerNode, PcpClient};
 use mock_peer::{MockPeer, TestNode, unix_now};
@@ -72,7 +72,9 @@ async fn setup() -> (AnnouncerNode, MockPeer) {
 async fn announce_delivers_verifiable_signed_event() {
     let (node, mock) = setup().await;
     let mut client = PcpClient::connect(node.pcp_addr(), [0x01; 16]).await;
-    client.broadcast(&CID, "統合テスト配信", "game", "説明").await;
+    client
+        .broadcast(&CID, "統合テスト配信", "game", "説明")
+        .await;
 
     let event = wait_received(&mock, Duration::from_secs(10), |v| {
         tag_value(v, "d").as_deref() == Some(cid_hex().as_str())

@@ -27,10 +27,8 @@ pub const PEX_MAX_PEERS: usize = 64;
 ///
 /// 返すアドレスは PeerEndpoint の `addr`(登録時に canonical 化済み — [`crate::store`])。
 pub fn select_peers_for_pex(peers: &[PeerEndpoint], max: usize) -> Vec<String> {
-    let mut eligible: Vec<&PeerEndpoint> = peers
-        .iter()
-        .filter(|p| p.verified && p.enabled)
-        .collect();
+    let mut eligible: Vec<&PeerEndpoint> =
+        peers.iter().filter(|p| p.verified && p.enabled).collect();
     eligible.sort_by(|a, b| {
         b.last_ok_at
             .unwrap_or(i64::MIN)
@@ -131,7 +129,7 @@ mod tests {
             peer(3, "c:7147", true, true, Some(200)),
             peer(4, "d:7147", false, true, Some(999)), // 未検証 → 除外
             peer(5, "e:7147", true, false, Some(999)), // 無効 → 除外
-            peer(6, "f:7147", true, true, None),        // 実績なし → 最下位
+            peer(6, "f:7147", true, true, None),       // 実績なし → 最下位
         ];
         assert_eq!(
             select_peers_for_pex(&peers, PEX_MAX_PEERS),
@@ -179,8 +177,8 @@ mod tests {
         let peers = vec![
             "not-an-addr".to_string(),
             "host:0".to_string(),
-            "2001:db8::1:7147".to_string(),       // ブラケットなし複数コロン
-            format!("{}:7147", "a".repeat(256)),   // 長さ超過
+            "2001:db8::1:7147".to_string(), // ブラケットなし複数コロン
+            format!("{}:7147", "a".repeat(256)), // 長さ超過
         ];
         let r = validate_incoming_peers(&peers, |_| false, PEX_MAX_PEERS);
         assert!(r.accepted.is_empty());
@@ -196,11 +194,7 @@ mod tests {
             "[2001:DB8::0:1]:7147".to_string(),
             "[2001:db8::1]:7147".to_string(),
         ];
-        let r = validate_incoming_peers(
-            &peers,
-            |c| c == "203.0.113.5:7147",
-            PEX_MAX_PEERS,
-        );
+        let r = validate_incoming_peers(&peers, |c| c == "203.0.113.5:7147", PEX_MAX_PEERS);
         assert_eq!(r.accepted.len(), 2);
         assert_eq!(r.rejected.len(), 3);
         assert!(r.has_rejections());

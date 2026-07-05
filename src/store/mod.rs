@@ -269,14 +269,11 @@ impl Store {
     /// - `label` は 64 文字以内(検証)。
     /// - `pubkey` は小文字 hex 64(`nostr` の `to_hex()` 出力形式)。重複は拒否。
     /// - `state` は `active`、`created_at` は現在時刻。
-    pub fn insert_persona(
-        &self,
-        pubkey: &str,
-        secret_enc: &[u8],
-        label: &str,
-    ) -> Result<Persona> {
+    pub fn insert_persona(&self, pubkey: &str, secret_enc: &[u8], label: &str) -> Result<Persona> {
         if label.chars().count() > LABEL_MAX_CHARS {
-            return Err(StoreError::Validation("ラベルは 64 文字以内で指定してください"));
+            return Err(StoreError::Validation(
+                "ラベルは 64 文字以内で指定してください",
+            ));
         }
         if !is_lower_hex(pubkey, PUBKEY_HEX_LEN) {
             return Err(StoreError::Validation("公開鍵の形式が不正です"));
@@ -320,16 +317,16 @@ impl Store {
                  FROM personas ORDER BY id ASC",
             )
             .map_err(map_sqlite)?;
-        let rows = stmt
-            .query_map([], row_to_persona)
-            .map_err(map_sqlite)?;
+        let rows = stmt.query_map([], row_to_persona).map_err(map_sqlite)?;
         collect_rows(rows)
     }
 
     /// ペルソナの表示名を更新する。存在すれば `true`。
     pub fn update_persona_label(&self, pubkey: &str, label: &str) -> Result<bool> {
         if label.chars().count() > LABEL_MAX_CHARS {
-            return Err(StoreError::Validation("ラベルは 64 文字以内で指定してください"));
+            return Err(StoreError::Validation(
+                "ラベルは 64 文字以内で指定してください",
+            ));
         }
         let conn = self.lock()?;
         let n = conn
@@ -381,11 +378,8 @@ impl Store {
         let conn = self.lock()?;
         if let Some(existing) = query_peer(&conn, addr)? {
             if source == PeerSource::Manual && existing.source != PeerSource::Manual {
-                conn.execute(
-                    "UPDATE peers SET source = 'manual' WHERE addr = ?1",
-                    [addr],
-                )
-                .map_err(map_sqlite)?;
+                conn.execute("UPDATE peers SET source = 'manual' WHERE addr = ?1", [addr])
+                    .map_err(map_sqlite)?;
                 return query_peer(&conn, addr)?
                     .ok_or(StoreError::Backend(rusqlite::Error::QueryReturnedNoRows));
             }
@@ -399,8 +393,7 @@ impl Store {
         )
         .map_err(map_sqlite)?;
         enforce_peer_limit(&conn)?;
-        query_peer(&conn, addr)?
-            .ok_or(StoreError::Backend(rusqlite::Error::QueryReturnedNoRows))
+        query_peer(&conn, addr)?.ok_or(StoreError::Backend(rusqlite::Error::QueryReturnedNoRows))
     }
 
     /// 全ピアを id 昇順で列挙する(UI の健全性表示用)。
@@ -487,9 +480,11 @@ impl Store {
             return Ok(None);
         }
         let count = conn
-            .query_row("SELECT fail_count FROM peers WHERE addr = ?1", [addr], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT fail_count FROM peers WHERE addr = ?1",
+                [addr],
+                |r| r.get::<_, i64>(0),
+            )
             .map_err(map_sqlite)?;
         Ok(Some(count))
     }
@@ -627,8 +622,12 @@ fn row_to_mute(row: &Row<'_>) -> rusqlite::Result<MuteEntry> {
 }
 
 fn query_peer(conn: &Connection, addr: &str) -> Result<Option<PeerEndpoint>> {
-    conn.query_row(&format!("{PEER_SELECT} WHERE addr = ?1"), [addr], row_to_peer)
-        .optional()
+    conn.query_row(
+        &format!("{PEER_SELECT} WHERE addr = ?1"),
+        [addr],
+        row_to_peer,
+    )
+    .optional()
 }
 
 /// 登録上限超過時に `manual` 以外を LRU 順(last_ok_at 昇順→added_at 昇順→id 昇順)で降格削除する。
@@ -652,9 +651,7 @@ fn enforce_peer_limit(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn collect_rows<T>(
-    rows: impl Iterator<Item = rusqlite::Result<T>>,
-) -> Result<Vec<T>> {
+fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
     let mut out = Vec::new();
     for row in rows {
         out.push(row.map_err(map_sqlite)?);
@@ -664,7 +661,9 @@ fn collect_rows<T>(
 
 /// 指定長の小文字 hex 文字列か(pubkey 形式検証用)。
 fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `QueryReturnedNoRows` を `Ok(None)` に畳み込むための拡張。
@@ -861,7 +860,11 @@ mod tests {
         // 最古(last_ok_at=0)の pex-0 が消え、manual は残る
         assert!(s.get_peer("pex-0:1").unwrap().is_none());
         assert!(s.get_peer("manual:1").unwrap().is_some());
-        assert!(s.get_peer(&format!("pex-{}:1", PEER_LIMIT - 1)).unwrap().is_some());
+        assert!(
+            s.get_peer(&format!("pex-{}:1", PEER_LIMIT - 1))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -869,7 +872,8 @@ mod tests {
         let s = store();
         // manual だけで上限を超えて登録しても降格されない
         for i in 0..(PEER_LIMIT + 5) {
-            s.upsert_peer(&format!("m-{i}:1"), PeerSource::Manual).unwrap();
+            s.upsert_peer(&format!("m-{i}:1"), PeerSource::Manual)
+                .unwrap();
         }
         assert_eq!(s.count_peers().unwrap(), PEER_LIMIT + 5);
         assert!(s.get_peer("m-0:1").unwrap().is_some());
@@ -896,7 +900,10 @@ mod tests {
         assert!(s.get_setting("pcp_bind").unwrap().is_none());
         s.set_setting("pcp_bind", "127.0.0.1:7146").unwrap();
         s.set_setting("pcp_bind", "127.0.0.1:9999").unwrap(); // UPSERT
-        assert_eq!(s.get_setting("pcp_bind").unwrap().unwrap(), "127.0.0.1:9999");
+        assert_eq!(
+            s.get_setting("pcp_bind").unwrap().unwrap(),
+            "127.0.0.1:9999"
+        );
         s.set_setting("pex_enabled", "1").unwrap();
         let all = s.all_settings().unwrap();
         assert_eq!(all.len(), 2);

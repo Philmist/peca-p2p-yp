@@ -23,13 +23,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::identity::{IdentityError, PersonaInfo};
 use crate::store::PersonaState;
 
-use super::{error_response, AppState};
+use super::{AppState, error_response};
 
 /// `personas` エンドポイント群のサブルーター。[`super::api_router`] が `.merge` する。
 pub(crate) fn routes() -> Router<AppState> {
@@ -39,10 +39,7 @@ pub(crate) fn routes() -> Router<AppState> {
             "/personas/{pubkey}/export",
             axum::routing::post(export_persona),
         )
-        .route(
-            "/personas",
-            get(list_personas).post(create_persona),
-        )
+        .route("/personas", get(list_personas).post(create_persona))
         .route(
             "/personas/{pubkey}",
             axum::routing::put(update_persona).delete(delete_persona),
@@ -58,7 +55,9 @@ fn no_identity() -> Response {
 fn identity_err(e: IdentityError) -> Response {
     match e {
         IdentityError::NotFound => error_response(StatusCode::NOT_FOUND, "not_found"),
-        IdentityError::Unusable => error_response(StatusCode::UNPROCESSABLE_ENTITY, "persona_unusable"),
+        IdentityError::Unusable => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, "persona_unusable")
+        }
         IdentityError::Crypto | IdentityError::Store(_) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }

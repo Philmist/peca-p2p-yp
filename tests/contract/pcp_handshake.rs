@@ -143,7 +143,10 @@ fn helo_produces_oleh_with_fixed_agent_name() {
 
     // sid は自ノードの SessionID(HELO sid のエコーはクライアントの自己接続判定を
     // 誤発火させるため禁止 — 本家 PeerCast 互換)。ver を含む
-    let oleh_sid = oleh.find("sid").and_then(|a| a.payload()).expect("sid atom");
+    let oleh_sid = oleh
+        .find("sid")
+        .and_then(|a| a.payload())
+        .expect("sid atom");
     assert_eq!(oleh_sid.len(), 16);
     assert_ne!(oleh_sid, &sid[..], "HELO sid をエコーしない");
     assert_eq!(
@@ -175,7 +178,10 @@ fn bcst_registers_then_updates_channel_with_notifications() {
     feed(&mut session, &helo(&sid));
 
     // 初回 BCST(playing) → announced
-    feed(&mut session, &bcst(&cid, &sid, "配信A", 500, FLG1_RECV | FLG1_DIRECT));
+    feed(
+        &mut session,
+        &bcst(&cid, &sid, "配信A", 500, FLG1_RECV | FLG1_DIRECT),
+    );
     let snap = registry.snapshot();
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].channel_id, cid);
@@ -190,7 +196,10 @@ fn bcst_registers_then_updates_channel_with_notifications() {
     }
 
     // 2 回目 BCST(同一 cid・名称変更) → updated
-    feed(&mut session, &bcst(&cid, &sid, "配信A2", 800, FLG1_RECV | FLG1_DIRECT));
+    feed(
+        &mut session,
+        &bcst(&cid, &sid, "配信A2", 800, FLG1_RECV | FLG1_DIRECT),
+    );
     let snap = registry.snapshot();
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].name, "配信A2");
@@ -210,7 +219,10 @@ fn firewalled_bcst_has_no_tracker() {
 
     let cid = [0xBBu8; 16];
     // PUSH(firewalled)ビットあり → tracker 省略
-    feed(&mut session, &bcst(&cid, &[0x33u8; 16], "FW", 400, FLG1_RECV | FLG1_PUSH));
+    feed(
+        &mut session,
+        &bcst(&cid, &[0x33u8; 16], "FW", 400, FLG1_RECV | FLG1_PUSH),
+    );
     let snap = registry.snapshot();
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].tracker, None, "firewalled はトラッカー空");
@@ -228,8 +240,14 @@ fn quit_ends_all_channels() {
     let mut session = AnnounceSession::new(registry.clone(), sec, "127.0.0.1:50003".into());
     let sid = [0x44u8; 16];
     feed(&mut session, &helo(&sid));
-    feed(&mut session, &bcst(&[0xC1u8; 16], &sid, "A", 500, FLG1_RECV));
-    feed(&mut session, &bcst(&[0xC2u8; 16], &sid, "B", 500, FLG1_RECV));
+    feed(
+        &mut session,
+        &bcst(&[0xC1u8; 16], &sid, "A", 500, FLG1_RECV),
+    );
+    feed(
+        &mut session,
+        &bcst(&[0xC2u8; 16], &sid, "B", 500, FLG1_RECV),
+    );
     // 通知を読み飛ばす
     let _ = rx.try_recv();
     let _ = rx.try_recv();
@@ -239,11 +257,17 @@ fn quit_ends_all_channels() {
     let disc = session
         .on_atom(quit.to_bytes().len(), roundtrip(&quit))
         .expect_err("QUIT は切断を返す");
-    assert!(disc.category.is_none(), "QUIT はセキュリティイベントではない");
+    assert!(
+        disc.category.is_none(),
+        "QUIT はセキュリティイベントではない"
+    );
 
     // 呼び出し側(pump)の切断後処理に相当
     session.end_all();
-    assert!(registry.snapshot().is_empty(), "全チャンネルが ended で除去される");
+    assert!(
+        registry.snapshot().is_empty(),
+        "全チャンネルが ended で除去される"
+    );
 
     // ended 通知が 2 件、最終状態を伴って届く
     let mut ended = 0;
@@ -265,7 +289,10 @@ fn tcp_abnormal_close_ends_immediately() {
     let mut session = AnnounceSession::new(registry.clone(), sec, "127.0.0.1:50004".into());
     let sid = [0x55u8; 16];
     feed(&mut session, &helo(&sid));
-    feed(&mut session, &bcst(&[0xD1u8; 16], &sid, "A", 500, FLG1_RECV));
+    feed(
+        &mut session,
+        &bcst(&[0xD1u8; 16], &sid, "A", 500, FLG1_RECV),
+    );
     let _ = rx.try_recv();
 
     session.end_all();
@@ -396,7 +423,10 @@ fn seventeenth_channel_is_ignored_and_logged() {
 
     sec.flush();
     let content = std::fs::read_to_string(&path).unwrap();
-    assert!(content.contains("pcp_reject"), "pcp_reject が記録される: {content}");
+    assert!(
+        content.contains("pcp_reject"),
+        "pcp_reject が記録される: {content}"
+    );
 }
 
 #[test]
@@ -455,7 +485,10 @@ async fn serve_roundtrips_over_tcp_and_ends_on_disconnect() {
         }
     };
     assert!(oleh.id().matches("oleh"));
-    assert_eq!(oleh.find("agnt").and_then(|a| a.as_str()), Some(agent_name()));
+    assert_eq!(
+        oleh.find("agnt").and_then(|a| a.as_str()),
+        Some(agent_name())
+    );
 
     // BCST 送信 → 登録
     client
@@ -493,8 +526,8 @@ async fn serve_roundtrips_over_tcp_and_ends_on_disconnect() {
 fn session_rate_limit_disconnects_with_pcp_reject() {
     let (sec, _g) = temp_security();
     let registry = ChannelRegistry::new();
-    let mut session = AnnounceSession::new(registry, sec, "127.0.0.1:50009".into())
-        .with_clock(Box::new(|| 1000));
+    let mut session =
+        AnnounceSession::new(registry, sec, "127.0.0.1:50009".into()).with_clock(Box::new(|| 1000));
     feed(&mut session, &helo(&[0x99u8; 16]));
 
     // 同一秒窓で 64KB/秒 を超えるまで無害 atom を投入

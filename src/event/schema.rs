@@ -156,7 +156,11 @@ impl ChannelListing {
             raw.push(vec!["peca".into(), "contact".into(), contact.clone()]);
         }
         if self.relays >= 0 {
-            raw.push(vec!["peca".into(), "relays".into(), self.relays.to_string()]);
+            raw.push(vec![
+                "peca".into(),
+                "relays".into(),
+                self.relays.to_string(),
+            ]);
         }
         if let Some(track) = &self.track {
             raw.push(vec![
@@ -654,7 +658,10 @@ mod tests {
     #[test]
     fn reject_oversize_before_parse() {
         let raw = "x".repeat(MAX_EVENT_BYTES + 1);
-        assert_eq!(verify_incoming(&raw, &cfg(), 0), Err(VerifyReject::Oversize));
+        assert_eq!(
+            verify_incoming(&raw, &cfg(), 0),
+            Err(VerifyReject::Oversize)
+        );
     }
 
     #[test]
@@ -668,7 +675,9 @@ mod tests {
         let keys = Keys::generate();
         let event = sample_listing().sign(&keys, 1_700_000_000, 0).unwrap();
         // content を改竄すると id 再計算が合わず署名検証に失敗する
-        let raw = event.as_json().replace("\"content\":\"\"", "\"content\":\"x\"");
+        let raw = event
+            .as_json()
+            .replace("\"content\":\"\"", "\"content\":\"x\"");
         assert_eq!(
             verify_incoming(&raw, &cfg(), 1_700_000_000),
             Err(VerifyReject::InvalidSig)

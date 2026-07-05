@@ -102,7 +102,9 @@ async fn app_running_with_mock_peer(world: &mut AppWorld) {
 async fn channel_announced(world: &mut AppWorld) {
     let c = ctx(world);
     let mut client = PcpClient::connect(c.node.pcp_addr(), [0x10; 16]).await;
-    client.broadcast(&CID, "掲載中チャンネル", "game", "説明").await;
+    client
+        .broadcast(&CID, "掲載中チャンネル", "game", "説明")
+        .await;
     c.client = Some(client);
     let mock = &ctx(world).mock;
     assert!(

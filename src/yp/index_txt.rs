@@ -21,16 +21,16 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{body::Body, Router};
+use axum::{Router, body::Body};
 use encoding_rs::SHIFT_JIS;
 
 use crate::config::{IndexEncoding, Settings};
 use crate::event::view::DiscoveredChannel;
 use crate::security::SecurityCategory;
-use crate::web::{error_response, AppState};
+use crate::web::{AppState, error_response};
 
 // ---------------------------------------------------------------------------
 // 生成ロジック
@@ -88,12 +88,7 @@ fn channel_line(ch: &DiscoveredChannel, now: u64, encoding: IndexEncoding) -> St
             sanitize(&t.title),
             sanitize(&t.url),
         ),
-        None => (
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ),
+        None => (String::new(), String::new(), String::new(), String::new()),
     };
     // フィールド 15: NAME_ENCODED — チャンネル名(生値)の percent エンコード
     let name_encoded = percent_encode_name(&l.title, encoding);
@@ -188,14 +183,17 @@ pub(crate) fn routes() -> Router<AppState> {
 /// GET /index.txt ハンドラ。
 async fn handler(State(state): State<AppState>, req: Request<Body>) -> Response {
     // URL 長チェック(≤ 1KB)
-    let uri_len = req.uri().path().len()
-        + req.uri().query().map_or(0, |q| q.len() + 1);
+    let uri_len = req.uri().path().len() + req.uri().query().map_or(0, |q| q.len() + 1);
     if uri_len > 1024 {
         return error_response(StatusCode::BAD_REQUEST, "request_too_large");
     }
 
     // ヘッダ合計サイズチェック(≤ 8KB)
-    let header_bytes: usize = req.headers().iter().map(|(k, v)| k.as_str().len() + v.len() + 4).sum();
+    let header_bytes: usize = req
+        .headers()
+        .iter()
+        .map(|(k, v)| k.as_str().len() + v.len() + 4)
+        .sum();
     if header_bytes > 8192 {
         return error_response(StatusCode::BAD_REQUEST, "request_too_large");
     }
@@ -245,17 +243,9 @@ async fn handler(State(state): State<AppState>, req: Request<Body>) -> Response 
     };
 
     if is_head {
-        (
-            [(header::CONTENT_TYPE, content_type)],
-            Body::empty(),
-        )
-            .into_response()
+        ([(header::CONTENT_TYPE, content_type)], Body::empty()).into_response()
     } else {
-        (
-            [(header::CONTENT_TYPE, content_type)],
-            body_bytes,
-        )
-            .into_response()
+        ([(header::CONTENT_TYPE, content_type)], body_bytes).into_response()
     }
 }
 
@@ -302,10 +292,7 @@ mod tests {
         assert_eq!(sanitize("foo<>bar"), "foo&lt;&gt;bar");
         // wiki 仕様: エスケープ対象は `<`/`>` のみ。`&` は触らない
         assert_eq!(sanitize("A&B"), "A&B");
-        assert_eq!(
-            sanitize("http://e.com/?a=1&b=2"),
-            "http://e.com/?a=1&b=2"
-        );
+        assert_eq!(sanitize("http://e.com/?a=1&b=2"), "http://e.com/?a=1&b=2");
         assert_eq!(sanitize("no-delim"), "no-delim");
     }
 
@@ -367,6 +354,9 @@ mod tests {
         let out = generate(&[ch], IndexEncoding::ShiftJis, 60);
         assert!(out.contains(&b'?'));
         // `?` は <> と衝突しない
-        assert!(!out.windows(2).any(|w| w == [b'?', b'>'] || w == [b'<', b'?']));
+        assert!(
+            !out.windows(2)
+                .any(|w| w == [b'?', b'>'] || w == [b'<', b'?'])
+        );
     }
 }

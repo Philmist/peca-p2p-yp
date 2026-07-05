@@ -64,7 +64,9 @@ fn listing(channel_id: &str, title: &str) -> ChannelListing {
 }
 
 fn signed(keys: &Keys, channel_id: &str, title: &str) -> Event {
-    listing(channel_id, title).sign(keys, unix_now(), 0).unwrap()
+    listing(channel_id, title)
+        .sign(keys, unix_now(), 0)
+        .unwrap()
 }
 
 fn ctx(world: &mut AppWorld) -> &mut OutboundWorld {
@@ -150,7 +152,8 @@ async fn channel_announce_works(world: &mut AppWorld) {
 async fn channel_discovery_works(world: &mut AppWorld) {
     let node = ctx(world).node.as_ref().unwrap();
     assert!(
-        node.wait_for_channel(CH_DISCOVER, Duration::from_secs(5)).await,
+        node.wait_for_channel(CH_DISCOVER, Duration::from_secs(5))
+            .await,
         "外向き接続のみでも SYNC で発見したチャンネルが一覧へ現れるべき(US2)"
     );
 }

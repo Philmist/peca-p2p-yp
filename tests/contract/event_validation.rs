@@ -14,11 +14,11 @@
 
 use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 
+use peca_p2p_yp::event::schema::{CHANNEL_KIND, MAX_TAGS, verify_incoming};
 use peca_p2p_yp::event::schema::{
-    ChannelListing, ChannelStatus, Track, VerifyConfig, VerifyReject, DEFAULT_MAX_CLOCK_SKEW_SEC,
-    MAX_BITRATE_KBPS, MAX_EVENT_BYTES, UNKNOWN_COUNT,
+    ChannelListing, ChannelStatus, DEFAULT_MAX_CLOCK_SKEW_SEC, MAX_BITRATE_KBPS, MAX_EVENT_BYTES,
+    Track, UNKNOWN_COUNT, VerifyConfig, VerifyReject,
 };
-use peca_p2p_yp::event::schema::{verify_incoming, CHANNEL_KIND, MAX_TAGS};
 use peca_p2p_yp::security::SecurityCategory;
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,11 @@ fn check1_boundary_16kb_is_not_oversize() {
     // ちょうど 16KB(境界)は Oversize ではなく、中身の JSON 不正で弾かれる。
     let raw = "x".repeat(MAX_EVENT_BYTES);
     let err = verify_incoming(&raw, &cfg(), CREATED).unwrap_err();
-    assert_ne!(err, VerifyReject::Oversize, "境界ちょうどは Oversize にしない");
+    assert_ne!(
+        err,
+        VerifyReject::Oversize,
+        "境界ちょうどは Oversize にしない"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +124,9 @@ fn check2_tampered_content_maps_to_event_invalid_sig() {
     let keys = Keys::generate();
     let event = sign(&full_listing(), &keys, CREATED, 0);
     // content を改竄すると id 再計算が合わず署名検証に失敗する。
-    let raw = event.as_json().replace("\"content\":\"\"", "\"content\":\"x\"");
+    let raw = event
+        .as_json()
+        .replace("\"content\":\"\"", "\"content\":\"x\"");
     let err = verify_incoming(&raw, &cfg(), CREATED).unwrap_err();
     assert_eq!(err, VerifyReject::InvalidSig);
     assert_reject_maps_to(&err, SecurityCategory::EventInvalidSig, "invalid_sig");
@@ -258,7 +264,10 @@ fn check6_pow_pass_and_insufficient() {
         max_clock_skew_sec: DEFAULT_MAX_CLOCK_SKEW_SEC,
         min_pow_bits: 8,
     };
-    assert!(verify_incoming(&raw, &pass, CREATED).is_ok(), "8bit PoW は min 8 を満たす");
+    assert!(
+        verify_incoming(&raw, &pass, CREATED).is_ok(),
+        "8bit PoW は min 8 を満たす"
+    );
 
     // 事実上到達不能な難易度は不足として拒否(決定的)。
     let strict = VerifyConfig {
@@ -331,5 +340,9 @@ fn explicit_negative_count_tag_is_invalid_format() {
         .sign_with_keys(&keys)
         .unwrap();
     let err = verify_incoming(&event.as_json(), &cfg(), CREATED).unwrap_err();
-    assert_reject_maps_to(&err, SecurityCategory::EventInvalidFormat, "explicit_negative");
+    assert_reject_maps_to(
+        &err,
+        SecurityCategory::EventInvalidFormat,
+        "explicit_negative",
+    );
 }

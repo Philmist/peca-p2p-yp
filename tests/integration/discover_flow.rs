@@ -11,20 +11,25 @@ use std::time::Duration;
 use nostr::{Event, Keys};
 use serde_json::Value;
 
-use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 use peca_p2p_yp::config::IndexEncoding;
+use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 use peca_p2p_yp::yp::index_txt::generate;
 
 #[path = "../common/mock_peer.rs"]
 mod mock_peer;
 
-use mock_peer::{unix_now, MockPeer, TestNode};
+use mock_peer::{MockPeer, TestNode, unix_now};
 
 // ---------------------------------------------------------------------------
 // 補助
 // ---------------------------------------------------------------------------
 
-fn listing(channel_id: &str, title: &str, status: ChannelStatus, tip: Option<&str>) -> ChannelListing {
+fn listing(
+    channel_id: &str,
+    title: &str,
+    status: ChannelStatus,
+    tip: Option<&str>,
+) -> ChannelListing {
     ChannelListing {
         channel_id: channel_id.into(),
         title: title.into(),
@@ -44,9 +49,14 @@ fn listing(channel_id: &str, title: &str, status: ChannelStatus, tip: Option<&st
 }
 
 fn signed(keys: &Keys, channel_id: &str, title: &str, created: u64) -> Event {
-    listing(channel_id, title, ChannelStatus::Live, Some("198.51.100.1:7144"))
-        .sign(keys, created, 0)
-        .unwrap()
+    listing(
+        channel_id,
+        title,
+        ChannelStatus::Live,
+        Some("198.51.100.1:7144"),
+    )
+    .sign(keys, created, 0)
+    .unwrap()
 }
 
 const CH_A: &str = "0123456789abcdef0123456789abcdef";
@@ -77,7 +87,11 @@ async fn channel_appears_via_sync_within_5s() {
     let rows = node.snapshot();
     let row = rows.iter().find(|c| c.channel_id == CH_A).unwrap();
     assert_eq!(row.listing.title, "配信A", "名称が反映される");
-    assert_eq!(row.listing.genre.as_deref(), Some("game"), "ジャンルが反映される");
+    assert_eq!(
+        row.listing.genre.as_deref(),
+        Some("game"),
+        "ジャンルが反映される"
+    );
     // 受信ピア(モック)が source_peers に記録される。
     assert!(
         row.source_peers.iter().any(|p| p == mock.addr()),
@@ -114,10 +128,7 @@ async fn invalid_event_is_not_visible() {
     // 少し待って不正分が現れないことを確認する。
     tokio::time::sleep(Duration::from_millis(300)).await;
     let rows = node.snapshot();
-    assert!(
-        rows.iter().any(|c| c.channel_id == CH_A),
-        "正当分は可視"
-    );
+    assert!(rows.iter().any(|c| c.channel_id == CH_A), "正当分は可視");
     assert!(
         !rows.iter().any(|c| c.channel_id == CH_B),
         "署名不正イベントは不可視(SC-005)"

@@ -73,7 +73,9 @@ fn listing(channel_id: &str, title: &str) -> ChannelListing {
 }
 
 fn signed(keys: &Keys, channel_id: &str, title: &str) -> Event {
-    listing(channel_id, title).sign(keys, unix_now(), 0).unwrap()
+    listing(channel_id, title)
+        .sign(keys, unix_now(), 0)
+        .unwrap()
 }
 
 /// EVENT(生 JSON)の `d` タグ(= channel_id)。
@@ -253,7 +255,9 @@ async fn all_peers_disconnected_notification(world: &mut AppWorld) {
     let reachability = node.reachability();
     // 接続拒否が続き、全ピア到達不能フラグ(= UI の到達不能バナー契機)が立つ。
     assert!(
-        wait_until(Duration::from_secs(15), || reachability.is_all_unreachable()).await,
+        wait_until(Duration::from_secs(15), || reachability
+            .is_all_unreachable())
+        .await,
         "全ピア到達不能の通知(status フラグ)が出るべき"
     );
 }
@@ -263,12 +267,17 @@ async fn auto_reconnect_on_peer_recovery(world: &mut AppWorld) {
     let c = ctx(world);
     // 生きたピアが現れる → 外向き維持ループが自動再接続して到達可能へ回復する。
     let peer = MockPeer::spawn().await;
-    c.node.as_ref().expect("ノード").add_manual_peer(peer.addr());
+    c.node
+        .as_ref()
+        .expect("ノード")
+        .add_manual_peer(peer.addr());
     c.mocks.push(peer);
     let node = c.node.as_ref().unwrap();
     let reachability = node.reachability();
     assert!(
-        wait_until(Duration::from_secs(10), || !reachability.is_all_unreachable()).await,
+        wait_until(Duration::from_secs(10), || !reachability
+            .is_all_unreachable())
+        .await,
         "回復可能なピア出現で自動再接続し到達可能へ戻るべき"
     );
     assert!(

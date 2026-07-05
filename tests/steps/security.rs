@@ -23,13 +23,13 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 use peca_p2p_yp::identity::IdentityManager;
 use peca_p2p_yp::p2p::frame::{
-    close_reason, read_frame, write_frame, Hello, Message, MAX_FRAME_PAYLOAD,
+    Hello, MAX_FRAME_PAYLOAD, Message, close_reason, read_frame, write_frame,
 };
 use peca_p2p_yp::p2p::session::PROTOCOL_VERSION;
 use peca_p2p_yp::store::{MuteKind, Store};
 
-use crate::mock_peer::{unix_now, MockPeer, TestNode};
 use crate::AppWorld;
+use crate::mock_peer::{MockPeer, TestNode, unix_now};
 
 /// 正当な配信のチャンネル ID。
 const CH_LEGIT: &str = "00000000000000000000000000000001";
@@ -350,7 +350,8 @@ async fn forged_event_not_listed(world: &mut AppWorld) {
     let node = ctx(world).node.as_ref().unwrap();
     // 拒否の証拠(セキュリティイベント)を待ってから一覧の不在を確認する。
     assert!(
-        node.wait_for_security("event_invalid_sig", LOG_TIMEOUT).await,
+        node.wait_for_security("event_invalid_sig", LOG_TIMEOUT)
+            .await,
         "署名検証失敗が記録されるべき"
     );
     let rows = node.snapshot();
@@ -489,7 +490,12 @@ async fn mitigations_keep_list_usable(world: &mut AppWorld) {
 async fn dangerous_url_event_circulating(world: &mut AppWorld) {
     let (mock, node) = node_with_mock(0x5EC0_0005).await;
     let keys = Keys::generate();
-    mock.push_signed(&signed(&keys, CH_URL, "危険URL配信", Some("javascript:alert(1)")));
+    mock.push_signed(&signed(
+        &keys,
+        CH_URL,
+        "危険URL配信",
+        Some("javascript:alert(1)"),
+    ));
     assert!(
         node.wait_for_channel(CH_URL, CONNECT_TIMEOUT).await,
         "イベントが一覧に反映されるべき(既定オープン型)"
@@ -503,7 +509,7 @@ async fn dangerous_url_event_circulating(world: &mut AppWorld) {
 async fn viewer_views_channels_api(world: &mut AppWorld) {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use peca_p2p_yp::web::{self, AppState, RateLimiter};
     use tower::ServiceExt;
 
@@ -512,14 +518,13 @@ async fn viewer_views_channels_api(world: &mut AppWorld) {
     let hub = Arc::clone(c.node.as_ref().unwrap().hub());
     let store = Arc::new(Store::open_in_memory().unwrap());
     let dir = tempfile::tempdir().unwrap();
-    let security = Arc::new(
-        peca_p2p_yp::security::SecurityLog::new(dir.path().join("s.log")).unwrap(),
-    );
+    let security =
+        Arc::new(peca_p2p_yp::security::SecurityLog::new(dir.path().join("s.log")).unwrap());
     let mut hosts = std::collections::HashSet::new();
     hosts.insert("127.0.0.1:7180".to_string());
     let limiter = RateLimiter::with_clock(web::RATE_LIMIT_PER_SEC, Box::new(|| 1_000));
-    let state = AppState::with_parts(store, security, "test-token", hosts, limiter)
-        .with_directory(hub);
+    let state =
+        AppState::with_parts(store, security, "test-token", hosts, limiter).with_directory(hub);
     let app = web::build_router(state);
     let mut req = Request::builder()
         .method(Method::GET)
@@ -531,7 +536,9 @@ async fn viewer_views_channels_api(world: &mut AppWorld) {
     req.extensions_mut().insert(ConnectInfo(addr));
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
     c.api_rows = rows;
 }
@@ -561,11 +568,8 @@ async fn url_warning_flag_present(world: &mut AppWorld) {
 async fn link_requires_explicit_action(_world: &mut AppWorld) {
     // UI 契約の検証: 警告付き URL は直接リンク(<a href>)ではなく確認ボタン+
     // 確認ダイアログを経由してのみ開かれる(ui/channels.html — FR-012)。
-    let html = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/ui/channels.html"
-    ))
-    .expect("ui/channels.html を読めるべき");
+    let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/channels.html"))
+        .expect("ui/channels.html を読めるべき");
     assert!(
         html.contains("if (ch.url_warning)"),
         "UI は url_warning フラグで表示を分岐するべき"
@@ -647,11 +651,7 @@ async fn persona_a_destroyed_irreversibly(world: &mut AppWorld) {
         "破棄後に nsec をエクスポートできてはならない"
     );
     assert!(
-        !manager
-            .list()
-            .unwrap()
-            .iter()
-            .any(|p| p.pubkey == pk_a),
+        !manager.list().unwrap().iter().any(|p| p.pubkey == pk_a),
         "破棄済みペルソナは一覧から消える"
     );
 }
@@ -689,14 +689,15 @@ async fn node_performs_pex(world: &mut AppWorld) {
 async fn bad_pex_rejected_and_logged(world: &mut AppWorld) {
     let node = ctx(world).node.as_ref().unwrap();
     assert!(
-        node.wait_for_security("pex_rejected", CONNECT_TIMEOUT).await,
+        node.wait_for_security("pex_rejected", CONNECT_TIMEOUT)
+            .await,
         "pex_rejected が記録されるべき(FR-015)"
     );
     let known: Vec<String> = node.known_peers().iter().map(|p| p.addr.clone()).collect();
     assert!(
-        !known.iter().any(|a| a == PEX_BAD_PORT
-            || a.contains("2001:db8::1:7147")
-            || a.len() > 256),
+        !known
+            .iter()
+            .any(|a| a == PEX_BAD_PORT || a.contains("2001:db8::1:7147") || a.len() > 256),
         "不正アドレスは接続候補に登録されてはならない: {known:?}"
     );
 }

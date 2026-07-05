@@ -304,7 +304,10 @@ mod tests {
         let events = sink.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].pubkey.to_hex(), p.pubkey);
-        assert!(events[0].verify().is_ok(), "発行イベントは検証可能な署名を持つ");
+        assert!(
+            events[0].verify().is_ok(),
+            "発行イベントは検証可能な署名を持つ"
+        );
         assert_eq!(tag_value(&events[0], "status").as_deref(), Some("live"));
     }
 
@@ -318,7 +321,10 @@ mod tests {
         let events = sink.events();
         assert_eq!(events.len(), 2);
         assert_eq!(tag_value(&events[1], "status").as_deref(), Some("ended"));
-        assert!(lock(&engine.states).is_empty(), "終了後は発行状態を破棄する");
+        assert!(
+            lock(&engine.states).is_empty(),
+            "終了後は発行状態を破棄する"
+        );
     }
 
     #[test]
@@ -351,8 +357,16 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].pubkey.to_hex(), a.pubkey);
         assert_eq!(tag_value(&events[1], "status").as_deref(), Some("ended"));
-        assert_eq!(events[1].pubkey.to_hex(), a.pubkey, "ended は旧ペルソナで発行");
-        assert_eq!(events[2].pubkey.to_hex(), b.pubkey, "live は新ペルソナで発行");
+        assert_eq!(
+            events[1].pubkey.to_hex(),
+            a.pubkey,
+            "ended は旧ペルソナで発行"
+        );
+        assert_eq!(
+            events[2].pubkey.to_hex(),
+            b.pubkey,
+            "live は新ペルソナで発行"
+        );
         assert_eq!(tag_value(&events[2], "status").as_deref(), Some("live"));
     }
 

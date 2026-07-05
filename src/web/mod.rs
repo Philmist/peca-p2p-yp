@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -317,11 +317,7 @@ async fn static_handler(req: Request) -> Response {
         _ => None,
     };
     match html {
-        Some(body) => (
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            body,
-        )
-            .into_response(),
+        Some(body) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -360,9 +356,11 @@ async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> 
     if state.rate_limiter.check(ip) {
         next.run(req).await
     } else {
-        state
-            .security
-            .log(SecurityCategory::HttpRateLimited, &ip.to_string(), "rate limit exceeded");
+        state.security.log(
+            SecurityCategory::HttpRateLimited,
+            &ip.to_string(),
+            "rate limit exceeded",
+        );
         error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited")
     }
 }
@@ -421,8 +419,10 @@ mod tests {
     fn rate_limiter_resets_next_window() {
         let clock = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let c2 = Arc::clone(&clock);
-        let limiter =
-            RateLimiter::with_clock(1, Box::new(move || c2.load(std::sync::atomic::Ordering::SeqCst)));
+        let limiter = RateLimiter::with_clock(
+            1,
+            Box::new(move || c2.load(std::sync::atomic::Ordering::SeqCst)),
+        );
         let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         assert!(limiter.check(ip));
         assert!(!limiter.check(ip));

@@ -17,9 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::broadcast;
 
-use crate::event::schema::{
-    ChannelListing, ChannelStatus, MAX_BITRATE_KBPS, Track, UNKNOWN_COUNT,
-};
+use crate::event::schema::{ChannelListing, ChannelStatus, MAX_BITRATE_KBPS, Track, UNKNOWN_COUNT};
 use crate::security;
 
 /// チャンネルの状態(data-model §AnnouncedChannel 状態遷移)。
@@ -237,7 +235,9 @@ pub fn clamp_count(raw: i64) -> i64 {
 
 /// トラッカー `ip:port` の妥当性検証(不正なら `None`)。
 pub fn validate_tracker(raw: &str) -> Option<String> {
-    raw.parse::<std::net::SocketAddr>().ok().map(|a| a.to_string())
+    raw.parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|a| a.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +427,10 @@ mod tests {
     fn end_removes_and_notifies_final_state() {
         let registry = ChannelRegistry::new();
         let mut rx = registry.subscribe();
-        registry.upsert(AnnouncedChannel::from_raw(raw(2, "B"), ChannelState::Announced));
+        registry.upsert(AnnouncedChannel::from_raw(
+            raw(2, "B"),
+            ChannelState::Announced,
+        ));
         let _ = rx.try_recv();
         assert!(registry.end(&[2u8; 16]));
         match rx.try_recv() {
