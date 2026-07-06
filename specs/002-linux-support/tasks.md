@@ -145,8 +145,8 @@
 - [ ] T033 [P] Linux/Windows 実機で quickstart 検証 5〜7 を実施する: 複数インスタンス同時稼働(FR-010)、起動失敗の定型エラー(FR-014)、Windows 後方互換(レガシー DPAPI BLOB のペルソナが利用可・新規は `PYK1` scheme 0x01)
   - 2026-07-07 部分実施済み(Debian 12 実機・実バイナリ): **検証 5** — 2 インスタンスが独立 data-dir(各 `0700`・個別 `master.key 0600`/`app.db 0600`)で同時稼働、ピア登録 → 双方向 established(片側は PEX 学習 `source:"pex"`)を確認。**検証 6** — 特権ポート(`--p2p-bind 0.0.0.0:80`)は「P2P 待受アドレスにバインドできませんでした(権限が不足しています)」、使用中ポートは「HTTP 待受アドレスにバインドできませんでした(ポートが使用中です)」で exit 1、スタックトレース・内部パスなし。**残(要 Windows 実機): 検証 7 — 002 実装前 DB のレガシー DPAPI BLOB 後方互換の手動確認(読込後方互換自体は windows CI の契約テスト `legacy_dpapi_blob_without_magic_decrypts` で自動検証済み)**
 - [X] T034 `specs/002-linux-support/quickstart.md` のトレーサビリティ表の各セルを実装済みテスト ID(ファイル名・テスト関数名)へ更新し、割り当てのないシナリオがないことを確認する
-- [ ] T035 最終ゲートを確認する: `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit` が緑、windows-latest / ubuntu-latest 両 CI ジョブで全テスト(cucumber 含む)が同一に通過(SC-002)、`SecurityCategory::ALL` 14 件の一致確認(data-model — リリース前ゲート)
-  - 2026-07-07 部分実施済み(Linux 側): `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit`(脆弱性 0・許容済み警告 1 件のみ)・`cargo test` 全緑(unit 218・contract/integration 全通過・cucumber 21/21)。`SecurityCategory::ALL` は 14 件で data-model と一致(`security/mod.rs` の網羅 unit テストも通過)。**残: windows-latest / ubuntu-latest 両 CI ジョブの通過確認(main への PR で発火)**
+- [X] T035 最終ゲートを確認する: `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit` が緑、windows-latest / ubuntu-latest 両 CI ジョブで全テスト(cucumber 含む)が同一に通過(SC-002)、`SecurityCategory::ALL` 14 件の一致確認(data-model — リリース前ゲート)
+  - 2026-07-07 完了: ローカル(Linux)で `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit`(脆弱性 0・許容済み警告 1 件のみ)・`cargo test` 全緑(unit 218・contract/integration 全通過・cucumber 21/21)。`SecurityCategory::ALL` は 14 件で data-model と一致(`security/mod.rs` の網羅 unit テストも通過)。PR #2 の CI run 28804098219 で windows-latest / ubuntu-latest 両ジョブ + Trivy が全て success(SC-002)。なお trivy ジョブの `pull-requests: read` 権限不足(PR イベントで 403)を発見し修正(01144ef)
 
 ---
 
