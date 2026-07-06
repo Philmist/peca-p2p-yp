@@ -1,7 +1,10 @@
 .agents
-.claude/skills
-skills-lock.json
-
+.claude/**
+!.claude/settings.json
+!.claude/skills/*
+!.claude/commands/*
+!.claude/agents/*
+!.claude/rules/*
 
 
 # Added by cargo
