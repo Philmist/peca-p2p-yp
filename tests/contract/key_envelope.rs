@@ -246,3 +246,39 @@ fn tampered_header_fails_decryption() {
         "magic 改竄は復号失敗(Unusable)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #10 (unix) master.key が読み取れない(所有者変更・chmod 000 等)場合は
+//      致命的エラーにせず部分劣化する(全ペルソナ利用不可・稼働継続 — FR-013、
+//      quickstart 検証 3-5)。実機検証(2026-07-07)で発見した欠陥の再現テスト。
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn unreadable_master_key_degrades_instead_of_failing() {
+    use peca_p2p_yp::identity::keystore::KeystoreInit;
+    use std::os::unix::fs::PermissionsExt;
+
+    // 正常な master.key で暗号化しておく。
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, _) = Keystore::open(dir.path(), false).expect("初回生成");
+    let enc = ks.protect(&PLAIN32).expect("protect");
+    drop(ks);
+
+    // 読取不能にする(chown root 相当の再現として mode 000)。
+    let key_path = dir.path().join("master.key");
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // 読取不能でも open は成功し(致命的エラー禁止)、Unreadable が通知される。
+    let (ks2, init2) = Keystore::open(dir.path(), true)
+        .expect("master.key 読取不能は部分劣化であり致命的エラーにしない(FR-013)");
+    assert_eq!(init2, KeystoreInit::Unreadable, "読取不能シグナルが返る");
+
+    // 鍵なしでは復号は Unusable(パニック・鍵素材漏洩なし)。
+    assert!(
+        matches!(ks2.unprotect(&enc), Err(IdentityError::Unusable)),
+        "読取不能時の復号は Unusable"
+    );
+
+    // 後片付け(tempdir の削除に必要)。
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}

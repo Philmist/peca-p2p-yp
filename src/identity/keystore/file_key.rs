@@ -136,7 +136,16 @@ pub(super) fn load_or_create(
 
 /// 既存 master.key を読み込む(サイズ検証つき)。
 fn load_existing(path: &Path) -> Result<(Option<MasterKey>, KeystoreInit), IdentityError> {
-    let mut bytes = fs::read(path).map_err(|_| IdentityError::Crypto)?;
+    let mut bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => {
+            // 読取不能(所有者変更・パーミッション等)= 部分劣化。致命的エラーに
+            // しない(FR-013)。ファイルは触らず、鍵を保持しない(§5)。
+            // 全ペルソナ Unusable。鍵素材・絶対パスは含めない(FR-011/FR-014)。
+            tracing::warn!("保護鍵ファイルを読み取れません。全ペルソナが利用できません");
+            return Ok((None, KeystoreInit::Unreadable));
+        }
+    };
     if bytes.len() != MASTER_KEY_LEN {
         // サイズ不一致 = 破損。ファイルは上書きせず、鍵を保持しない(§5)。
         // 全ペルソナ Unusable。鍵素材・絶対パスは含めない(FR-011/FR-014)。

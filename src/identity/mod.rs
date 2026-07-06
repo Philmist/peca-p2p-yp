@@ -50,6 +50,8 @@ pub enum KeystoreHealth {
 pub enum UnavailableCause {
     /// master.key が破損している(サイズ不一致)。
     MasterKeyCorrupt,
+    /// master.key が読み取れない(所有者変更・パーミッション等)。
+    MasterKeyUnreadable,
     /// 保管ファイルのパーミッションを是正できない。
     PermissionUnfixable,
 }
@@ -67,6 +69,8 @@ impl KeystoreHealth {
             KeystoreHealth::Unavailable(UnavailableCause::PermissionUnfixable)
         } else if init == KeystoreInit::Corrupt {
             KeystoreHealth::Unavailable(UnavailableCause::MasterKeyCorrupt)
+        } else if init == KeystoreInit::Unreadable {
+            KeystoreHealth::Unavailable(UnavailableCause::MasterKeyUnreadable)
         } else {
             KeystoreHealth::Ok
         }
