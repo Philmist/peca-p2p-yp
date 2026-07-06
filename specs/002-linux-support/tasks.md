@@ -106,6 +106,7 @@
 - [X] T022 [P] [US2] `src/web/personas.rs` の DPAPI 依存文言をプラットフォーム中立な「保護された保管」表現へ変更する(挙動変更なし — cli-config §6)
 - [X] T036 [US2] `tests/steps/` のステップ定義を実装し、T023 の cucumber シナリオ①〜④を事後アサーション(秘密鍵・nsec 非出力検査)を含めて全通過させる(T018〜T021 完了後)
 - [ ] T024 [US2] Linux 実機で quickstart 検証 3 を実施する: 平文非保存(strings 検査 + `PYK1` scheme 0x02)、鍵分離(DB 単体持出しで復号不能)、他アカウント遮断(Permission denied)、`chmod 644` → 自動是正 + `key_permission_fixed`、`chown root` → 部分劣化 + 発見機能継続、Windows ノードとの相互発見(SC-005)、nsec エクスポート/破棄の同一意味論(FR-007)
+  - 2026-07-06 部分実施済み(Linux/WSL2・実バイナリ): API でペルソナ作成 → `secret_enc` が `PYK1` + scheme 0x02、strings 検査で nsec1 出現 0・64 桁 hex は公開鍵のみ、master.key 32 bytes `0600`・data-dir `0700`、`chmod 644 master.key` → 再起動で `0600` へ自動是正 + `key_permission_fixed` 記録・ペルソナ `usable:true` 維持、標準出力・security.log に秘密鍵/nsec 非出力。**残(要 root・複数アカウント・Windows ノード環境): 他アカウント遮断、`chown root` 部分劣化(cucumber ③ が symlink 代表で自動検証済み)、DB 単体持出し(contract #8 で自動検証済み)、Windows 相互発見(SC-005)、nsec エクスポート/破棄の手動比較**
 
 **Checkpoint**: US1 と US2 が独立に動作(Linux で掲載ノードとして完全機能、SC-003/SC-005/SC-006)
 
@@ -129,6 +130,7 @@
 - [X] T029 [US3] `src/main.rs` の tracing 初期化で出力先が端末でないとき ANSI エスケープを無効化する(`with_ansi(IsTerminal)` — research R8、FR-011)(T028 と同一ファイルのため順次)
 - [X] T030 [P] [US3] `contrib/systemd/peca-p2p-yp.service` を新規作成する: contracts/systemd-service.md §2 の unit 全文(`Type=notify`・`StateDirectory=peca-p2p-yp`・`StateDirectoryMode=0700`・`UMask=0077`・`Restart=on-failure`・ハードニング群・`RestrictAddressFamilies` に `AF_UNIX` 含む・`TimeoutStopSec` 非指定)
 - [ ] T031 [US3] systemd 実機で quickstart 検証 4 を実施する: `systemctl start` → active(READY 後に返る)、`journalctl` に起動サマリ(ANSI・秘密鍵なし)、`systemctl stop` が 90 秒以内・`ExecMainStatus=0`(SC-004)、`kill -9` → 自動再起動、data-dir = `/var/lib/peca-p2p-yp`(systemd-service §3)、および上記すべてがデスクトップセッション・対話操作なしのヘッドレス環境(nologin のサービスアカウント)で完了すること(ヘッドレス無人稼働 — FR-005/SC-003)
+  - 2026-07-06 注記: 実装(T025〜T030)は完了し、SIGTERM → exit 0・NOTIFY_SOCKET 経由 READY/STOPPING は統合テストで自動検証済み。本タスクの systemd 実機検証は開発環境(WSL2・systemd offline)では実施不能のため、systemd 稼働環境での実施が必要
 
 **Checkpoint**: 全ユーザーストーリーが独立に機能
 
