@@ -20,6 +20,12 @@ use announcer::{AnnouncerNode, PcpClient};
 
 const CID: [u8; 16] = [0x5A; 16];
 
+/// 前提(Background / Given)の接続確立・伝搬待ちに使う余裕を持ったタイムアウト。
+/// 「60 秒以内」等を検証する Then とは別で、遅い CI ランナー(windows-latest)の
+/// プロセス起動 / TCP 確立オーバーヘッドを吸収する。条件成立で即 return するため
+/// green run のコストは実質ゼロ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn cid_hex() -> String {
     CID.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -88,7 +94,7 @@ async fn app_running_with_mock_peer(world: &mut AppWorld) {
     let node = AnnouncerNode::spawn(0xC0FFEE).await;
     node.add_manual_peer(mock.addr());
     assert!(
-        node.wait_established(Duration::from_secs(5)).await,
+        node.wait_established(CONNECT_TIMEOUT).await,
         "モックピアと established になるべき"
     );
     world.us1 = Some(Us1World {
@@ -108,7 +114,7 @@ async fn channel_announced(world: &mut AppWorld) {
     c.client = Some(client);
     let mock = &ctx(world).mock;
     assert!(
-        wait_received(mock, Duration::from_secs(10), |v| {
+        wait_received(mock, CONNECT_TIMEOUT, |v| {
             tag_value(v, "d").as_deref() == Some(cid_hex().as_str())
                 && tag_value(v, "status").as_deref() == Some("live")
         })

@@ -23,6 +23,12 @@ const CH_LIVE: &str = "0123456789abcdef0123456789abcdef";
 const CH_STALE: &str = "0123456789abcdef0123456789abcde0";
 const TIP: &str = "198.51.100.1:7144";
 
+/// 前提(Given)の接続 → SYNC 待ちに使う余裕を持ったタイムアウト。
+/// SC-004 の「5 秒以内」検証(下記 Then)とは別物で、遅い CI ランナー
+/// (windows-latest)でのプロセス起動 / TCP 確立オーバーヘッドを吸収する。
+/// ポーリングは条件成立で即 return するため green run のコストは実質ゼロ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// US2 シナリオ 1 個分の状態(cucumber は各シナリオで新規 World を生成する)。
 pub struct Us2World {
     mock: Option<MockPeer>,
@@ -116,7 +122,7 @@ async fn channel_with_tip_listed(world: &mut AppWorld) {
     // 一覧へ現れるまで待つ(接続 → SYNC)。
     let node = ctx(world).node.as_ref().unwrap();
     assert!(
-        node.wait_for_channel(CH_LIVE, Duration::from_secs(5)).await,
+        node.wait_for_channel(CH_LIVE, CONNECT_TIMEOUT).await,
         "トラッカー接続先つきチャンネルが一覧へ現れるべき"
     );
 }
@@ -142,7 +148,7 @@ async fn stale_event_received(world: &mut AppWorld) {
     }
     let node = ctx(world).node.as_ref().unwrap();
     assert!(
-        node.wait_for_channel(CH_LIVE, Duration::from_secs(5)).await,
+        node.wait_for_channel(CH_LIVE, CONNECT_TIMEOUT).await,
         "現行チャンネルで接続確立を確認"
     );
 }

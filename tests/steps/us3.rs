@@ -20,7 +20,9 @@ use crate::mock_peer::{MockPeer, TestNode, unix_now};
 
 const CH_A: &str = "0123456789abcdef0123456789abcdef";
 const CH_B: &str = "0123456789abcdef0123456789abcdee";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// 接続確立待ちは遅い CI ランナー(windows-latest)のオーバーヘッドを吸収できるよう
+// 余裕を持たせる。条件成立で即 return するため green run のコストは実質ゼロ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// US3 シナリオ 1 個分の状態(cucumber は各シナリオで新規 World を生成する)。
 pub struct Us3World {

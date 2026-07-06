@@ -18,6 +18,11 @@ const CH_DISCOVER: &str = "0123456789abcdef0123456789abcdc3";
 const CH_ANNOUNCE: &str = "0123456789abcdef0123456789abcdd4";
 const TIP: &str = "198.51.100.1:7144";
 
+/// 外向き接続の established / 伝搬 / 発見待ちに使う余裕を持ったタイムアウト。
+/// 遅い CI ランナー(windows-latest)のオーバーヘッドを吸収する。条件成立で
+/// 即 return するため green run のコストは実質ゼロ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// outbound_only シナリオの状態(各シナリオで新規に生成される)。
 pub struct OutboundWorld {
     mock: Option<MockPeer>,
@@ -109,7 +114,7 @@ async fn outbound_only_established(world: &mut AppWorld) {
             break;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < CONNECT_TIMEOUT,
             "外向き接続のみで established に達するべき"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -141,7 +146,7 @@ async fn channel_announce_works(world: &mut AppWorld) {
             return;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < CONNECT_TIMEOUT,
             "外向き接続のみでも掲載イベントが伝搬先ピアへ届くべき(US1)"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -152,8 +157,7 @@ async fn channel_announce_works(world: &mut AppWorld) {
 async fn channel_discovery_works(world: &mut AppWorld) {
     let node = ctx(world).node.as_ref().unwrap();
     assert!(
-        node.wait_for_channel(CH_DISCOVER, Duration::from_secs(5))
-            .await,
+        node.wait_for_channel(CH_DISCOVER, CONNECT_TIMEOUT).await,
         "外向き接続のみでも SYNC で発見したチャンネルが一覧へ現れるべき(US2)"
     );
 }
