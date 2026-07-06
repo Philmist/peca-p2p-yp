@@ -57,6 +57,12 @@ fn main() {
                 .expect("tokio ランタイム構築")
                 .block_on(async {
                     AppWorld::cucumber()
+                        // シナリオを直列実行する(既定は最大 64 並行)。各シナリオは
+                        // 独自の P2P ノード(MockPeer / TestNode)を起動し TCP 接続・SYNC を
+                        // 行うため、並行実行するとコア数の少ない CI ランナー(windows-latest)
+                        // 上で接続確立が枯渇し、どのシナリオが落ちるか非決定的なフレークと
+                        // なる。直列化すれば各シナリオが資源を占有でき、決定的に成立する。
+                        .max_concurrent_scenarios(1usize)
                         .fail_on_skipped()
                         .run_and_exit("tests/features")
                         .await;
