@@ -44,11 +44,15 @@ pub enum SecurityCategory {
     HttpRateLimited,
     /// URL 警告判定の発動(FR-012)
     UrlWarning,
+    /// 保管物の緩いパーミッションを自動是正した(unix — FR-013 / cli-config §4)
+    KeyPermissionFixed,
+    /// 保管物のパーミッションを是正できず影響ペルソナを利用不可とした(unix — FR-013)
+    KeyPermissionUnfixable,
 }
 
 impl SecurityCategory {
-    /// 全カテゴリ(データモデルの全量 12 件)。リリース前ゲート(T059)の一致確認に使う。
-    pub const ALL: [SecurityCategory; 12] = [
+    /// 全カテゴリ(データモデルの全量 14 件)。リリース前ゲート(T035)の一致確認に使う。
+    pub const ALL: [SecurityCategory; 14] = [
         SecurityCategory::PcpReject,
         SecurityCategory::P2pInvalidFrame,
         SecurityCategory::P2pOversize,
@@ -61,6 +65,8 @@ impl SecurityCategory {
         SecurityCategory::PexRejected,
         SecurityCategory::HttpRateLimited,
         SecurityCategory::UrlWarning,
+        SecurityCategory::KeyPermissionFixed,
+        SecurityCategory::KeyPermissionUnfixable,
     ];
 
     /// ログに書き出すカテゴリ名(data-model.md の表記と一致させる)。
@@ -78,6 +84,8 @@ impl SecurityCategory {
             SecurityCategory::PexRejected => "pex_rejected",
             SecurityCategory::HttpRateLimited => "http_rate_limited",
             SecurityCategory::UrlWarning => "url_warning",
+            SecurityCategory::KeyPermissionFixed => "key_permission_fixed",
+            SecurityCategory::KeyPermissionUnfixable => "key_permission_unfixable",
         }
     }
 }
@@ -333,9 +341,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn all_12_categories_have_unique_names() {
+    fn all_14_categories_have_unique_names() {
         let names: HashSet<&str> = SecurityCategory::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 14);
         assert!(names.contains("pcp_reject"));
         assert!(names.contains("p2p_invalid_frame"));
         assert!(names.contains("p2p_oversize"));
@@ -348,6 +356,8 @@ mod tests {
         assert!(names.contains("pex_rejected"));
         assert!(names.contains("http_rate_limited"));
         assert!(names.contains("url_warning"));
+        assert!(names.contains("key_permission_fixed"));
+        assert!(names.contains("key_permission_unfixable"));
     }
 
     #[test]

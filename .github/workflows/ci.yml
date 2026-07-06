@@ -13,7 +13,11 @@ env:
 jobs:
   ci:
     name: Build, Test, Lint
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -46,15 +50,23 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --check
 
+      # cargo-audit は install が重いため 1 OS(高速な ubuntu)でのみ実行する。
       - name: Install cargo-audit
+        if: matrix.os == 'ubuntu-latest'
         run: cargo install cargo-audit --locked
 
       - name: Cargo audit
+        if: matrix.os == 'ubuntu-latest'
         run: cargo audit
 
   trivy:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
+    # dorny/paths-filter は pull_request イベントで PR の変更ファイル一覧 API を
+    # 呼ぶため pull-requests: read が必要(無指定だと既定権限で 403 になる)
+    permissions:
+      contents: read
+      pull-requests: read
 
     steps:
       - uses: actions/checkout@v4

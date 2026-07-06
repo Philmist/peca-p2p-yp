@@ -21,7 +21,7 @@ use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::VerifyConfig;
 use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::event::view::DiscoveredChannel;
-use peca_p2p_yp::identity::IdentityManager;
+use peca_p2p_yp::identity::{IdentityManager, Keystore};
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
@@ -122,7 +122,10 @@ impl AnnouncerNode {
         }
 
         // ペルソナ(自動選択)+ 掲載エンジン + 変更契機ブリッジ。
-        let identity = Arc::new(IdentityManager::new(Arc::clone(&store)));
+        let identity = Arc::new(IdentityManager::new(
+            Arc::clone(&store),
+            Keystore::ephemeral(),
+        ));
         let persona_pubkey = identity.create("US1 テスト").unwrap().pubkey;
         let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
         let engine = Arc::new(PublishEngine::new(Arc::clone(&identity), sink, 60));

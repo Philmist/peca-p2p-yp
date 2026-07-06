@@ -21,7 +21,7 @@ use peca_p2p_yp::config::{self, CliOverrides, Settings};
 use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
-use peca_p2p_yp::identity::IdentityManager;
+use peca_p2p_yp::identity::{IdentityManager, Keystore, KeystoreHealth, keystore};
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
@@ -80,6 +80,27 @@ async fn run() -> Result<(), i32> {
         })?,
     );
 
+    // 5b. keystore 初期化 + 起動時パーミッション検査(リスナーバインド前 —
+    //     contracts/cli-config.md §4 起動順序: data-dir 作成(0700)→ Store →
+    //     keystore 初期化(master.key 読込/生成)→ パーミッション検査 → リスナーバインド)。
+    //     既存に自プラットフォーム scheme のペルソナがあるかで「保護鍵消失疑い」を判定する。
+    let has_encrypted_personas = store
+        .list_personas()
+        .map(|ps| {
+            ps.iter()
+                .any(|p| keystore::is_current_scheme(&p.secret_enc))
+        })
+        .unwrap_or(false);
+    let (keystore, keystore_init) =
+        Keystore::open(&data_dir, has_encrypted_personas).map_err(|e| {
+            eprintln!("{e}");
+            1
+        })?;
+    // 緩いパーミッションは 0600/0700 へ是正し、是正不能なら全ペルソナ利用不可へ倒す
+    // (発見・伝搬は継続 — FR-013)。unix のみ実体があり Windows は no-op。
+    let permission = peca_p2p_yp::platform::enforce_permissions(&data_dir, &security);
+    let keystore_health = KeystoreHealth::evaluate(permission.is_healthy(), keystore_init);
+
     // 6. バインドアドレスの確定(検証済み)。
     let p2p_addr = settings.p2p_addr().map_err(exit_config)?;
     let http_addr = settings.http_addr().map_err(exit_config)?;
@@ -119,10 +140,11 @@ async fn run() -> Result<(), i32> {
 
     // 11. P2P 待受のバインド(失敗は起動失敗)。空文字設定なら待受なし(外向きのみ)。
     let p2p_listener = match p2p_addr {
-        Some(addr) => Some(TcpListener::bind(addr).await.map_err(|_| {
-            eprintln!("P2P 待受アドレスにバインドできませんでした");
-            1
-        })?),
+        Some(addr) => Some(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| bind_error("P2P", &e))?,
+        ),
         None => None,
     };
 
@@ -155,10 +177,9 @@ async fn run() -> Result<(), i32> {
 
     // 13. PCP アナウンス待受(loopback のみ — ADR-0006 決定 4)。
     let registry = ChannelRegistry::new();
-    let pcp_listener = TcpListener::bind(pcp_addr).await.map_err(|_| {
-        eprintln!("PCP 待受アドレスにバインドできませんでした");
-        1
-    })?;
+    let pcp_listener = TcpListener::bind(pcp_addr)
+        .await
+        .map_err(|e| bind_error("PCP", &e))?;
     {
         let registry = Arc::clone(&registry);
         let security = Arc::clone(&security);
@@ -168,8 +189,14 @@ async fn run() -> Result<(), i32> {
         }));
     }
 
-    // 14. ペルソナ管理と掲載エンジン(T028/T029)。
-    let identity = Arc::new(IdentityManager::new(Arc::clone(&store)));
+    // 14. ペルソナ管理と掲載エンジン(T028/T029)。keystore 初期化・パーミッション検査は
+    //     リスナーバインド前(手順 5b)に済ませており、その健全性を IdentityManager へ渡す
+    //     (Unavailable なら全ペルソナ利用不可・鍵操作は利用不可エラー — FR-013)。
+    let identity = Arc::new(IdentityManager::new_with_health(
+        Arc::clone(&store),
+        keystore,
+        keystore_health,
+    ));
     let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
     let engine = Arc::new(PublishEngine::new(
         Arc::clone(&identity),
@@ -232,10 +259,9 @@ async fn run() -> Result<(), i32> {
             max_clock_skew_sec: settings.max_clock_skew_sec as i64,
         }));
     let app = build_router(state);
-    let http_listener = TcpListener::bind(http_addr).await.map_err(|_| {
-        eprintln!("HTTP 待受アドレスにバインドできませんでした");
-        1
-    })?;
+    let http_listener = TcpListener::bind(http_addr)
+        .await
+        .map_err(|e| bind_error("HTTP", &e))?;
 
     // 16. 起動サマリ(バインドアドレス・既知ピア数のみ。内部情報なし)。
     let known_peers = store.count_peers().unwrap_or(0);
@@ -250,18 +276,27 @@ async fn run() -> Result<(), i32> {
         outbound_target = settings.p2p_outbound_target,
         inbound_max = settings.p2p_inbound_max,
         known_peers,
-        "起動しました(停止は Ctrl+C)"
+        "起動しました(停止は Ctrl+C / SIGTERM)"
     );
 
-    // 17. serve + graceful shutdown(Ctrl+C で全サブシステムへ伝播)。
+    // 16a. 全リスナーバインド成功後に READY=1 を通知する(FR-009 — systemd-service §1)。
+    //      NOTIFY_SOCKET 未設定時は no-op。送信失敗は稼働へ影響しない(MUST)。
+    peca_p2p_yp::platform::sd_notify("READY=1");
+
+    // 17. serve + graceful shutdown(SIGTERM/SIGINT/Ctrl+C で全サブシステムへ伝播)。
     //     レート制限の接続元取得に connect-info が必須(T019 申し送り)。
+    //     platform::shutdown_signal() が unix では SIGTERM+SIGINT、Windows では ctrl_c を
+    //     待つ(contracts/cli-config.md §3、research R6 — T027/T028)。
     let serve = axum::serve(
         http_listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        peca_p2p_yp::platform::shutdown_signal().await;
         tracing::info!(target: "startup", "shutdown 要求を受信しました");
+        // 停止開始を systemd へ通知してから既存 watch チャネル経路で停止伝播する
+        // (STOPPING=1 → shutdown_tx 送信の順 — systemd-service §1、FR-008)。
+        peca_p2p_yp::platform::sd_notify("STOPPING=1");
         let _ = shutdown_tx.send(true);
     });
 
@@ -443,24 +478,26 @@ fn spawn_sweep_loop(hub: Arc<GossipHub>, mut shutdown: watch::Receiver<bool>) ->
     })
 }
 
-/// data-dir を解決する。`--data-dir` 未指定時は `%APPDATA%\peca-p2p-yp`。
+/// data-dir を解決し、存在しなければ作成する(contracts/cli-config.md §1)。
+///
+/// 解決優先順は `platform::ensure_data_dir` に委譲する(unix では mode 0700 で作成)。
+/// 解決不能の場合は定型メッセージを標準エラーへ出力して終了コード 2 を返す(FR-014)。
 fn resolve_data_dir(overrides: &CliOverrides) -> Result<PathBuf, i32> {
-    if let Some(dir) = &overrides.data_dir {
-        return Ok(dir.clone());
-    }
-    match std::env::var_os("APPDATA") {
-        Some(base) => Ok(PathBuf::from(base).join("peca-p2p-yp")),
-        None => {
-            eprintln!("APPDATA が未設定です。--data-dir を指定してください");
-            Err(2)
-        }
-    }
+    peca_p2p_yp::platform::ensure_data_dir(overrides.data_dir.as_deref()).map_err(|msg| {
+        eprintln!("{msg}");
+        2
+    })
 }
 
 /// tracing のコンソール出力を初期化する。既定は INFO で、`RUST_LOG` は
 /// **INFO への追加指定**として重ねる(例: `RUST_LOG=pcp=debug` で通常ログ +
 /// PCP セッションのデバッグ出力。素の EnvFilter と違い既定ログは消えない)。
+///
+/// 出力先が端末でない場合(journald 捕捉・パイプ等)は ANSI エスケープを無効化する
+/// (FR-011 — research R8、contracts/systemd-service.md §1 ログ契約)。
 fn init_tracing() {
+    use std::io::IsTerminal;
+
     let extra = std::env::var("RUST_LOG").unwrap_or_default();
     let directives = if extra.is_empty() {
         "info".to_string()
@@ -468,9 +505,12 @@ fn init_tracing() {
         format!("info,{extra}")
     };
     let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(&directives);
+    // 端末でない出力先(journald・パイプ)では ANSI エスケープを出力しない(FR-011)。
+    let ansi = std::io::stdout().is_terminal();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(ansi)
         .init();
 }
 
@@ -480,7 +520,31 @@ fn exit_config(e: config::ConfigError) -> i32 {
     2
 }
 
+/// リスナーバインド失敗を「どのリスナーか + 原因種別」の定型メッセージへ写像し、
+/// 実行時異常の終了コード 1 を返す(cli-config.md §5 / FR-014)。
+///
+/// OS エラーの生文字列・絶対パス・依存クレート名など内部実装詳細は出力しない
+/// (§5 失格条件 / FR-011)。原因種別へ翻訳できない場合は原因なしの定型文言に留める。
+fn bind_error(listener: &str, err: &std::io::Error) -> i32 {
+    use std::io::ErrorKind;
+    let base = format!("{listener} 待受アドレスにバインドできませんでした");
+    let msg = match err.kind() {
+        ErrorKind::AddrInUse => format!("{base}(ポートが使用中です)"),
+        ErrorKind::PermissionDenied => format!("{base}(権限が不足しています)"),
+        ErrorKind::AddrNotAvailable => format!("{base}(指定アドレスが利用できません)"),
+        _ => base,
+    };
+    eprintln!("{msg}");
+    1
+}
+
 fn print_usage() {
+    // `--data-dir` 既定値の説明はプラットフォーム別に正しい既定を表示する
+    //(cli-config.md §1 の解決順・§6)。表示のみで挙動は変えない。
+    #[cfg(windows)]
+    let data_dir_default = "%APPDATA%\\peca-p2p-yp";
+    #[cfg(unix)]
+    let data_dir_default = "$XDG_STATE_HOME/peca-p2p-yp(未設定時 ~/.local/state/peca-p2p-yp、systemd 下は $STATE_DIRECTORY)";
     println!(
         "peca-p2p-yp — 分散型配信情報共有ネットワーク(YP 代替)\n\
          \n\
@@ -490,7 +554,7 @@ fn print_usage() {
          \x20 --p2p-bind <host:port>   P2P 待受(空文字で待受無効=外向きのみ)\n\
          \x20 --http-bind <host:port>  HTTP(UI・index.txt)待受(loopback のみ)\n\
          \x20 --pcp-bind <host:port>   PCP アナウンス待受(loopback のみ)\n\
-         \x20 --data-dir <path>        データディレクトリ(既定: %APPDATA%\\peca-p2p-yp)\n\
+         \x20 --data-dir <path>        データディレクトリ(既定: {data_dir_default})\n\
          \x20 -h, --help               このヘルプを表示\n"
     );
 }

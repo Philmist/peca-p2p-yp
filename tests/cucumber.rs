@@ -16,6 +16,8 @@ use cucumber::World;
 #[path = "common/mock_peer.rs"]
 pub(crate) mod mock_peer;
 
+#[path = "steps/keystore.rs"]
+mod keystore;
 #[path = "steps/outbound_only.rs"]
 mod outbound_only;
 #[path = "steps/security.rs"]
@@ -40,6 +42,8 @@ pub struct AppWorld {
     outbound: Option<outbound_only::OutboundWorld>,
     /// セキュリティシナリオの状態。各シナリオの Given で初期化する(T055)。
     security: Option<security::SecurityWorld>,
+    /// US2 鍵保管セキュリティシナリオの状態。各シナリオの Given で初期化する(T036)。
+    keystore: Option<keystore::KeystoreWorld>,
 }
 
 /// ステップの async 未来型は debug ビルドで巨大になり、Windows 既定の main スレッド

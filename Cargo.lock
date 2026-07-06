@@ -1435,6 +1435,7 @@ name = "peca-p2p-yp"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chacha20poly1305",
  "cucumber",
  "encoding_rs",
  "http-body-util",
@@ -1450,6 +1451,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "zeroize",
 ]
 
 [[package]]

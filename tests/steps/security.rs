@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
-use peca_p2p_yp::identity::IdentityManager;
+use peca_p2p_yp::identity::{IdentityManager, Keystore};
 use peca_p2p_yp::p2p::frame::{
     Hello, MAX_FRAME_PAYLOAD, Message, close_reason, read_frame, write_frame,
 };
@@ -589,7 +589,10 @@ async fn link_requires_explicit_action(_world: &mut AppWorld) {
 
 #[given("利用者がペルソナAでチャンネルを掲載している")]
 async fn persona_a_publishes(world: &mut AppWorld) {
-    let manager = IdentityManager::new(Arc::new(Store::open_in_memory().unwrap()));
+    let manager = IdentityManager::new(
+        Arc::new(Store::open_in_memory().unwrap()),
+        Keystore::ephemeral(),
+    );
     let a = manager.create("らべるA").expect("ペルソナA作成");
     let keys = manager.signing_keys(&a.pubkey).expect("署名鍵");
     let event = signed(&keys, CH_PERSONA_A, "ペルソナAの配信", None);
