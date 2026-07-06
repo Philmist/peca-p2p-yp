@@ -68,15 +68,16 @@
 
 ### Tests for User Story 1
 
-- [ ] T010 [P] [US1] `tests/contract/cli_config.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する: data-dir 解決順テスト — `--data-dir` が全ソースに優先(cli-config §7 #1)、(unix)`STATE_DIRECTORY` > `XDG_STATE_HOME` > `~/.local/state` の順(§7 #2)
-- [ ] T011 [P] [US1] `tests/integration/platform_startup.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する: 使用中ポートで起動 → 定型メッセージ + 非 0 終了・スタックトレース/内部パスなし(cli-config §5・§7 #5)、異なる data-dir + ポート指定で 2 インスタンス同時稼働(§7 #6、FR-010)
+- [X] T010 [P] [US1] `tests/contract/cli_config.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する: data-dir 解決順テスト — `--data-dir` が全ソースに優先(cli-config §7 #1)、(unix)`STATE_DIRECTORY` > `XDG_STATE_HOME` > `~/.local/state` の順(§7 #2)
+- [X] T011 [P] [US1] `tests/integration/platform_startup.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する: 使用中ポートで起動 → 定型メッセージ + 非 0 終了・スタックトレース/内部パスなし(cli-config §5・§7 #5)、異なる data-dir + ポート指定で 2 インスタンス同時稼働(§7 #6、FR-010)
 
 ### Implementation for User Story 1
 
-- [ ] T012 [P] [US1] `src/config.rs` の `--help` 文言を更新する: `--data-dir` 既定値をプラットフォーム別に正しく表示(Windows: `%APPDATA%\peca-p2p-yp` / Linux: `$XDG_STATE_HOME/peca-p2p-yp` ほか)、「DPAPI」等の Windows 固有名をプラットフォーム中立表現へ(挙動不変 — cli-config §6)
-- [ ] T013 [US1] `src/main.rs` の起動失敗経路を FR-014 合否基準に沿って整備する: バインド失敗・権限不足時に (a) 失敗した操作(どのリスナーか)と (b) 原因種別(使用中・権限不足等)が判別できる定型メッセージ + 終了コード規約(0/1/2)。スタックトレース・内部絶対パス・OS エラー生文字列のみの出力を排除(cli-config §5)
-- [ ] T014 [US1] `.github/workflows/ci.yml` に `ubuntu-latest` の build + test + clippy + fmt ジョブを追加し、既存 `windows-latest` ジョブと並走させる(research R10、SC-002 ゲート)
+- [X] T012 [P] [US1] `src/config.rs` の `--help` 文言を更新する: `--data-dir` 既定値をプラットフォーム別に正しく表示(Windows: `%APPDATA%\peca-p2p-yp` / Linux: `$XDG_STATE_HOME/peca-p2p-yp` ほか)、「DPAPI」等の Windows 固有名をプラットフォーム中立表現へ(挙動不変 — cli-config §6)
+- [X] T013 [US1] `src/main.rs` の起動失敗経路を FR-014 合否基準に沿って整備する: バインド失敗・権限不足時に (a) 失敗した操作(どのリスナーか)と (b) 原因種別(使用中・権限不足等)が判別できる定型メッセージ + 終了コード規約(0/1/2)。スタックトレース・内部絶対パス・OS エラー生文字列のみの出力を排除(cli-config §5)
+- [X] T014 [US1] `.github/workflows/ci.yml` に `ubuntu-latest` の build + test + clippy + fmt ジョブを追加し、既存 `windows-latest` ジョブと並走させる(research R10、SC-002 ゲート)
 - [ ] T015 [US1] Linux 実機で quickstart 検証 1・2 を実施する: `cargo fmt/clippy/build/test` 全成功、`cargo tree` に Win32 クレートが現れない、手動起動でピア接続 → チャンネル発見 → index.txt 取得、loopback 強制(`--http-bind 0.0.0.0:7180` 拒否 — ADR-0006)を確認
+  - 2026-07-06 部分実施済み(Linux/WSL2): fmt・clippy・build・test 全成功、`cargo tree` に Win32 クレート出現なし、手動起動 → `/index.txt` 200・data-dir 0700・master.key 0600、`--http-bind 0.0.0.0:7180` は定型メッセージ + 終了コード 2 で拒否。**残: 実ネットワークでのピア接続 → 他ノードのチャンネル発見**(既知ピアのある環境が必要)
 
 **Checkpoint**: Linux 上で発見・伝搬ノードとして完全動作(MVP 成立、SC-001)
 

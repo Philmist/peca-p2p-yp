@@ -119,10 +119,11 @@ async fn run() -> Result<(), i32> {
 
     // 11. P2P 待受のバインド(失敗は起動失敗)。空文字設定なら待受なし(外向きのみ)。
     let p2p_listener = match p2p_addr {
-        Some(addr) => Some(TcpListener::bind(addr).await.map_err(|_| {
-            eprintln!("P2P 待受アドレスにバインドできませんでした");
-            1
-        })?),
+        Some(addr) => Some(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| bind_error("P2P", &e))?,
+        ),
         None => None,
     };
 
@@ -155,10 +156,9 @@ async fn run() -> Result<(), i32> {
 
     // 13. PCP アナウンス待受(loopback のみ — ADR-0006 決定 4)。
     let registry = ChannelRegistry::new();
-    let pcp_listener = TcpListener::bind(pcp_addr).await.map_err(|_| {
-        eprintln!("PCP 待受アドレスにバインドできませんでした");
-        1
-    })?;
+    let pcp_listener = TcpListener::bind(pcp_addr)
+        .await
+        .map_err(|e| bind_error("PCP", &e))?;
     {
         let registry = Arc::clone(&registry);
         let security = Arc::clone(&security);
@@ -248,10 +248,9 @@ async fn run() -> Result<(), i32> {
             max_clock_skew_sec: settings.max_clock_skew_sec as i64,
         }));
     let app = build_router(state);
-    let http_listener = TcpListener::bind(http_addr).await.map_err(|_| {
-        eprintln!("HTTP 待受アドレスにバインドできませんでした");
-        1
-    })?;
+    let http_listener = TcpListener::bind(http_addr)
+        .await
+        .map_err(|e| bind_error("HTTP", &e))?;
 
     // 16. 起動サマリ(バインドアドレス・既知ピア数のみ。内部情報なし)。
     let known_peers = store.count_peers().unwrap_or(0);
@@ -493,7 +492,31 @@ fn exit_config(e: config::ConfigError) -> i32 {
     2
 }
 
+/// リスナーバインド失敗を「どのリスナーか + 原因種別」の定型メッセージへ写像し、
+/// 実行時異常の終了コード 1 を返す(cli-config.md §5 / FR-014)。
+///
+/// OS エラーの生文字列・絶対パス・依存クレート名など内部実装詳細は出力しない
+/// (§5 失格条件 / FR-011)。原因種別へ翻訳できない場合は原因なしの定型文言に留める。
+fn bind_error(listener: &str, err: &std::io::Error) -> i32 {
+    use std::io::ErrorKind;
+    let base = format!("{listener} 待受アドレスにバインドできませんでした");
+    let msg = match err.kind() {
+        ErrorKind::AddrInUse => format!("{base}(ポートが使用中です)"),
+        ErrorKind::PermissionDenied => format!("{base}(権限が不足しています)"),
+        ErrorKind::AddrNotAvailable => format!("{base}(指定アドレスが利用できません)"),
+        _ => base,
+    };
+    eprintln!("{msg}");
+    1
+}
+
 fn print_usage() {
+    // `--data-dir` 既定値の説明はプラットフォーム別に正しい既定を表示する
+    //(cli-config.md §1 の解決順・§6)。表示のみで挙動は変えない。
+    #[cfg(windows)]
+    let data_dir_default = "%APPDATA%\\peca-p2p-yp";
+    #[cfg(unix)]
+    let data_dir_default = "$XDG_STATE_HOME/peca-p2p-yp(未設定時 ~/.local/state/peca-p2p-yp、systemd 下は $STATE_DIRECTORY)";
     println!(
         "peca-p2p-yp — 分散型配信情報共有ネットワーク(YP 代替)\n\
          \n\
@@ -503,7 +526,7 @@ fn print_usage() {
          \x20 --p2p-bind <host:port>   P2P 待受(空文字で待受無効=外向きのみ)\n\
          \x20 --http-bind <host:port>  HTTP(UI・index.txt)待受(loopback のみ)\n\
          \x20 --pcp-bind <host:port>   PCP アナウンス待受(loopback のみ)\n\
-         \x20 --data-dir <path>        データディレクトリ(既定: %APPDATA%\\peca-p2p-yp)\n\
+         \x20 --data-dir <path>        データディレクトリ(既定: {data_dir_default})\n\
          \x20 -h, --help               このヘルプを表示\n"
     );
 }

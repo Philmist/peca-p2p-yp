@@ -74,6 +74,14 @@ name = "index_txt"
 path = "tests/contract/index_txt.rs"
 
 [[test]]
+name = "cli_config"
+path = "tests/contract/cli_config.rs"
+
+[[test]]
+name = "platform_startup"
+path = "tests/integration/platform_startup.rs"
+
+[[test]]
 name = "announce_flow"
 path = "tests/integration/announce_flow.rs"
 
