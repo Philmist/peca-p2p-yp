@@ -276,18 +276,27 @@ async fn run() -> Result<(), i32> {
         outbound_target = settings.p2p_outbound_target,
         inbound_max = settings.p2p_inbound_max,
         known_peers,
-        "起動しました(停止は Ctrl+C)"
+        "起動しました(停止は Ctrl+C / SIGTERM)"
     );
 
-    // 17. serve + graceful shutdown(Ctrl+C で全サブシステムへ伝播)。
+    // 16a. 全リスナーバインド成功後に READY=1 を通知する(FR-009 — systemd-service §1)。
+    //      NOTIFY_SOCKET 未設定時は no-op。送信失敗は稼働へ影響しない(MUST)。
+    peca_p2p_yp::platform::sd_notify("READY=1");
+
+    // 17. serve + graceful shutdown(SIGTERM/SIGINT/Ctrl+C で全サブシステムへ伝播)。
     //     レート制限の接続元取得に connect-info が必須(T019 申し送り)。
+    //     platform::shutdown_signal() が unix では SIGTERM+SIGINT、Windows では ctrl_c を
+    //     待つ(contracts/cli-config.md §3、research R6 — T027/T028)。
     let serve = axum::serve(
         http_listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        peca_p2p_yp::platform::shutdown_signal().await;
         tracing::info!(target: "startup", "shutdown 要求を受信しました");
+        // 停止開始を systemd へ通知してから既存 watch チャネル経路で停止伝播する
+        // (STOPPING=1 → shutdown_tx 送信の順 — systemd-service §1、FR-008)。
+        peca_p2p_yp::platform::sd_notify("STOPPING=1");
         let _ = shutdown_tx.send(true);
     });
 
@@ -483,7 +492,12 @@ fn resolve_data_dir(overrides: &CliOverrides) -> Result<PathBuf, i32> {
 /// tracing のコンソール出力を初期化する。既定は INFO で、`RUST_LOG` は
 /// **INFO への追加指定**として重ねる(例: `RUST_LOG=pcp=debug` で通常ログ +
 /// PCP セッションのデバッグ出力。素の EnvFilter と違い既定ログは消えない)。
+///
+/// 出力先が端末でない場合(journald 捕捉・パイプ等)は ANSI エスケープを無効化する
+/// (FR-011 — research R8、contracts/systemd-service.md §1 ログ契約)。
 fn init_tracing() {
+    use std::io::IsTerminal;
+
     let extra = std::env::var("RUST_LOG").unwrap_or_default();
     let directives = if extra.is_empty() {
         "info".to_string()
@@ -491,9 +505,12 @@ fn init_tracing() {
         format!("info,{extra}")
     };
     let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(&directives);
+    // 端末でない出力先(journald・パイプ)では ANSI エスケープを出力しない(FR-011)。
+    let ansi = std::io::stdout().is_terminal();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(ansi)
         .init();
 }
 

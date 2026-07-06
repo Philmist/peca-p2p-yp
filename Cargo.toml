@@ -78,6 +78,10 @@ name = "cli_config"
 path = "tests/contract/cli_config.rs"
 
 [[test]]
+name = "graceful_shutdown"
+path = "tests/integration/graceful_shutdown.rs"
+
+[[test]]
 name = "platform_startup"
 path = "tests/integration/platform_startup.rs"
 

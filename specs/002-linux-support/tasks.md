@@ -119,15 +119,15 @@
 
 ### Tests for User Story 3
 
-- [ ] T025 [P] [US3] `tests/integration/graceful_shutdown.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する(unix): SIGTERM 受信で graceful shutdown 経路により終了コード 0 で終了すること、`NOTIFY_SOCKET` に一時 UnixDatagram を指定した場合に全リスナーバインド後 `READY=1`・停止開始時 `STOPPING=1` が届くこと、`NOTIFY_SOCKET` 未設定でも正常稼働すること(FR-008/FR-009、systemd-service §1)
+- [X] T025 [P] [US3] `tests/integration/graceful_shutdown.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する(unix): SIGTERM 受信で graceful shutdown 経路により終了コード 0 で終了すること、`NOTIFY_SOCKET` に一時 UnixDatagram を指定した場合に全リスナーバインド後 `READY=1`・停止開始時 `STOPPING=1` が届くこと、`NOTIFY_SOCKET` 未設定でも正常稼働すること(FR-008/FR-009、systemd-service §1)
 
 ### Implementation for User Story 3
 
-- [ ] T026 [US3] `src/platform/mod.rs` に sd_notify を std のみで実装する(unix): `$NOTIFY_SOCKET` のパス(先頭 `@` は abstract socket として `\0` 読替)へ `UnixDatagram` で `READY=1` / `STOPPING=1` を送信。未設定なら no-op、送信失敗は debug ログのみで稼働へ影響させない(research R5、systemd-service §1)
-- [ ] T027 [US3] `src/platform/mod.rs` に `shutdown_signal()` 抽象を実装する: unix は `SIGTERM` + `SIGINT`(`tokio::signal::unix`)、Windows は `ctrl_c`(現行)(research R6)(T026 と同一ファイルのため順次)
-- [ ] T028 [US3] `src/main.rs` を配線する: `ctrl_c` 直書きを `platform::shutdown_signal()` へ差替え、全リスナーバインド成功後に `READY=1`、shutdown 開始時に `STOPPING=1` を送信してから既存 watch チャネル経路で全サブシステム停止(FR-008/FR-009、SC-004)(T026・T027 完了後)
-- [ ] T029 [US3] `src/main.rs` の tracing 初期化で出力先が端末でないとき ANSI エスケープを無効化する(`with_ansi(IsTerminal)` — research R8、FR-011)(T028 と同一ファイルのため順次)
-- [ ] T030 [P] [US3] `contrib/systemd/peca-p2p-yp.service` を新規作成する: contracts/systemd-service.md §2 の unit 全文(`Type=notify`・`StateDirectory=peca-p2p-yp`・`StateDirectoryMode=0700`・`UMask=0077`・`Restart=on-failure`・ハードニング群・`RestrictAddressFamilies` に `AF_UNIX` 含む・`TimeoutStopSec` 非指定)
+- [X] T026 [US3] `src/platform/mod.rs` に sd_notify を std のみで実装する(unix): `$NOTIFY_SOCKET` のパス(先頭 `@` は abstract socket として `\0` 読替)へ `UnixDatagram` で `READY=1` / `STOPPING=1` を送信。未設定なら no-op、送信失敗は debug ログのみで稼働へ影響させない(research R5、systemd-service §1)
+- [X] T027 [US3] `src/platform/mod.rs` に `shutdown_signal()` 抽象を実装する: unix は `SIGTERM` + `SIGINT`(`tokio::signal::unix`)、Windows は `ctrl_c`(現行)(research R6)(T026 と同一ファイルのため順次)
+- [X] T028 [US3] `src/main.rs` を配線する: `ctrl_c` 直書きを `platform::shutdown_signal()` へ差替え、全リスナーバインド成功後に `READY=1`、shutdown 開始時に `STOPPING=1` を送信してから既存 watch チャネル経路で全サブシステム停止(FR-008/FR-009、SC-004)(T026・T027 完了後)
+- [X] T029 [US3] `src/main.rs` の tracing 初期化で出力先が端末でないとき ANSI エスケープを無効化する(`with_ansi(IsTerminal)` — research R8、FR-011)(T028 と同一ファイルのため順次)
+- [X] T030 [P] [US3] `contrib/systemd/peca-p2p-yp.service` を新規作成する: contracts/systemd-service.md §2 の unit 全文(`Type=notify`・`StateDirectory=peca-p2p-yp`・`StateDirectoryMode=0700`・`UMask=0077`・`Restart=on-failure`・ハードニング群・`RestrictAddressFamilies` に `AF_UNIX` 含む・`TimeoutStopSec` 非指定)
 - [ ] T031 [US3] systemd 実機で quickstart 検証 4 を実施する: `systemctl start` → active(READY 後に返る)、`journalctl` に起動サマリ(ANSI・秘密鍵なし)、`systemctl stop` が 90 秒以内・`ExecMainStatus=0`(SC-004)、`kill -9` → 自動再起動、data-dir = `/var/lib/peca-p2p-yp`(systemd-service §3)、および上記すべてがデスクトップセッション・対話操作なしのヘッドレス環境(nologin のサービスアカウント)で完了すること(ヘッドレス無人稼働 — FR-005/SC-003)
 
 **Checkpoint**: 全ユーザーストーリーが独立に機能

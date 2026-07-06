@@ -249,6 +249,107 @@ pub fn enforce_permissions(_data_dir: &Path, _security: &SecurityLog) -> Permiss
 }
 
 // ---------------------------------------------------------------------------
+// sd_notify プロトコル(unix のみ — contracts/systemd-service.md §1, research R5)
+// ---------------------------------------------------------------------------
+
+/// sd_notify プロトコルで通知を送る(unix のみ)。
+///
+/// `$NOTIFY_SOCKET` が未設定の場合は no-op(FR-009 MUST)。送信失敗は debug ログのみで
+/// 稼働へ影響させない(MUST — contracts/systemd-service.md §1)。
+/// 先頭 `@` は abstract socket として `\0` に読み替える(Linux 拡張 — research R5)。
+/// 依存クレートは追加せず std のみで実装する(research R5)。
+#[cfg(unix)]
+pub fn sd_notify(message: &str) {
+    use std::os::unix::net::UnixDatagram;
+
+    let socket_path = match std::env::var_os("NOTIFY_SOCKET") {
+        Some(p) => p,
+        None => return, // 未設定は no-op(FR-009 MUST)
+    };
+
+    let sock = match UnixDatagram::unbound() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("sd_notify: ソケット作成失敗: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = notify_send(&sock, &socket_path, message) {
+        tracing::debug!("sd_notify: 送信失敗: {e}");
+    }
+}
+
+/// Linux: ファイルパスまたは abstract socket(`@` 前置)へデータグラムを送信する。
+///
+/// `@` 以降をアブストラクト名として `std::os::linux::net::SocketAddrExt` で解決する
+/// (abstract socket は Linux 拡張 — research R5)。
+#[cfg(target_os = "linux")]
+fn notify_send(
+    sock: &std::os::unix::net::UnixDatagram,
+    socket_path: &std::ffi::OsStr,
+    message: &str,
+) -> std::io::Result<usize> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_bytes = socket_path.as_bytes();
+    if let Some(abstract_name) = path_bytes.strip_prefix(b"@") {
+        // abstract socket: `@` 以降をアブストラクト名として送信(`\0` 読替 — research R5)
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name)?;
+        sock.send_to_addr(message.as_bytes(), &addr)
+    } else {
+        sock.send_to(message.as_bytes(), std::path::Path::new(socket_path))
+    }
+}
+
+/// 非 Linux unix(macOS 等): ファイルパスのみ対応(abstract socket は Linux 拡張)。
+#[cfg(all(unix, not(target_os = "linux")))]
+fn notify_send(
+    sock: &std::os::unix::net::UnixDatagram,
+    socket_path: &std::ffi::OsStr,
+    message: &str,
+) -> std::io::Result<usize> {
+    sock.send_to(message.as_bytes(), std::path::Path::new(socket_path))
+}
+
+/// sd_notify: Windows は no-op(systemd は Windows で使用しない)。
+#[cfg(not(unix))]
+pub fn sd_notify(_message: &str) {}
+
+// ---------------------------------------------------------------------------
+// 停止シグナル抽象(contracts/cli-config.md §3, research R6)
+// ---------------------------------------------------------------------------
+
+/// 停止シグナルを非同期に待つ(プラットフォーム抽象 — research R6)。
+///
+/// unix: SIGTERM(systemd `systemctl stop`)または SIGINT(Ctrl+C)のいずれかを待つ
+/// (`tokio::signal::unix` — contracts/cli-config.md §3)。
+/// Windows: ctrl_c(現行挙動を維持)。
+/// 呼び出し元は本関数が返ったら `STOPPING=1` 通知 → shutdown 伝播を行う
+/// (contracts/systemd-service.md §1, contracts/cli-config.md §3)。
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("SIGTERM ハンドラの登録に失敗しました");
+        let mut sigint =
+            signal(SignalKind::interrupt()).expect("SIGINT ハンドラの登録に失敗しました");
+
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = sigint.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // テスト
 // ---------------------------------------------------------------------------
 
