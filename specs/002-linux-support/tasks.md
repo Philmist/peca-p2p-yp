@@ -105,10 +105,10 @@
 - [X] T021 [US2] `src/main.rs` の起動順序を配線する: data-dir 作成(`0700`)→ Store オープン → keystore 初期化(master.key 読込/生成)→ パーミッション検査 → リスナーバインド。検査結果(KeystoreHealth)を IdentityManager へ渡す(cli-config §4 起動順序)(T019・T020 完了後)
 - [X] T022 [P] [US2] `src/web/personas.rs` の DPAPI 依存文言をプラットフォーム中立な「保護された保管」表現へ変更する(挙動変更なし — cli-config §6)
 - [X] T036 [US2] `tests/steps/` のステップ定義を実装し、T023 の cucumber シナリオ①〜④を事後アサーション(秘密鍵・nsec 非出力検査)を含めて全通過させる(T018〜T021 完了後)
-- [ ] T024 [US2] Linux 実機で quickstart 検証 3 を実施する: 平文非保存(strings 検査 + `PYK1` scheme 0x02)、鍵分離(DB 単体持出しで復号不能)、他アカウント遮断(Permission denied)、`chmod 644` → 自動是正 + `key_permission_fixed`、`chown root` → 部分劣化 + 発見機能継続、Windows ノードとの相互発見(SC-005)、nsec エクスポート/破棄の同一意味論(FR-007)
+- [X] T024 [US2] Linux 実機で quickstart 検証 3 を実施する: 平文非保存(strings 検査 + `PYK1` scheme 0x02)、鍵分離(DB 単体持出しで復号不能)、他アカウント遮断(Permission denied)、`chmod 644` → 自動是正 + `key_permission_fixed`、`chown root` → 部分劣化 + 発見機能継続、Windows ノードとの相互発見(SC-005)、nsec エクスポート/破棄の同一意味論(FR-007)
   - 2026-07-06 部分実施済み(Linux/WSL2・実バイナリ): API でペルソナ作成 → `secret_enc` が `PYK1` + scheme 0x02、strings 検査で nsec1 出現 0・64 桁 hex は公開鍵のみ、master.key 32 bytes `0600`・data-dir `0700`、`chmod 644 master.key` → 再起動で `0600` へ自動是正 + `key_permission_fixed` 記録・ペルソナ `usable:true` 維持、標準出力・security.log に秘密鍵/nsec 非出力。**残(要 root・複数アカウント・Windows ノード環境): 他アカウント遮断、`chown root` 部分劣化(cucumber ③ が symlink 代表で自動検証済み)、DB 単体持出し(contract #8 で自動検証済み)、Windows 相互発見(SC-005)、nsec エクスポート/破棄の手動比較**
   - 2026-07-07 追実施(Debian 12 実機・root 検証): **`chown root master.key` → 部分劣化で欠陥を発見**(致命的エラー終了しノードが起動しない — FR-013 違反)。契約テスト #10(`unreadable_master_key_degrades_instead_of_failing`)を追加(失敗確認)→ `KeystoreInit::Unreadable` / `UnavailableCause::MasterKeyUnreadable` を導入して修正。修正後の実機再検証: 定型警告「保護鍵ファイルを読み取れません」+ 全ペルソナ `usable:false` + index.txt 200 継続 + 鍵操作は `persona_unusable` 拒否 + ログに秘密鍵/nsec 非出力を確認。他アカウント遮断も確認済み(`sudo -u nobody cat master.key app.db` → 両ファイルとも「許可がありません」— 利用者実施・2026-07-07)
-  - 2026-07-07 完了(利用者実施): 検証 3-6 Windows ノードとの相互発見(SC-005)を確認。あわせて「掲載終了前にペルソナを破棄すると掲載終了イベントを伝搬できない」挙動を観測 — 破棄後は署名不能(ADR-0003 の破棄意味論)による設計どおりの挙動で、他ノード側は鮮度窓(600 秒)で自然消滅するため許容と判断。**残: nsec エクスポート/破棄の Windows/Linux 同一意味論の手動比較(検証 3-7 — FR-007 自体は既存 001 テストが両 OS CI で同一通過することで自動検証済み)**
+  - 2026-07-07 完了(利用者実施): 検証 3-6 Windows ノードとの相互発見(SC-005)を確認。あわせて「掲載終了前にペルソナを破棄すると掲載終了イベントを伝搬できない」挙動を観測 — 破棄後は署名不能(ADR-0003 の破棄意味論)による設計どおりの挙動で、他ノード側は鮮度窓(600 秒)で自然消滅するため許容と判断。検証 3-7(nsec エクスポート/破棄の同一意味論 — FR-007)も Debian と Windows 11 の両方で同一フローであることを利用者が確認(2026-07-07)し、**T024 の全項目が完了**
 
 **Checkpoint**: US1 と US2 が独立に動作(Linux で掲載ノードとして完全機能、SC-003/SC-005/SC-006)
 
