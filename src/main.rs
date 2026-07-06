@@ -21,7 +21,7 @@ use peca_p2p_yp::config::{self, CliOverrides, Settings};
 use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
-use peca_p2p_yp::identity::{IdentityManager, Keystore, keystore};
+use peca_p2p_yp::identity::{IdentityManager, Keystore, KeystoreHealth, keystore};
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
@@ -79,6 +79,27 @@ async fn run() -> Result<(), i32> {
             1
         })?,
     );
+
+    // 5b. keystore 初期化 + 起動時パーミッション検査(リスナーバインド前 —
+    //     contracts/cli-config.md §4 起動順序: data-dir 作成(0700)→ Store →
+    //     keystore 初期化(master.key 読込/生成)→ パーミッション検査 → リスナーバインド)。
+    //     既存に自プラットフォーム scheme のペルソナがあるかで「保護鍵消失疑い」を判定する。
+    let has_encrypted_personas = store
+        .list_personas()
+        .map(|ps| {
+            ps.iter()
+                .any(|p| keystore::is_current_scheme(&p.secret_enc))
+        })
+        .unwrap_or(false);
+    let (keystore, keystore_init) =
+        Keystore::open(&data_dir, has_encrypted_personas).map_err(|e| {
+            eprintln!("{e}");
+            1
+        })?;
+    // 緩いパーミッションは 0600/0700 へ是正し、是正不能なら全ペルソナ利用不可へ倒す
+    // (発見・伝搬は継続 — FR-013)。unix のみ実体があり Windows は no-op。
+    let permission = peca_p2p_yp::platform::enforce_permissions(&data_dir, &security);
+    let keystore_health = KeystoreHealth::evaluate(permission.is_healthy(), keystore_init);
 
     // 6. バインドアドレスの確定(検証済み)。
     let p2p_addr = settings.p2p_addr().map_err(exit_config)?;
@@ -168,24 +189,14 @@ async fn run() -> Result<(), i32> {
         }));
     }
 
-    // 14. ペルソナ管理と掲載エンジン(T028/T029)。
-    //     keystore 初期化: 既存に自プラットフォーム scheme のペルソナがあるか判定し、
-    //     master.key を読込/生成する(ADR-0008 §4/§5)。
-    // TODO(T020/T021): KeystoreInit の反映(KeystoreHealth 化)と起動順序の是正
-    //   (keystore 初期化をリスナーバインド前へ移動)。
-    let has_encrypted_personas = store
-        .list_personas()
-        .map(|ps| {
-            ps.iter()
-                .any(|p| keystore::is_current_scheme(&p.secret_enc))
-        })
-        .unwrap_or(false);
-    let (keystore, _keystore_init) =
-        Keystore::open(&data_dir, has_encrypted_personas).map_err(|e| {
-            eprintln!("{e}");
-            1
-        })?;
-    let identity = Arc::new(IdentityManager::new(Arc::clone(&store), keystore));
+    // 14. ペルソナ管理と掲載エンジン(T028/T029)。keystore 初期化・パーミッション検査は
+    //     リスナーバインド前(手順 5b)に済ませており、その健全性を IdentityManager へ渡す
+    //     (Unavailable なら全ペルソナ利用不可・鍵操作は利用不可エラー — FR-013)。
+    let identity = Arc::new(IdentityManager::new_with_health(
+        Arc::clone(&store),
+        keystore,
+        keystore_health,
+    ));
     let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
     let engine = Arc::new(PublishEngine::new(
         Arc::clone(&identity),

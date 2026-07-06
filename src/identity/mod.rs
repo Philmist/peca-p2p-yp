@@ -30,6 +30,54 @@ pub use keystore::{Keystore, KeystoreInit};
 /// 「現在選択中」ペルソナを保存する settings キー。
 pub const SELECTED_PERSONA_KEY: &str = "selected_persona";
 
+/// 共有保管物(master.key・DB のパーミッション)起因の健全性(data-model §KeystoreHealth)。
+///
+/// 起動時パーミッション検査(`platform::enforce_permissions`)と keystore 初期化
+/// (`KeystoreInit`)の結果から導く。`Unavailable` は個別ペルソナの復号可否と独立に
+/// **全ペルソナを利用不可**へ倒す(パーミッション是正不能時は復号自体は成立し得るが、
+/// at-rest 保護が崩れているため利用させない — contracts/cli-config.md §4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeystoreHealth {
+    /// 保管物は健全(是正済み含む)。個別ペルソナの復号可否で `usable` を判定する。
+    Ok,
+    /// 共有保管物が是正不能・master.key 破損等。全ペルソナ `usable:false`・鍵操作は
+    /// 「利用不可」エラー。発見・伝搬(US1)は非影響(MUST — FR-013)。
+    Unavailable(UnavailableCause),
+}
+
+/// [`KeystoreHealth::Unavailable`] の原因(利用者がログから区別できること — key-envelope §5)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableCause {
+    /// master.key が破損している(サイズ不一致)。
+    MasterKeyCorrupt,
+    /// 保管ファイルのパーミッションを是正できない。
+    PermissionUnfixable,
+}
+
+impl KeystoreHealth {
+    /// パーミッション検査結果(健全か)と keystore 初期化結果から健全性を導く。
+    ///
+    /// パーミッション是正不能を最優先で `Unavailable` にする(復号は成立し得るが at-rest
+    /// 保護が崩れているため)。次いで master.key 破損。`CreatedMissingSuspected`(保護鍵
+    /// 消失疑い)は新しい master.key で keystore 自体は機能するため `Ok` とし、既存
+    /// scheme 0x02 ペルソナは個別に復号失敗して `usable:false` になる(key-envelope §5 の
+    /// 影響範囲「既存ペルソナ」に一致)。消失疑いの定型警告は生成時点で記録済み。
+    pub fn evaluate(permission_healthy: bool, init: KeystoreInit) -> Self {
+        if !permission_healthy {
+            KeystoreHealth::Unavailable(UnavailableCause::PermissionUnfixable)
+        } else if init == KeystoreInit::Corrupt {
+            KeystoreHealth::Unavailable(UnavailableCause::MasterKeyCorrupt)
+        } else {
+            KeystoreHealth::Ok
+        }
+    }
+
+    /// 共有保管物起因で全ペルソナ利用不可か。
+    fn is_unavailable(self) -> bool {
+        matches!(self, KeystoreHealth::Unavailable(_))
+    }
+}
+
 /// ペルソナ管理のエラー。
 #[derive(Debug)]
 pub enum IdentityError {
@@ -84,6 +132,8 @@ pub struct IdentityManager {
     store: Arc<Store>,
     /// 鍵保護の入口(プラットフォーム状態を保持 — ADR-0008)。
     keystore: Keystore,
+    /// 共有保管物起因の健全性(起動時検査から確定 — T020)。
+    health: KeystoreHealth,
     /// チャンネルへの割当(channel_id hex32 → pubkey hex64)。揮発。
     assignments: Mutex<HashMap<String, String>>,
 }
@@ -99,16 +149,32 @@ impl IdentityManager {
     /// `keystore` は本番では data-dir から初期化した [`Keystore`]([`Keystore::open`])、
     /// テストでは [`Keystore::ephemeral`] を明示的に渡す。ephemeral を暗黙に用いる
     /// 経路は設けない(鍵取扱いの安全性 — 本番で誤って揮発鍵を使わないため)。
+    ///
+    /// 健全性は [`KeystoreHealth::Ok`]。共有保管物起因の劣化を反映する場合は
+    /// [`new_with_health`](Self::new_with_health) を使う。
     pub fn new(store: Arc<Store>, keystore: Keystore) -> Self {
+        Self::new_with_health(store, keystore, KeystoreHealth::Ok)
+    }
+
+    /// 起動時検査で確定した [`KeystoreHealth`] を反映してマネージャを作成する(T021)。
+    ///
+    /// `Unavailable` のとき全ペルソナは `usable:false`、鍵操作(作成・署名・エクスポート・
+    /// 破棄)は「利用不可」エラーになる。発見・伝搬は非影響(FR-013)。
+    pub fn new_with_health(store: Arc<Store>, keystore: Keystore, health: KeystoreHealth) -> Self {
         Self {
             store,
             keystore,
+            health,
             assignments: Mutex::new(HashMap::new()),
         }
     }
 
     /// ペルソナを新規作成する(鍵生成 → keystore 暗号化 → 保存)。
     pub fn create(&self, label: &str) -> Result<PersonaInfo, IdentityError> {
+        // 共有保管物が利用不可なら鍵操作は「利用不可」エラー(FR-013)。
+        if self.health.is_unavailable() {
+            return Err(IdentityError::Unusable);
+        }
         let keys = Keys::generate();
         let pubkey = keys.public_key().to_hex();
         let secret_enc = self.keystore.protect(keys.secret_key().as_secret_bytes())?;
@@ -128,13 +194,17 @@ impl IdentityManager {
     }
 
     /// 全ペルソナを列挙する(利用可否は keystore 復号の試行で判定)。
+    ///
+    /// 共有保管物が利用不可([`KeystoreHealth::Unavailable`])のときは、個別の復号可否に
+    /// かかわらず全ペルソナを `usable:false` にする(FR-013)。
     pub fn list(&self) -> Result<Vec<PersonaInfo>, IdentityError> {
         let selected = self.selected()?;
         let personas = self.store.list_personas()?;
+        let available = !self.health.is_unavailable();
         Ok(personas
             .into_iter()
             .map(|p| {
-                let usable = self.keystore.unprotect(&p.secret_enc).is_ok();
+                let usable = available && self.keystore.unprotect(&p.secret_enc).is_ok();
                 PersonaInfo {
                     selected: selected.as_deref() == Some(p.pubkey.as_str()),
                     pubkey: p.pubkey,
@@ -212,6 +282,10 @@ impl IdentityManager {
 
     /// ペルソナを破棄する(行削除 — 復元不可)。割当・選択からも取り除く。
     pub fn delete(&self, pubkey: &str) -> Result<(), IdentityError> {
+        // 共有保管物が利用不可なら鍵操作は「利用不可」エラー(FR-013)。
+        if self.health.is_unavailable() {
+            return Err(IdentityError::Unusable);
+        }
         if !self.store.delete_persona(pubkey)? {
             return Err(IdentityError::NotFound);
         }
@@ -220,7 +294,13 @@ impl IdentityManager {
     }
 
     /// 署名用の鍵ペアをロードする(掲載エンジン用)。復号失敗は利用不可。
+    ///
+    /// 共有保管物が利用不可なら復号可否によらず「利用不可」エラーになる(FR-013 —
+    /// エクスポートも本関数を経由するため同様)。
     pub fn signing_keys(&self, pubkey: &str) -> Result<Keys, IdentityError> {
+        if self.health.is_unavailable() {
+            return Err(IdentityError::Unusable);
+        }
         let persona = self
             .store
             .get_persona_by_pubkey(pubkey)?

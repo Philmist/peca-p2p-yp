@@ -76,8 +76,9 @@
 - [X] T012 [P] [US1] `src/config.rs` の `--help` 文言を更新する: `--data-dir` 既定値をプラットフォーム別に正しく表示(Windows: `%APPDATA%\peca-p2p-yp` / Linux: `$XDG_STATE_HOME/peca-p2p-yp` ほか)、「DPAPI」等の Windows 固有名をプラットフォーム中立表現へ(挙動不変 — cli-config §6)
 - [X] T013 [US1] `src/main.rs` の起動失敗経路を FR-014 合否基準に沿って整備する: バインド失敗・権限不足時に (a) 失敗した操作(どのリスナーか)と (b) 原因種別(使用中・権限不足等)が判別できる定型メッセージ + 終了コード規約(0/1/2)。スタックトレース・内部絶対パス・OS エラー生文字列のみの出力を排除(cli-config §5)
 - [X] T014 [US1] `.github/workflows/ci.yml` に `ubuntu-latest` の build + test + clippy + fmt ジョブを追加し、既存 `windows-latest` ジョブと並走させる(research R10、SC-002 ゲート)
-- [ ] T015 [US1] Linux 実機で quickstart 検証 1・2 を実施する: `cargo fmt/clippy/build/test` 全成功、`cargo tree` に Win32 クレートが現れない、手動起動でピア接続 → チャンネル発見 → index.txt 取得、loopback 強制(`--http-bind 0.0.0.0:7180` 拒否 — ADR-0006)を確認
-  - 2026-07-06 部分実施済み(Linux/WSL2): fmt・clippy・build・test 全成功、`cargo tree` に Win32 クレート出現なし、手動起動 → `/index.txt` 200・data-dir 0700・master.key 0600、`--http-bind 0.0.0.0:7180` は定型メッセージ + 終了コード 2 で拒否。**残: 実ネットワークでのピア接続 → 他ノードのチャンネル発見**(既知ピアのある環境が必要)
+- [X] T015 [US1] Linux 実機で quickstart 検証 1・2 を実施する: `cargo fmt/clippy/build/test` 全成功、`cargo tree` に Win32 クレートが現れない、手動起動でピア接続 → チャンネル発見 → index.txt 取得、loopback 強制(`--http-bind 0.0.0.0:7180` 拒否 — ADR-0006)を確認
+  - 2026-07-06 部分実施済み(Linux/WSL2): fmt・clippy・build・test 全成功、`cargo tree` に Win32 クレート出現なし、手動起動 → `/index.txt` 200・data-dir 0700・master.key 0600、`--http-bind 0.0.0.0:7180` は定型メッセージ + 終了コード 2 で拒否
+  - 2026-07-06 完了: WSL(Linux)と Win11 ノード間で実ネットワーク疎通を確認(ピア接続 → 他ノードのチャンネル発見)— 利用者確認済み
 
 **Checkpoint**: Linux 上で発見・伝搬ノードとして完全動作(MVP 成立、SC-001)
 
@@ -93,17 +94,17 @@
 
 > **注**: T016(key_envelope 契約テスト)は keystore 実装(Phase 2)の前提となるため Phase 2 へ前倒し済み(テストファースト — Principle IV)。
 
-- [ ] T017 [P] [US2] `tests/contract/cli_config.rs` に追加する: (unix) 緩いパーミッションの master.key/DB が `0600` へ是正され `key_permission_fixed` が記録される(cli-config §7 #3)、(unix) 是正不能時に全ペルソナ利用不可 + index.txt/一覧提供は継続(§7 #4)。**T018〜T021 の実装前に失敗する状態を確認する(Principle IV)**
-- [ ] T023 [P] [US2] `tests/features/security.feature` に cucumber シナリオを追加し、`tests/steps/` にステップ定義の骨子を用意する: ①平文非永続化(at-rest 保護) ②パーミッション自動是正 ③是正不能の部分劣化(全ペルソナ利用不可 + 発見機能継続) ④復号不能データの隔離(当該ペルソナのみ利用不可)。各シナリオの事後アサーションとして全ログ出力に秘密鍵・nsec(hex 64 桁・bech32・部分文字列・Debug 表現)が含まれないことを検査対象として定義する(spec セキュリティシナリオ、quickstart トレーサビリティ表)。**US2 実装(T018〜T021)前にシナリオが失敗する状態を確認する(Principle IV)**
+- [X] T017 [P] [US2] `tests/contract/cli_config.rs` に追加する: (unix) 緩いパーミッションの master.key/DB が `0600` へ是正され `key_permission_fixed` が記録される(cli-config §7 #3)、(unix) 是正不能時に全ペルソナ利用不可 + index.txt/一覧提供は継続(§7 #4)。**T018〜T021 の実装前に失敗する状態を確認する(Principle IV)**
+- [X] T023 [P] [US2] `tests/features/security.feature` に cucumber シナリオを追加し、`tests/steps/` にステップ定義の骨子を用意する: ①平文非永続化(at-rest 保護) ②パーミッション自動是正 ③是正不能の部分劣化(全ペルソナ利用不可 + 発見機能継続) ④復号不能データの隔離(当該ペルソナのみ利用不可)。各シナリオの事後アサーションとして全ログ出力に秘密鍵・nsec(hex 64 桁・bech32・部分文字列・Debug 表現)が含まれないことを検査対象として定義する(spec セキュリティシナリオ、quickstart トレーサビリティ表)。**US2 実装(T018〜T021)前にシナリオが失敗する状態を確認する(Principle IV)**
 
 ### Implementation for User Story 2
 
-- [ ] T018 [US2] `src/security/mod.rs` に `SecurityCategory` を 2 件追加する: `KeyPermissionFixed`(`key_permission_fixed`)・`KeyPermissionUnfixable`(`key_permission_unfixable`)。`SecurityCategory::ALL` を 14 件に更新(data-model §SecurityCategory)(T017・T023 の失敗確認後)
-- [ ] T019 [US2] `src/platform/mod.rs` に起動時パーミッション検査・是正(unix のみ)を実装する: 対象 data-dir → `0700`、`master.key`・`app.db`・`app.db-wal`・`app.db-shm` → `0600`。group/other ビット(`0o077`)判定、symlink は追従せず是正不能扱い、是正成功 → `key_permission_fixed` 記録・継続、是正失敗(`EPERM`/`EROFS`/IO エラー)→ `key_permission_unfixable` 記録・警告。記録パスは data-dir 相対名のみ。Windows では no-op(cli-config §4)(T018 完了後)
-- [ ] T020 [US2] `src/identity/` に `KeystoreHealth`(`Ok` / `Unavailable` + 原因)を導入する: `Unavailable` 時は全ペルソナ `usable: false`・鍵操作(作成・署名・エクスポート・破棄)は既存「利用不可」エラー応答・発見/伝搬は非影響。原因別(master.key 破損 / パーミッション是正不能 / 保護鍵消失疑い / 個別ペルソナ復号失敗)に異なる定型警告 — 鍵素材・絶対パス非含有(key-envelope §5「障害原因の識別」、data-model §KeystoreHealth)
-- [ ] T021 [US2] `src/main.rs` の起動順序を配線する: data-dir 作成(`0700`)→ Store オープン → keystore 初期化(master.key 読込/生成)→ パーミッション検査 → リスナーバインド。検査結果(KeystoreHealth)を IdentityManager へ渡す(cli-config §4 起動順序)(T019・T020 完了後)
-- [ ] T022 [P] [US2] `src/web/personas.rs` の DPAPI 依存文言をプラットフォーム中立な「保護された保管」表現へ変更する(挙動変更なし — cli-config §6)
-- [ ] T036 [US2] `tests/steps/` のステップ定義を実装し、T023 の cucumber シナリオ①〜④を事後アサーション(秘密鍵・nsec 非出力検査)を含めて全通過させる(T018〜T021 完了後)
+- [X] T018 [US2] `src/security/mod.rs` に `SecurityCategory` を 2 件追加する: `KeyPermissionFixed`(`key_permission_fixed`)・`KeyPermissionUnfixable`(`key_permission_unfixable`)。`SecurityCategory::ALL` を 14 件に更新(data-model §SecurityCategory)(T017・T023 の失敗確認後)
+- [X] T019 [US2] `src/platform/mod.rs` に起動時パーミッション検査・是正(unix のみ)を実装する: 対象 data-dir → `0700`、`master.key`・`app.db`・`app.db-wal`・`app.db-shm` → `0600`。group/other ビット(`0o077`)判定、symlink は追従せず是正不能扱い、是正成功 → `key_permission_fixed` 記録・継続、是正失敗(`EPERM`/`EROFS`/IO エラー)→ `key_permission_unfixable` 記録・警告。記録パスは data-dir 相対名のみ。Windows では no-op(cli-config §4)(T018 完了後)
+- [X] T020 [US2] `src/identity/` に `KeystoreHealth`(`Ok` / `Unavailable` + 原因)を導入する: `Unavailable` 時は全ペルソナ `usable: false`・鍵操作(作成・署名・エクスポート・破棄)は既存「利用不可」エラー応答・発見/伝搬は非影響。原因別(master.key 破損 / パーミッション是正不能 / 保護鍵消失疑い / 個別ペルソナ復号失敗)に異なる定型警告 — 鍵素材・絶対パス非含有(key-envelope §5「障害原因の識別」、data-model §KeystoreHealth)
+- [X] T021 [US2] `src/main.rs` の起動順序を配線する: data-dir 作成(`0700`)→ Store オープン → keystore 初期化(master.key 読込/生成)→ パーミッション検査 → リスナーバインド。検査結果(KeystoreHealth)を IdentityManager へ渡す(cli-config §4 起動順序)(T019・T020 完了後)
+- [X] T022 [P] [US2] `src/web/personas.rs` の DPAPI 依存文言をプラットフォーム中立な「保護された保管」表現へ変更する(挙動変更なし — cli-config §6)
+- [X] T036 [US2] `tests/steps/` のステップ定義を実装し、T023 の cucumber シナリオ①〜④を事後アサーション(秘密鍵・nsec 非出力検査)を含めて全通過させる(T018〜T021 完了後)
 - [ ] T024 [US2] Linux 実機で quickstart 検証 3 を実施する: 平文非保存(strings 検査 + `PYK1` scheme 0x02)、鍵分離(DB 単体持出しで復号不能)、他アカウント遮断(Permission denied)、`chmod 644` → 自動是正 + `key_permission_fixed`、`chown root` → 部分劣化 + 発見機能継続、Windows ノードとの相互発見(SC-005)、nsec エクスポート/破棄の同一意味論(FR-007)
 
 **Checkpoint**: US1 と US2 が独立に動作(Linux で掲載ノードとして完全機能、SC-003/SC-005/SC-006)

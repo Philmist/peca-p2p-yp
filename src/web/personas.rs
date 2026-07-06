@@ -1,7 +1,7 @@
 //! ペルソナ API(T030 — contracts/local-api.md `personas` エンドポイント群)
 //!
 //! - `GET /api/v1/personas`: ペルソナ一覧(秘密鍵は返さない)。
-//!   利用不可ペルソナ(DPAPI 復号失敗)は `usable: false` として一覧に含める。
+//!   利用不可ペルソナ(保護された保管の復号失敗)は `usable: false` として一覧に含める。
 //! - `POST /api/v1/personas`: 新規作成(`{"label":"..."}` → `{"pubkey":"..."}`)。
 //! - `PUT /api/v1/personas/{pubkey}`: label 変更 / archive / チャンネルへの割当 /
 //!   「現在選択中」設定。

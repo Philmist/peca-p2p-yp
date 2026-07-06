@@ -16,6 +16,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::security::SecurityLog;
+
 // ---------------------------------------------------------------------------
 // 解決ロジック(テスト容易性 — 環境変数ルックアップを注入できる純関数)
 // ---------------------------------------------------------------------------
@@ -125,6 +127,125 @@ fn create_data_dir(dir: &Path) -> Result<(), String> {
 #[cfg(windows)]
 fn create_data_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|_| "データディレクトリを作成できませんでした".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// 起動時パーミッション検査・是正(unix のみ — contracts/cli-config.md §4)
+// ---------------------------------------------------------------------------
+
+/// パーミッション検査・是正の結果(contracts/cli-config.md §4)。
+///
+/// 記録する対象名は data-dir 相対名のみ(絶対パス非漏洩 — Principle II)。
+/// `unfixable` が空でなければ共有保管物が守れていないため、呼び出し側は
+/// [`KeystoreHealth::Unavailable`](crate::identity::KeystoreHealth) へ写像する。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PermissionCheck {
+    /// 緩いパーミッションを是正した対象の data-dir 相対名。
+    pub fixed: Vec<String>,
+    /// 是正できなかった対象の data-dir 相対名(symlink・EPERM・EROFS 等)。
+    pub unfixable: Vec<String>,
+}
+
+impl PermissionCheck {
+    /// 是正不能な対象がなければ健全(全ペルソナ利用可)。
+    pub fn is_healthy(&self) -> bool {
+        self.unfixable.is_empty()
+    }
+}
+
+/// 起動時に data-dir と保管物のパーミッションを検査・是正する(unix — FR-013)。
+///
+/// 対象と是正値: data-dir → `0700`、`master.key`・`app.db`・`app.db-wal`・`app.db-shm`
+/// (存在するもの)→ `0600`。group/other ビット(`0o077`)が 1 つでも立っていれば是正
+/// 対象とし、owner ビットのみ厳しい場合(例 `0400`)は他ユーザー開放がないため是正しない。
+/// symlink は追従せず是正不能として扱う(第三者ファイルの mode 改変を避ける)。
+///
+/// 是正成功 → `key_permission_fixed` を記録して継続。是正失敗(`EPERM`・`EROFS`・IO
+/// エラー・symlink)→ `key_permission_unfixable` を記録・警告し、[`PermissionCheck`] の
+/// `unfixable` に載せる(呼び出し側が全ペルソナ利用不可へ写像する)。**起動と発見・伝搬
+/// 機能は継続する**(MUST)。記録・警告に鍵素材・絶対パスは含めない(FR-011/FR-014)。
+#[cfg(unix)]
+pub fn enforce_permissions(data_dir: &Path, security: &SecurityLog) -> PermissionCheck {
+    let mut check = PermissionCheck::default();
+    // (相対名, 絶対パス, 是正 mode)。data-dir 自身は "." として記録する。
+    let targets: [(&str, PathBuf, u32); 5] = [
+        (".", data_dir.to_path_buf(), 0o700),
+        ("master.key", data_dir.join("master.key"), 0o600),
+        ("app.db", data_dir.join("app.db"), 0o600),
+        ("app.db-wal", data_dir.join("app.db-wal"), 0o600),
+        ("app.db-shm", data_dir.join("app.db-shm"), 0o600),
+    ];
+    for (name, path, mode) in targets {
+        match enforce_one(&path, mode) {
+            EnforceOutcome::Absent | EnforceOutcome::AlreadyStrict => {}
+            EnforceOutcome::Fixed => {
+                check.fixed.push(name.to_string());
+                security.log(
+                    crate::security::SecurityCategory::KeyPermissionFixed,
+                    name,
+                    "保管物のパーミッションを是正しました",
+                );
+            }
+            EnforceOutcome::Unfixable => {
+                check.unfixable.push(name.to_string());
+                security.log(
+                    crate::security::SecurityCategory::KeyPermissionUnfixable,
+                    name,
+                    "保管物のパーミッションを是正できませんでした",
+                );
+            }
+        }
+    }
+    if !check.unfixable.is_empty() {
+        // 定型警告(鍵素材・絶対パスなし — FR-011/FR-014)。原因の区別は
+        // key_permission_unfixable の記録と本警告で成立する(key-envelope.md §5)。
+        tracing::warn!(
+            "保管ファイルのアクセス権を是正できないため、全ペルソナを利用できません(発見・伝搬は継続します)"
+        );
+    }
+    check
+}
+
+/// 単一対象の是正結果。
+#[cfg(unix)]
+enum EnforceOutcome {
+    /// 対象が存在しない。
+    Absent,
+    /// 既に他ユーザー開放がない(是正不要)。
+    AlreadyStrict,
+    /// 緩いパーミッションを是正した。
+    Fixed,
+    /// 是正できなかった(symlink・chmod 失敗)。
+    Unfixable,
+}
+
+/// 1 対象を検査・是正する(symlink は追従しない — `lstat` 相当の `symlink_metadata`)。
+#[cfg(unix)]
+fn enforce_one(path: &Path, target_mode: u32) -> EnforceOutcome {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        // 存在しない・stat 不能はスキップ(WAL/SHM は無いこともある)。
+        return EnforceOutcome::Absent;
+    };
+    let mode = meta.permissions().mode() & 0o7777;
+    // 他ユーザー(group/other)への開放がなければ是正不要(owner のみ厳しい 0400 等も含む)。
+    if mode & 0o077 == 0 {
+        return EnforceOutcome::AlreadyStrict;
+    }
+    // symlink は追従して mode を変えない(第三者ファイル改変の回避 — §4)。
+    if meta.file_type().is_symlink() {
+        return EnforceOutcome::Unfixable;
+    }
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(target_mode)) {
+        Ok(()) => EnforceOutcome::Fixed,
+        Err(_) => EnforceOutcome::Unfixable,
+    }
+}
+
+/// Windows: パーミッション検査は no-op(DPAPI がアカウントスコープを担保 — §4)。
+#[cfg(windows)]
+pub fn enforce_permissions(_data_dir: &Path, _security: &SecurityLog) -> PermissionCheck {
+    PermissionCheck::default()
 }
 
 // ---------------------------------------------------------------------------
