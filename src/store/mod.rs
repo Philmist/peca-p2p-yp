@@ -3,7 +3,8 @@
 //! 永続エンティティ(personas / peers / mutes / settings)の CRUD を提供する
 //! (data-model.md rev 2 準拠 — relays テーブルは存在しない。FR-014)。
 //!
-//! - 本番配置は `%APPDATA%\peca-p2p-yp\app.db`([`Store::open_default`])。
+//! - 本番配置はプラットフォーム別に解決した data-dir の `app.db`
+//!   ([`Store::open_default`] — contracts/cli-config.md §1)。
 //!   テスト・多ノード起動用に任意パス([`Store::open_at`] / [`Store::open_in_dir`])と
 //!   インメモリ([`Store::open_in_memory`])のコンストラクタを持つ。
 //! - スキーマは `schema.sql` を `include_str!` で埋め込み、起動時に冪等適用する。
@@ -13,7 +14,7 @@
 //!   (Principle II)。SQLite の原因は `source()` 経由でのみ内部ログに供給する。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -223,11 +224,9 @@ pub struct Store {
 }
 
 impl Store {
-    /// 本番配置(`%APPDATA%\peca-p2p-yp\app.db`)で開く。
+    /// 本番配置(contracts/cli-config.md §1 の優先順で解決した data-dir の `app.db`)で開く。
     pub fn open_default() -> Result<Self> {
-        let base = std::env::var_os("APPDATA").ok_or(StoreError::Environment)?;
-        let mut dir = PathBuf::from(base);
-        dir.push("peca-p2p-yp");
+        let dir = crate::platform::ensure_data_dir(None).map_err(|_| StoreError::Environment)?;
         Self::open_in_dir(dir)
     }
 

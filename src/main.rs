@@ -21,7 +21,7 @@ use peca_p2p_yp::config::{self, CliOverrides, Settings};
 use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
-use peca_p2p_yp::identity::IdentityManager;
+use peca_p2p_yp::identity::{IdentityManager, Keystore, keystore};
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::P2pRuntime;
@@ -169,7 +169,23 @@ async fn run() -> Result<(), i32> {
     }
 
     // 14. ペルソナ管理と掲載エンジン(T028/T029)。
-    let identity = Arc::new(IdentityManager::new(Arc::clone(&store)));
+    //     keystore 初期化: 既存に自プラットフォーム scheme のペルソナがあるか判定し、
+    //     master.key を読込/生成する(ADR-0008 §4/§5)。
+    // TODO(T020/T021): KeystoreInit の反映(KeystoreHealth 化)と起動順序の是正
+    //   (keystore 初期化をリスナーバインド前へ移動)。
+    let has_encrypted_personas = store
+        .list_personas()
+        .map(|ps| {
+            ps.iter()
+                .any(|p| keystore::is_current_scheme(&p.secret_enc))
+        })
+        .unwrap_or(false);
+    let (keystore, _keystore_init) =
+        Keystore::open(&data_dir, has_encrypted_personas).map_err(|e| {
+            eprintln!("{e}");
+            1
+        })?;
+    let identity = Arc::new(IdentityManager::new(Arc::clone(&store), keystore));
     let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
     let engine = Arc::new(PublishEngine::new(
         Arc::clone(&identity),
@@ -443,18 +459,15 @@ fn spawn_sweep_loop(hub: Arc<GossipHub>, mut shutdown: watch::Receiver<bool>) ->
     })
 }
 
-/// data-dir を解決する。`--data-dir` 未指定時は `%APPDATA%\peca-p2p-yp`。
+/// data-dir を解決し、存在しなければ作成する(contracts/cli-config.md §1)。
+///
+/// 解決優先順は `platform::ensure_data_dir` に委譲する(unix では mode 0700 で作成)。
+/// 解決不能の場合は定型メッセージを標準エラーへ出力して終了コード 2 を返す(FR-014)。
 fn resolve_data_dir(overrides: &CliOverrides) -> Result<PathBuf, i32> {
-    if let Some(dir) = &overrides.data_dir {
-        return Ok(dir.clone());
-    }
-    match std::env::var_os("APPDATA") {
-        Some(base) => Ok(PathBuf::from(base).join("peca-p2p-yp")),
-        None => {
-            eprintln!("APPDATA が未設定です。--data-dir を指定してください");
-            Err(2)
-        }
-    }
+    peca_p2p_yp::platform::ensure_data_dir(overrides.data_dir.as_deref()).map_err(|msg| {
+        eprintln!("{msg}");
+        2
+    })
 }
 
 /// tracing のコンソール出力を初期化する。既定は INFO で、`RUST_LOG` は

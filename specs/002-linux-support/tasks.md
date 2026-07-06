@@ -44,17 +44,17 @@
 
 **⚠️ 順序**: T016 は keystore 実装(T004〜T007)そのものを検証する契約テストであるため、US2 から本フェーズへ前倒しする。**T016 を先に作成し、失敗する状態(未実装によるコンパイル失敗を含む)を確認してから T004 以降の実装に着手する**(constitution Principle IV / 実装中ゲート 5)。
 
-- [ ] T016 [P] [US2] `tests/contract/key_envelope.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する: contracts/key-envelope.md §6 の契約テスト #1〜#9 — ①protect 出力が `PYK1` + 現プラットフォーム scheme で始まり平文 32 bytes 非含有 ②roundtrip 一致 ③payload/tag 1bit 破壊 → Unusable(パニックしない) ④他プラットフォーム/未知 scheme → Unusable ⑤(windows) レガシー BLOB 復号可 ⑥(unix) magic なし BLOB → Unusable ⑦(unix) master.key 欠如時に 0600 で生成・既存暗号化ペルソナありなら警告 ⑧(unix) 別 master.key では復号不能 ⑨(unix) AAD 改竄で復号失敗。**作成時点で全テストが失敗することを確認する**
+- [X] T016 [P] [US2] `tests/contract/key_envelope.rs` を新規作成し `Cargo.toml` に `[[test]]` 登録する: contracts/key-envelope.md §6 の契約テスト #1〜#9 — ①protect 出力が `PYK1` + 現プラットフォーム scheme で始まり平文 32 bytes 非含有 ②roundtrip 一致 ③payload/tag 1bit 破壊 → Unusable(パニックしない) ④他プラットフォーム/未知 scheme → Unusable ⑤(windows) レガシー BLOB 復号可 ⑥(unix) magic なし BLOB → Unusable ⑦(unix) master.key 欠如時に 0600 で生成・既存暗号化ペルソナありなら警告 ⑧(unix) 別 master.key では復号不能 ⑨(unix) AAD 改竄で復号失敗。**作成時点で全テストが失敗することを確認する**
 
 ### Implementation for Foundational
 
-- [ ] T003 [P] `src/platform/mod.rs` を新規作成し、data-dir 解決を実装する: 優先順 `--data-dir` > `$STATE_DIRECTORY`(unix・複数列挙時は先頭)> `%APPDATA%\peca-p2p-yp`(Windows)/ `$XDG_STATE_HOME/peca-p2p-yp`(unix)> `~/.local/state/peca-p2p-yp`。unix では data-dir を mode `0700` で再帰作成。解決不能時は定型メッセージ + 終了コード 2(contracts/cli-config.md §1)。`src/lib.rs` に `mod platform` を登録する
-- [ ] T004 [P] `src/identity/keystore/mod.rs` を新規作成し、鍵エンベロープを実装する: `magic "PYK1" || scheme(1byte) || payload` の encode/decode、`protect(&[u8]) -> Vec<u8>` / `unprotect(&[u8]) -> Result<...>` 共通入口、読込規則(magic なし → レガシー DPAPI BLOB 扱い、他プラットフォーム/未知 scheme → Unusable でパニック禁止)、書込みは常にエンベロープ形式(contracts/key-envelope.md §1〜§3)
-- [ ] T005 [P] `src/identity/mod.rs` 内の既存 `mod dpapi` を `src/identity/keystore/dpapi.rs` へ `#[cfg(windows)]` で移設する(挙動不変・scheme 0x01 として keystore から呼ばれる)(research R1)
-- [ ] T006 [P] `src/identity/keystore/file_key.rs` を `#[cfg(unix)]` で新規作成する: master.key 読込/生成(`O_CREAT|O_EXCL` + mode `0600` で原子的生成、`EEXIST` 時は既存読込へフォールバック、32 bytes サイズ検証 → 不一致は破損扱い、暗号化済みペルソナ存在下での新規生成時は「保護鍵消失疑い」警告)+ XChaCha20-Poly1305 protect/unprotect(nonce 24 bytes 前置、AAD = `magic || scheme`)+ 鍵素材・中間バッファの `zeroize`、鍵保持型の `Debug` redaction(contracts/key-envelope.md §4・§5)
-- [ ] T007 `src/identity/mod.rs` の `dpapi::protect` / `dpapi::unprotect` 直接呼出しを `keystore::protect` / `keystore::unprotect` へ置換する。復号失敗 → 当該ペルソナのみ `usable: false`(既存 ADR-0003 §4 挙動維持)。既存 unit テスト(`dpapi_roundtrip` 等)を keystore 経由に更新する(T004〜T006 完了後)
-- [ ] T008 [P] `src/store/mod.rs` の `open_default` を `platform::data_dir` 使用へ変更する(T003 完了後)
-- [ ] T009 [P] `src/main.rs` の `resolve_data_dir` を `platform` モジュールの解決へ差し替える(既存 CLI `--data-dir` の意味論不変 — contracts/cli-config.md)(T003 完了後)
+- [X] T003 [P] `src/platform/mod.rs` を新規作成し、data-dir 解決を実装する: 優先順 `--data-dir` > `$STATE_DIRECTORY`(unix・複数列挙時は先頭)> `%APPDATA%\peca-p2p-yp`(Windows)/ `$XDG_STATE_HOME/peca-p2p-yp`(unix)> `~/.local/state/peca-p2p-yp`。unix では data-dir を mode `0700` で再帰作成。解決不能時は定型メッセージ + 終了コード 2(contracts/cli-config.md §1)。`src/lib.rs` に `mod platform` を登録する
+- [X] T004 [P] `src/identity/keystore/mod.rs` を新規作成し、鍵エンベロープを実装する: `magic "PYK1" || scheme(1byte) || payload` の encode/decode、`protect(&[u8]) -> Vec<u8>` / `unprotect(&[u8]) -> Result<...>` 共通入口、読込規則(magic なし → レガシー DPAPI BLOB 扱い、他プラットフォーム/未知 scheme → Unusable でパニック禁止)、書込みは常にエンベロープ形式(contracts/key-envelope.md §1〜§3)
+- [X] T005 [P] `src/identity/mod.rs` 内の既存 `mod dpapi` を `src/identity/keystore/dpapi.rs` へ `#[cfg(windows)]` で移設する(挙動不変・scheme 0x01 として keystore から呼ばれる)(research R1)
+- [X] T006 [P] `src/identity/keystore/file_key.rs` を `#[cfg(unix)]` で新規作成する: master.key 読込/生成(`O_CREAT|O_EXCL` + mode `0600` で原子的生成、`EEXIST` 時は既存読込へフォールバック、32 bytes サイズ検証 → 不一致は破損扱い、暗号化済みペルソナ存在下での新規生成時は「保護鍵消失疑い」警告)+ XChaCha20-Poly1305 protect/unprotect(nonce 24 bytes 前置、AAD = `magic || scheme`)+ 鍵素材・中間バッファの `zeroize`、鍵保持型の `Debug` redaction(contracts/key-envelope.md §4・§5)
+- [X] T007 `src/identity/mod.rs` の `dpapi::protect` / `dpapi::unprotect` 直接呼出しを `keystore::protect` / `keystore::unprotect` へ置換する。復号失敗 → 当該ペルソナのみ `usable: false`(既存 ADR-0003 §4 挙動維持)。既存 unit テスト(`dpapi_roundtrip` 等)を keystore 経由に更新する(T004〜T006 完了後)
+- [X] T008 [P] `src/store/mod.rs` の `open_default` を `platform::data_dir` 使用へ変更する(T003 完了後)
+- [X] T009 [P] `src/main.rs` の `resolve_data_dir` を `platform` モジュールの解決へ差し替える(既存 CLI `--data-dir` の意味論不変 — contracts/cli-config.md)(T003 完了後)
 
 **Checkpoint**: `cargo build` が Windows・Linux の両方で成功し(FR-001 の型レベル成立)、T016 の契約テストが両プラットフォームで通過する
 
