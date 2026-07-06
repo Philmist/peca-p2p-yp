@@ -106,7 +106,7 @@ impl AnnouncerNode {
             true, // PEX 有効
         ));
         let (sd_tx, sd_rx) = watch::channel(false);
-        let mut handles = runtime.spawn(p2p_listener, sd_rx.clone());
+        let mut handles = runtime.spawn(p2p_listener.into_iter().collect(), sd_rx.clone());
 
         // PCP 待受(loopback 任意ポート)。
         let pcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

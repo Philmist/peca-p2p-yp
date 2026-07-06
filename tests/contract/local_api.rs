@@ -332,7 +332,7 @@ async fn get_settings_returns_all_keys_with_defaults() {
     assert_eq!(json.as_object().unwrap().len(), 13);
     assert_eq!(json["pcp_bind"], "127.0.0.1:7146");
     assert_eq!(json["http_bind"], "127.0.0.1:7180");
-    assert_eq!(json["p2p_bind"], "0.0.0.0:7147");
+    assert_eq!(json["p2p_bind"], "0.0.0.0:7147,[::]:7147");
     assert_eq!(json["event_store_max"], 4096);
     assert_eq!(json["pex_enabled"], true);
     assert_eq!(json["index_txt_encoding"], "utf-8");

@@ -22,7 +22,7 @@ use crate::store::{Store, StoreError};
 
 const DEFAULT_PCP_BIND: &str = "127.0.0.1:7146";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7180";
-const DEFAULT_P2P_BIND: &str = "0.0.0.0:7147";
+const DEFAULT_P2P_BIND: &str = "0.0.0.0:7147,[::]:7147";
 const DEFAULT_P2P_OUTBOUND_TARGET: u32 = 8;
 const DEFAULT_P2P_INBOUND_MAX: u32 = 32;
 const DEFAULT_PEX_ENABLED: bool = true;
@@ -241,10 +241,9 @@ impl Settings {
     pub fn validate(&self) -> Result<(), ConfigError> {
         require_loopback(KEY_PCP_BIND, &self.pcp_bind)?;
         require_loopback(KEY_HTTP_BIND, &self.http_bind)?;
-        // p2p_bind: 空は待受無効、非空はパース可能であること(loopback 強制なし)
-        if !self.p2p_bind.is_empty() && self.p2p_bind.parse::<SocketAddr>().is_err() {
-            return Err(ConfigError::InvalidBind { key: KEY_P2P_BIND });
-        }
+        // p2p_bind: 空は待受無効、非空はカンマ区切り各要素がパース可能であること
+        // (loopback 強制なし — ADR-0008)。
+        parse_bind_list(KEY_P2P_BIND, &self.p2p_bind)?;
         self.index_encoding()?;
         Ok(())
     }
@@ -259,12 +258,10 @@ impl Settings {
         parse_bind(KEY_HTTP_BIND, &self.http_bind)
     }
 
-    /// P2P 待受アドレス。空文字(待受無効)は `None`。
-    pub fn p2p_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
-        if self.p2p_bind.is_empty() {
-            return Ok(None);
-        }
-        parse_bind(KEY_P2P_BIND, &self.p2p_bind).map(Some)
+    /// P2P 待受アドレス列(ADR-0008)。カンマ区切りの各要素をパースする。
+    /// 空文字・空要素のみ(待受無効=外向きのみ — FR-016)は空 `Vec`。
+    pub fn p2p_addr(&self) -> Result<Vec<SocketAddr>, ConfigError> {
+        parse_bind_list(KEY_P2P_BIND, &self.p2p_bind)
     }
 
     /// index.txt の出力エンコーディング。
@@ -364,6 +361,20 @@ fn parse_bind(key: &'static str, value: &str) -> Result<SocketAddr, ConfigError>
         .map_err(|_| ConfigError::InvalidBind { key })
 }
 
+/// カンマ区切りのバインドアドレス列をパースする(ADR-0008)。
+///
+/// 各要素は前後空白をトリムし、空要素(連続カンマ・末尾カンマ)は無視する。
+/// 非空の要素が一つでもパース不能なら [`ConfigError::InvalidBind`]。
+/// 空文字・空要素のみは空 `Vec`(待受無効の表現)。
+fn parse_bind_list(key: &'static str, value: &str) -> Result<Vec<SocketAddr>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| parse_bind(key, s))
+        .collect()
+}
+
 /// loopback バインド強制(ADR-0006 決定 4)。非 loopback・書式不正・空は拒否。
 fn require_loopback(key: &'static str, value: &str) -> Result<(), ConfigError> {
     let addr = parse_bind(key, value)?;
@@ -388,7 +399,7 @@ mod tests {
         let d = Settings::default();
         assert_eq!(d.pcp_bind, "127.0.0.1:7146");
         assert_eq!(d.http_bind, "127.0.0.1:7180");
-        assert_eq!(d.p2p_bind, "0.0.0.0:7147");
+        assert_eq!(d.p2p_bind, "0.0.0.0:7147,[::]:7147");
         assert_eq!(d.p2p_outbound_target, 8);
         assert_eq!(d.p2p_inbound_max, 32);
         assert!(d.pex_enabled);
@@ -494,19 +505,66 @@ mod tests {
 
     #[test]
     fn p2p_bind_allows_any_and_empty() {
-        // 非 loopback でも p2p は許容
+        // 非 loopback でも p2p は許容(単一)
         let mut s = Settings {
             p2p_bind: "0.0.0.0:7147".to_string(),
             ..Default::default()
         };
         assert!(s.validate().is_ok());
-        assert_eq!(s.p2p_addr().unwrap(), Some("0.0.0.0:7147".parse().unwrap()));
-        // 空文字 = 待受無効
+        assert_eq!(s.p2p_addr().unwrap(), vec!["0.0.0.0:7147".parse().unwrap()]);
+        // 空文字 = 待受無効(空 Vec)
         s.p2p_bind = String::new();
         assert!(s.validate().is_ok());
-        assert_eq!(s.p2p_addr().unwrap(), None);
+        assert!(s.p2p_addr().unwrap().is_empty());
         // 書式不正は拒否
         s.p2p_bind = "not-an-addr".to_string();
+        assert!(matches!(
+            s.validate(),
+            Err(ConfigError::InvalidBind { key: "p2p_bind" })
+        ));
+    }
+
+    #[test]
+    fn p2p_bind_parses_comma_separated_list() {
+        // カンマ区切りで IPv4/IPv6 デュアルスタック(ADR-0008 決定1)
+        let s = Settings {
+            p2p_bind: "0.0.0.0:7147,[::]:7147".to_string(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+        assert_eq!(
+            s.p2p_addr().unwrap(),
+            vec![
+                "0.0.0.0:7147".parse().unwrap(),
+                "[::]:7147".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn p2p_bind_trims_whitespace_and_skips_empty_elements() {
+        // 前後空白のトリムと、連続カンマ・末尾カンマの空要素無視
+        let s = Settings {
+            p2p_bind: " 0.0.0.0:7147 , ,[::]:7147,".to_string(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+        assert_eq!(
+            s.p2p_addr().unwrap(),
+            vec![
+                "0.0.0.0:7147".parse().unwrap(),
+                "[::]:7147".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn p2p_bind_rejects_when_any_element_invalid() {
+        // 1 要素でもパース不能なら全体を InvalidBind として拒否
+        let s = Settings {
+            p2p_bind: "0.0.0.0:7147,not-an-addr".to_string(),
+            ..Default::default()
+        };
         assert!(matches!(
             s.validate(),
             Err(ConfigError::InvalidBind { key: "p2p_bind" })
