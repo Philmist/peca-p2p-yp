@@ -113,18 +113,26 @@ fmt / clippy / 全テスト(cucumber 含む)が同一に通過すること。
 
 ## セキュリティシナリオとテストの対応(トレーサビリティ)
 
-spec のセキュリティシナリオ 7 本の検証割り当て。tasks.md 生成時に各セルを具体的な
-テスト ID へ落とすこと(割り当てのないシナリオを作らない)。
+spec のセキュリティシナリオ 7 本の検証割り当て(実装済みテスト ID へ更新済み — T034)。
+contract テストは `tests/contract/`、cucumber シナリオは `tests/features/security.feature`
+(ステップ定義: `tests/steps/keystore.rs`)にある。割り当てのないシナリオはない。
 
-| Gherkin シナリオ(spec) | contract テスト | cucumber | 手動(quickstart) |
+| Gherkin シナリオ(spec) | contract テスト | cucumber(security.feature) | 手動(quickstart) |
 |---|---|---|---|
-| 平文非永続化 | key-envelope #1 | at-rest 保護シナリオ | 検証3-1 |
-| 別アカウント復号不能 | key-envelope #8 | —(マルチアカウントは CI 不能) | 検証3-2, 3-3 |
-| パーミッション自動是正 | cli-config §7 #3 | 是正シナリオ | 検証3-4 |
-| 是正不能の部分劣化 | cli-config §7 #4 | 部分劣化シナリオ | 検証3-5 |
-| 復号不能データの隔離 | key-envelope #3, #4, #6 | 隔離シナリオ | 検証3-2 |
-| 秘密鍵のログ非出力 | —(全テストの事後アサーション) | 各シナリオでログ検査 | 検証3-7, 検証4-2 |
-| バインド失敗時の非漏洩 | cli-config §7 #5 | — | 検証6 |
+| 平文非永続化 | `key_envelope.rs::protect_output_is_envelope_without_plaintext`(#1) | 「ペルソナ秘密鍵の平文非永続化」 | 検証3-1 |
+| 別アカウント復号不能 | `key_envelope.rs::different_master_key_cannot_decrypt`(#8) | —(マルチアカウントは CI 不能) | 検証3-2, 3-3 |
+| パーミッション自動是正 | `cli_config.rs::loose_master_key_and_db_are_fixed_and_recorded`(§7 #3) | 「緩いパーミッションの自動是正」 | 検証3-4 |
+| 是正不能の部分劣化 | `cli_config.rs::unfixable_symlink_is_reported_and_recorded`(§7 #4) | 「是正不能時の部分劣化」 | 検証3-5 |
+| 復号不能データの隔離 | `key_envelope.rs::corrupted_payload_is_unusable_not_panic`(#3)/`foreign_and_unknown_scheme_is_unusable`(#4)/`legacy_blob_without_magic_is_unusable_on_unix`(#6) | 「復号不能データの隔離」 | 検証3-2 |
+| 秘密鍵のログ非出力 | —(全テストの事後アサーション) | 各シナリオの事後アサーション(hex 64 桁・`nsec1…`・部分文字列・Debug 表現の非出力検査) | 検証3-7, 検証4-2 |
+| バインド失敗時の非漏洩 | `platform_startup.rs::port_in_use_exits_nonzero_with_typed_message`(§7 #5) | — | 検証6 |
+
+補助対応(表外): data-dir 解決順は `cli_config.rs::cli_data_dir_beats_all_env_sources` /
+`state_directory_beats_xdg_and_home` / `state_directory_colon_separated_uses_first` /
+`xdg_state_home_beats_home` / `home_dot_local_state_fallback` / `unresolvable_without_any_source_returns_err`
+(cli-config §7 #1・#2)、複数インスタンスは `platform_startup.rs::two_instances_run_concurrently`
+(§7 #6)、SIGTERM/sd_notify は `graceful_shutdown.rs::sigterm_causes_graceful_shutdown_with_exit_code_0` /
+`sd_notify_ready_and_stopping_delivered_via_notify_socket`(systemd-service §1)が検証する。
 
 FR-007(nsec エクスポート・破棄の同一意味論)は新規テストを追加せず、既存 001 の
 contract / cucumber テストが Linux CI でも同一に通過すること(SC-002 — research R10)で

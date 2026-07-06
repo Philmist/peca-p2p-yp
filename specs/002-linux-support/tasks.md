@@ -129,8 +129,9 @@
 - [X] T028 [US3] `src/main.rs` を配線する: `ctrl_c` 直書きを `platform::shutdown_signal()` へ差替え、全リスナーバインド成功後に `READY=1`、shutdown 開始時に `STOPPING=1` を送信してから既存 watch チャネル経路で全サブシステム停止(FR-008/FR-009、SC-004)(T026・T027 完了後)
 - [X] T029 [US3] `src/main.rs` の tracing 初期化で出力先が端末でないとき ANSI エスケープを無効化する(`with_ansi(IsTerminal)` — research R8、FR-011)(T028 と同一ファイルのため順次)
 - [X] T030 [P] [US3] `contrib/systemd/peca-p2p-yp.service` を新規作成する: contracts/systemd-service.md §2 の unit 全文(`Type=notify`・`StateDirectory=peca-p2p-yp`・`StateDirectoryMode=0700`・`UMask=0077`・`Restart=on-failure`・ハードニング群・`RestrictAddressFamilies` に `AF_UNIX` 含む・`TimeoutStopSec` 非指定)
-- [ ] T031 [US3] systemd 実機で quickstart 検証 4 を実施する: `systemctl start` → active(READY 後に返る)、`journalctl` に起動サマリ(ANSI・秘密鍵なし)、`systemctl stop` が 90 秒以内・`ExecMainStatus=0`(SC-004)、`kill -9` → 自動再起動、data-dir = `/var/lib/peca-p2p-yp`(systemd-service §3)、および上記すべてがデスクトップセッション・対話操作なしのヘッドレス環境(nologin のサービスアカウント)で完了すること(ヘッドレス無人稼働 — FR-005/SC-003)
+- [X] T031 [US3] systemd 実機で quickstart 検証 4 を実施する: `systemctl start` → active(READY 後に返る)、`journalctl` に起動サマリ(ANSI・秘密鍵なし)、`systemctl stop` が 90 秒以内・`ExecMainStatus=0`(SC-004)、`kill -9` → 自動再起動、data-dir = `/var/lib/peca-p2p-yp`(systemd-service §3)、および上記すべてがデスクトップセッション・対話操作なしのヘッドレス環境(nologin のサービスアカウント)で完了すること(ヘッドレス無人稼働 — FR-005/SC-003)
   - 2026-07-06 注記: 実装(T025〜T030)は完了し、SIGTERM → exit 0・NOTIFY_SOCKET 経由 READY/STOPPING は統合テストで自動検証済み。本タスクの systemd 実機検証は開発環境(WSL2・systemd offline)では実施不能のため、systemd 稼働環境での実施が必要
+  - 2026-07-07 完了(Debian 12 実機・systemd 稼働環境): quickstart 検証 4 の 1〜6 を利用者が実施・確認済み。systemd 側の残存証跡とも整合 — `Type=notify` の unit が `Result=success`・`ExecMainStatus=0`(graceful stop、SC-004)・`NRestarts=1`(`kill -9` → `Restart=on-failure` による自動再起動)・`User=peca-p2p-yp`(nologin サービスアカウントによるヘッドレス無人稼働)・`StateDirectory=peca-p2p-yp`(data-dir = `/var/lib/peca-p2p-yp`)
 
 **Checkpoint**: 全ユーザーストーリーが独立に機能
 
@@ -140,10 +141,12 @@
 
 **Purpose**: ドキュメント・最終検証・リリースゲート
 
-- [ ] T032 [P] `README.md` に Linux 導入・稼働手順と systemd サービス登録手順(quickstart 検証 4 の手順・複数インスタンス用テンプレート unit `peca-p2p-yp@.service` への言及を含む)を追記する(FR-012)
+- [X] T032 [P] `README.md` に Linux 導入・稼働手順と systemd サービス登録手順(quickstart 検証 4 の手順・複数インスタンス用テンプレート unit `peca-p2p-yp@.service` への言及を含む)を追記する(FR-012)
 - [ ] T033 [P] Linux/Windows 実機で quickstart 検証 5〜7 を実施する: 複数インスタンス同時稼働(FR-010)、起動失敗の定型エラー(FR-014)、Windows 後方互換(レガシー DPAPI BLOB のペルソナが利用可・新規は `PYK1` scheme 0x01)
-- [ ] T034 `specs/002-linux-support/quickstart.md` のトレーサビリティ表の各セルを実装済みテスト ID(ファイル名・テスト関数名)へ更新し、割り当てのないシナリオがないことを確認する
+  - 2026-07-07 部分実施済み(Debian 12 実機・実バイナリ): **検証 5** — 2 インスタンスが独立 data-dir(各 `0700`・個別 `master.key 0600`/`app.db 0600`)で同時稼働、ピア登録 → 双方向 established(片側は PEX 学習 `source:"pex"`)を確認。**検証 6** — 特権ポート(`--p2p-bind 0.0.0.0:80`)は「P2P 待受アドレスにバインドできませんでした(権限が不足しています)」、使用中ポートは「HTTP 待受アドレスにバインドできませんでした(ポートが使用中です)」で exit 1、スタックトレース・内部パスなし。**残(要 Windows 実機): 検証 7 — 002 実装前 DB のレガシー DPAPI BLOB 後方互換の手動確認(読込後方互換自体は windows CI の契約テスト `legacy_dpapi_blob_without_magic_decrypts` で自動検証済み)**
+- [X] T034 `specs/002-linux-support/quickstart.md` のトレーサビリティ表の各セルを実装済みテスト ID(ファイル名・テスト関数名)へ更新し、割り当てのないシナリオがないことを確認する
 - [ ] T035 最終ゲートを確認する: `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit` が緑、windows-latest / ubuntu-latest 両 CI ジョブで全テスト(cucumber 含む)が同一に通過(SC-002)、`SecurityCategory::ALL` 14 件の一致確認(data-model — リリース前ゲート)
+  - 2026-07-07 部分実施済み(Linux 側): `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit`(脆弱性 0・許容済み警告 1 件のみ)・`cargo test` 全緑(unit 218・contract/integration 全通過・cucumber 21/21)。`SecurityCategory::ALL` は 14 件で data-model と一致(`security/mod.rs` の網羅 unit テストも通過)。**残: windows-latest / ubuntu-latest 両 CI ジョブの通過確認(main への PR で発火)**
 
 ---
 
