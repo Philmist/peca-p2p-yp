@@ -46,8 +46,11 @@ const CH_PERSONA_B: &str = "00000000000000000000000000000006";
 /// スパム pubkey が保持できるイベント上限(EventStore の pubkey 単位クォータ — ADR-0004 §2)。
 const PUBKEY_QUOTA: usize = 64;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const LOG_TIMEOUT: Duration = Duration::from_secs(5);
+// 接続確立・セキュリティイベント記録待ちは遅い CI ランナー(windows-latest)の
+// オーバーヘッドを吸収できるよう余裕を持たせる。条件成立で即 return するため
+// green run のコストは実質ゼロ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const LOG_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// セキュリティシナリオ 1 個分の状態。
 #[derive(Default)]
