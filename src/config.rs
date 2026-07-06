@@ -287,7 +287,8 @@ pub struct CliOverrides {
     pub pcp_bind: Option<String>,
     pub http_bind: Option<String>,
     pub p2p_bind: Option<String>,
-    /// データディレクトリ(`app.db` の配置先)。未指定なら `%APPDATA%` を使う。
+    /// データディレクトリ(`app.db` の配置先)。未指定ならプラットフォーム別の
+    /// 既定パスを使う(解決順は `--help` / cli-config.md §1 を参照)。
     pub data_dir: Option<PathBuf>,
 }
 

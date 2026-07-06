@@ -232,6 +232,7 @@ impl PublishEngine {
 mod tests {
     use super::*;
     use crate::event::schema::Track;
+    use crate::identity::Keystore;
     use crate::store::Store;
 
     /// 発行イベントを記録するだけの sink。
@@ -274,7 +275,7 @@ mod tests {
 
     fn engine() -> (Arc<PublishEngine>, Arc<IdentityManager>, Arc<RecordingSink>) {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let identity = Arc::new(IdentityManager::new(store));
+        let identity = Arc::new(IdentityManager::new(store, Keystore::ephemeral()));
         let sink = Arc::new(RecordingSink::default());
         let engine = Arc::new(PublishEngine::new(
             Arc::clone(&identity),

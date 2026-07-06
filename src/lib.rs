@@ -3,6 +3,7 @@ pub mod event;
 pub mod identity;
 pub mod p2p;
 pub mod pcp;
+pub mod platform;
 pub mod security;
 pub mod store;
 pub mod web;
