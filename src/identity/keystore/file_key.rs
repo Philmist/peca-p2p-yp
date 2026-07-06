@@ -1,5 +1,5 @@
 //! Linux(unix)向けマスター鍵ファイルと XChaCha20-Poly1305 保護
-//! (scheme 0x02 — ADR-0008 §2/§4、key-envelope.md §1「scheme 0x02」・§5)。
+//! (scheme 0x02 — ADR-0009 §2/§4、key-envelope.md §1「scheme 0x02」・§5)。
 //!
 //! - payload 形式: `nonce(24) || ct_and_tag(48)`。nonce は暗号化ごとに OS CSPRNG で生成。
 //! - AAD = `magic || scheme`(呼び出し側が渡す 5 bytes — エンベロープヘッダの改竄で

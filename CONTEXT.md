@@ -58,6 +58,9 @@ HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015
 - ADR-0004: 脅威モデル(多層緩和・pubkey クォータ・PEX 残余リスク・プライバシー方針)
 - ADR-0005: gossip 形式的検証「該当」判定(PlusCal モデル = `docs/formal/gossip_propagation.tla`)
 - ADR-0006: トランスポート非暗号化・plain HTTP・LAN 公開オプトイン v1 非実装
+- ADR-0007: 許容的ライセンス(MIT)と GPL 結合回避の根拠
+- ADR-0008: P2P 待受のデュアルスタック化(`p2p_bind` カンマ区切り複数バインド)
+- ADR-0009: Linux 鍵保護(keystore 抽象・エンベロープ・マスター鍵)
 - security-review-checklist.md: セキュリティ PR のレビュー観点(実装中ゲート 6)
 - release-gate-check-2026-07-04.md: リリース前ゲート 8〜10 の適用記録
 

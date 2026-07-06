@@ -4,7 +4,7 @@
 //!   (ADR-0003 §6 — リンク推定防止)
 //! - 秘密鍵は keystore(プラットフォーム保護 — Windows は DPAPI、Linux は master.key +
 //!   XChaCha20-Poly1305)で暗号化したエンベロープのみを SQLite に保存する(平文保存
-//!   MUST NOT — data-model §Persona、ADR-0008)
+//!   MUST NOT — data-model §Persona、ADR-0009)
 //! - 復号失敗(エンベロープ破損・別アカウント・保護鍵消失・他プラットフォーム持込み)は
 //!   当該ペルソナを「利用不可」として扱い、起動・他機能は継続する(ADR-0003 §4)
 //! - 破棄 = 行削除。復元手段は提供しない(ADR-0003 §3)
@@ -134,7 +134,7 @@ pub struct PersonaInfo {
 /// ペルソナ管理(`Arc` 共有・Send+Sync)。
 pub struct IdentityManager {
     store: Arc<Store>,
-    /// 鍵保護の入口(プラットフォーム状態を保持 — ADR-0008)。
+    /// 鍵保護の入口(プラットフォーム状態を保持 — ADR-0009)。
     keystore: Keystore,
     /// 共有保管物起因の健全性(起動時検査から確定 — T020)。
     health: KeystoreHealth,

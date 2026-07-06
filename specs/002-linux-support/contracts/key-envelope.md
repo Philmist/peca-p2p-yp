@@ -3,7 +3,7 @@
 **Principles**: I, II | **FR**: FR-003, FR-004, FR-005, FR-006 | **正**: 本書(実装・テストは本書に従う)
 
 `personas.secret_enc`(SQLite BLOB)の内容形式と、Linux マスター鍵ファイルの契約。
-確定後は docs/adr/0008-linux-key-protection.md に決定として転記する。
+確定後は docs/adr/0009-linux-key-protection.md に決定として転記する。
 
 ## 1. エンベロープ形式
 

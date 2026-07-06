@@ -5,7 +5,7 @@
 spec の Technical Context に NEEDS CLARIFICATION はないが、spec Assumptions が
 「plan 段階で ADR 化して確定する」と委譲した事項(マスター鍵配置・AEAD 選定・
 `secret_enc` 識別方式)と、実装方式の未確定点を本書で確定する。
-R1〜R4 は **ADR-0008(docs/adr/0008-linux-key-protection.md)** へ転記して正式決定とする。
+R1〜R4 は **ADR-0009(docs/adr/0009-linux-key-protection.md)** へ転記して正式決定とする。
 
 ---
 

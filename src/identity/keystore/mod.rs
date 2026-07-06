@@ -1,4 +1,4 @@
-//! 鍵保護の共通入口(keystore 抽象 — ADR-0008 §1/§3)。
+//! 鍵保護の共通入口(keystore 抽象 — ADR-0009 §1/§3)。
 //!
 //! 正: `specs/002-linux-support/contracts/key-envelope.md`。
 //!

@@ -1,4 +1,4 @@
-# ADR-0008: Linux 鍵保護(keystore 抽象・エンベロープ・マスター鍵)
+# ADR-0009: Linux 鍵保護(keystore 抽象・エンベロープ・マスター鍵)
 
 **Status**: Accepted
 **Date**: 2026-07-06

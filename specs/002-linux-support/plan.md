@@ -63,10 +63,10 @@ data-dir + ポート個別指定で両立(FR-010 SHOULD — 既存 `--data-dir`/
 | 入力検証・trust nothing | II | PASS | ネットワーク入力経路に変更なし。新規入力はローカルファイル(master.key)のみで、長さ・パーミッション検証を行う(contracts/key-envelope.md) |
 | 既存の暗号論的に安全なライブラリ / 自前暗号禁止 | II | PASS | AEAD は RustCrypto `chacha20poly1305`(監査済み・pure Rust)。鍵生成は OS CSPRNG。自前アルゴリズムなし(research R2) |
 | 最小権限 | II | PASS | 鍵ファイル/DB `0600`・data-dir `0700`・自動是正(FR-013)。unit 例は NoNewPrivileges / ProtectSystem=strict / UMask=0077 等でハードニング(contracts/systemd-service.md) |
-| セキュリティ設計決定の ADR 化 | II, VI | PASS(条件付き) | 鍵エンベロープ・AEAD 選定・マスター鍵配置は **ADR-0008** として実装フェーズ冒頭に確定する(research.md の決定を正として転記)。spec Assumptions が plan 段階での ADR 化を要求 → 本 plan の research.md が草案、tasks で ADR-0008 作成をゲート化 |
+| セキュリティ設計決定の ADR 化 | II, VI | PASS(条件付き) | 鍵エンベロープ・AEAD 選定・マスター鍵配置は **ADR-0009** として実装フェーズ冒頭に確定する(research.md の決定を正として転記)。spec Assumptions が plan 段階での ADR 化を要求 → 本 plan の research.md が草案、tasks で ADR-0009 作成をゲート化 |
 | エラーの内部情報非漏洩 | II | PASS | FR-014。既存の定型メッセージ方式(main.rs / config.rs)を踏襲 |
 | Gherkin 振舞い定義 | IV | PASS | spec にセキュリティシナリオ 7 本 + 受け入れシナリオを記載済み。cucumber テストへの対応付けを quickstart.md / tasks で行う。ネガティブシナリオ(緩いパーミッション・復号不能データ・バインド失敗)を含む |
-| 形式的検証の要否判定 | V | PASS(対象外と判定) | 新規の並行アルゴリズム・プロトコル状態機械はない(鍵保護は逐次処理、shutdown は既存 watch チャネル経路の再利用)。「クリティカル」3 基準の第 1・2 を満たさないため PlusCal 対象外。判定理由は ADR-0008 に明記する(Principle V の MUST) |
+| 形式的検証の要否判定 | V | PASS(対象外と判定) | 新規の並行アルゴリズム・プロトコル状態機械はない(鍵保護は逐次処理、shutdown は既存 watch チャネル経路の再利用)。「クリティカル」3 基準の第 1・2 を満たさないため PlusCal 対象外。判定理由は ADR-0009 に明記する(Principle V の MUST) |
 | 原則トレーサビリティ | VI | PASS | 本表・research.md・contracts が原則番号を明記 |
 
 **違反なし** → Complexity Tracking は空。
@@ -76,9 +76,9 @@ data-dir + ポート個別指定で両立(FR-010 SHOULD — 既存 `--data-dir`/
 ログ要件(Security Requirements)に適合。エンベロープ後方互換(Windows 既存 BLOB)は
 復号経路のみで書込みは常に新形式 — ダウングレード攻撃面なし(contracts/key-envelope.md §4)。
 
-### ADR-0008 転記項目(実装フェーズ冒頭のゲート)
+### ADR-0009 転記項目(実装フェーズ冒頭のゲート)
 
-research R1〜R4 と contracts を正として、以下を `docs/adr/0008-linux-key-protection.md` に
+research R1〜R4 と contracts を正として、以下を `docs/adr/0009-linux-key-protection.md` に
 確定・転記する。**tasks.md はこの ADR 作成を実装タスクの先頭ゲートとすること**(spec
 Assumptions の要求。checklists/security.md CHK031 対応):
 
@@ -148,7 +148,7 @@ tests/
                                       # 復号不能隔離・SIGTERM 安全終了(spec Gherkin 対応)
 
 .github/workflows/ci.yml      # ubuntu-latest の build+test ジョブ追加(SC-002)
-docs/adr/0008-linux-key-protection.md  # 実装フェーズ冒頭で確定(research.md を正とする)
+docs/adr/0009-linux-key-protection.md  # 実装フェーズ冒頭で確定(research.md を正とする)
 README.md                      # Linux 導入・systemd 手順の追記(FR-012)
 ```
 

@@ -1,4 +1,4 @@
-//! Windows DPAPI ラッパ(ユーザースコープ・scheme 0x01 — ADR-0008 §1)。
+//! Windows DPAPI ラッパ(ユーザースコープ・scheme 0x01 — ADR-0009 §1)。
 //!
 //! payload は生 DPAPI BLOB(`CryptProtectData` / `CRYPTPROTECT_UI_FORBIDDEN`)。
 //! keystore がエンベロープ(magic || 0x01 || payload)を付与するため、本モジュールは

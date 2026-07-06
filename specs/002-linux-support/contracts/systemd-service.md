@@ -75,7 +75,7 @@ WantedBy=multi-user.target
   超えた場合は systemd による `SIGKILL` 強制終了に委ね、アプリ側の追加フェイルセーフは
   実装しない。SQLite は WAL + トランザクション境界により強制終了でもデータ破壊に至らず
   次回起動時に通常復旧し、`master.key` は生成後に書き換えないため影響を受けない。
-  この受容判断は ADR-0008 の受容事項に含める(Principle I — データ完全性)
+  この受容判断は ADR-0009 の受容事項に含める(Principle I — データ完全性)
 - `RestrictAddressFamilies` に `AF_UNIX` を含める(NOTIFY_SOCKET 送信に必要)
 - `Restart=on-failure`: 異常終了時の自動復帰(US3 シナリオ 4)。正常停止(exit 0)では
   再起動しない

@@ -1,7 +1,7 @@
 //! 契約テスト: 鍵エンベロープと master.key(002-linux-support T016)
 //!
 //! 正: `specs/002-linux-support/contracts/key-envelope.md` §6(契約テスト #1〜#9)。
-//! 設計決定は `docs/adr/0008-linux-key-protection.md`。
+//! 設計決定は `docs/adr/0009-linux-key-protection.md`。
 //!
 //! - 秘密鍵・鍵素材はログ・テスト出力・エラー文言へ出さない(FR-011 MUST NOT)。
 //!   本テストのダミー平文はコード内固定値のみで、`println!` 等で出力しない。

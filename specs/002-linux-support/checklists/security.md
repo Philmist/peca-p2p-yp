@@ -82,10 +82,10 @@
 
 ## 依存関係・前提(Dependencies & Assumptions)
 
-- [x] CHK030 新規暗号依存の選定根拠(監査・保守・供給網)が記録され、ADR-0008 への転記対象として特定されているか? [Dependency, research R2, plan §Constitution Check]
-  → **research R2 に供給網評価(RustCrypto 傘下・cargo audit 継続監視)を追記**。ADR-0008 転記項目 2 として plan に明記。
-- [x] CHK031 ADR-0008 に転記すべき決定事項の一覧と tasks でのゲート化前提が明記されているか? [Traceability, plan, Spec §Assumptions]
-  → **plan に「ADR-0008 転記項目」節を新設**(7 項目を列挙し、tasks.md が ADR 作成を先頭ゲートとする要求を明記)。
+- [x] CHK030 新規暗号依存の選定根拠(監査・保守・供給網)が記録され、ADR-0009 への転記対象として特定されているか? [Dependency, research R2, plan §Constitution Check]
+  → **research R2 に供給網評価(RustCrypto 傘下・cargo audit 継続監視)を追記**。ADR-0009 転記項目 2 として plan に明記。
+- [x] CHK031 ADR-0009 に転記すべき決定事項の一覧と tasks でのゲート化前提が明記されているか? [Traceability, plan, Spec §Assumptions]
+  → **plan に「ADR-0009 転記項目」節を新設**(7 項目を列挙し、tasks.md が ADR 作成を先頭ゲートとする要求を明記)。
 - [x] CHK032 systemd(`UMask=0077`/`StateDirectoryMode=0700`)と手動起動(umask 任意)の双方で FR-013 予防要件が成立することが検証されているか? [Assumption, systemd-service §2, cli-config §1]
   → **成立根拠を cli-config §4「予防の成立根拠」に記録**(master.key は umask 非依存の明示 0600、data-dir 0700 が主防壁、systemd 設定は多層防御、手動起動の残余は起動時検査が是正)。
 
@@ -93,5 +93,5 @@
 
 - 完了した項目は `[x]` にし、判断(受容・spec 修正・ADR 記載)をインラインで追記する
 - `[Gap]` 項目は「意図的除外の明記」でも解消とみなせる — その場合は spec/plan に一文を追加すること
-- 解消先の目安: 要件の変更 → spec.md、設計判断の記録 → ADR-0008(実装開始時)、検証割り当て → tasks.md
-- 2026-07-06 解消: spec.md(FR-013 精緻化・Assumptions 4 件追記)/ key-envelope.md(§3 レガシー・ロールバック、§4 zeroize 範囲・FR-011 検査範囲・脅威モデル限界、§5 生成順序・競合・障害原因識別)/ cli-config.md(§4 全面精緻化 + 意図的除外、§5 FR-014 合否基準を新設し以降を §6/§7 に繰上げ)/ data-model.md(KeystoreHealth の原因保持・API 応答)/ quickstart.md(検証3 精緻化・トレーサビリティ表)/ plan.md(ADR-0008 転記項目)/ research.md(R2 供給網評価)
+- 解消先の目安: 要件の変更 → spec.md、設計判断の記録 → ADR-0009(実装開始時)、検証割り当て → tasks.md
+- 2026-07-06 解消: spec.md(FR-013 精緻化・Assumptions 4 件追記)/ key-envelope.md(§3 レガシー・ロールバック、§4 zeroize 範囲・FR-011 検査範囲・脅威モデル限界、§5 生成順序・競合・障害原因識別)/ cli-config.md(§4 全面精緻化 + 意図的除外、§5 FR-014 合否基準を新設し以降を §6/§7 に繰上げ)/ data-model.md(KeystoreHealth の原因保持・API 応答)/ quickstart.md(検証3 精緻化・トレーサビリティ表)/ plan.md(ADR-0009 転記項目)/ research.md(R2 供給網評価)
