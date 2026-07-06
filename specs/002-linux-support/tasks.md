@@ -27,8 +27,8 @@
 
 **⚠️ GATE**: T001(ADR-0008)は plan.md「Constitution Check」の条件付き PASS を成立させる先頭ゲート。T001 完了までいかなる実装タスクにも着手しない(spec Assumptions / checklists/security.md CHK031)。
 
-- [ ] T001 ADR-0008 を `docs/adr/0008-linux-key-protection.md` に作成する。research.md R1〜R4 と contracts/ を正として、plan.md「ADR-0008 転記項目」の 7 項目(①cfg 集約方式 ②AEAD 選定と依存評価 ③エンベロープ形式・後方互換・レガシー残存/ロールバック非対応の受容 ④master.key 配置・生成順序・生成競合 ⑤脅威モデルの限界の受容 ⑥パーミッション検査の範囲と意図的除外 ⑦Principle V 非適用の判定理由)をすべて記載する
-- [ ] T002 `Cargo.toml` を更新する: `windows` クレートを `[target.'cfg(windows)'.dependencies]` へ移動し、`chacha20poly1305`・`zeroize` を `[target.'cfg(unix)'.dependencies]` へ追加する(research R1/R2)。Windows でビルドが従来どおり通ることを確認する
+- [X] T001 ADR-0008 を `docs/adr/0008-linux-key-protection.md` に作成する。research.md R1〜R4 と contracts/ を正として、plan.md「ADR-0008 転記項目」の 7 項目(①cfg 集約方式 ②AEAD 選定と依存評価 ③エンベロープ形式・後方互換・レガシー残存/ロールバック非対応の受容 ④master.key 配置・生成順序・生成競合 ⑤脅威モデルの限界の受容 ⑥パーミッション検査の範囲と意図的除外 ⑦Principle V 非適用の判定理由)をすべて記載する
+- [X] T002 `Cargo.toml` を更新する: `windows` クレートを `[target.'cfg(windows)'.dependencies]` へ移動し、`chacha20poly1305`・`zeroize` を `[target.'cfg(unix)'.dependencies]` へ追加する(research R1/R2)。Windows でビルドが従来どおり通ることを確認する
 
 **Checkpoint**: ADR-0008 確定・依存再配線済み(この時点で Linux ビルドはまだ失敗してよい)
 
