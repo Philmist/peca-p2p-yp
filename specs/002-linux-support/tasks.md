@@ -107,7 +107,8 @@
 - [X] T036 [US2] `tests/steps/` のステップ定義を実装し、T023 の cucumber シナリオ①〜④を事後アサーション(秘密鍵・nsec 非出力検査)を含めて全通過させる(T018〜T021 完了後)
 - [ ] T024 [US2] Linux 実機で quickstart 検証 3 を実施する: 平文非保存(strings 検査 + `PYK1` scheme 0x02)、鍵分離(DB 単体持出しで復号不能)、他アカウント遮断(Permission denied)、`chmod 644` → 自動是正 + `key_permission_fixed`、`chown root` → 部分劣化 + 発見機能継続、Windows ノードとの相互発見(SC-005)、nsec エクスポート/破棄の同一意味論(FR-007)
   - 2026-07-06 部分実施済み(Linux/WSL2・実バイナリ): API でペルソナ作成 → `secret_enc` が `PYK1` + scheme 0x02、strings 検査で nsec1 出現 0・64 桁 hex は公開鍵のみ、master.key 32 bytes `0600`・data-dir `0700`、`chmod 644 master.key` → 再起動で `0600` へ自動是正 + `key_permission_fixed` 記録・ペルソナ `usable:true` 維持、標準出力・security.log に秘密鍵/nsec 非出力。**残(要 root・複数アカウント・Windows ノード環境): 他アカウント遮断、`chown root` 部分劣化(cucumber ③ が symlink 代表で自動検証済み)、DB 単体持出し(contract #8 で自動検証済み)、Windows 相互発見(SC-005)、nsec エクスポート/破棄の手動比較**
-  - 2026-07-07 追実施(Debian 12 実機・root 検証): **`chown root master.key` → 部分劣化で欠陥を発見**(致命的エラー終了しノードが起動しない — FR-013 違反)。契約テスト #10(`unreadable_master_key_degrades_instead_of_failing`)を追加(失敗確認)→ `KeystoreInit::Unreadable` / `UnavailableCause::MasterKeyUnreadable` を導入して修正。修正後の実機再検証: 定型警告「保護鍵ファイルを読み取れません」+ 全ペルソナ `usable:false` + index.txt 200 継続 + 鍵操作は `persona_unusable` 拒否 + ログに秘密鍵/nsec 非出力を確認。他アカウント遮断も確認済み(`sudo -u nobody cat master.key app.db` → 両ファイルとも「許可がありません」— 利用者実施・2026-07-07)。**残(要 Windows ノード環境): Windows 相互発見(SC-005)、nsec エクスポート/破棄の手動比較**
+  - 2026-07-07 追実施(Debian 12 実機・root 検証): **`chown root master.key` → 部分劣化で欠陥を発見**(致命的エラー終了しノードが起動しない — FR-013 違反)。契約テスト #10(`unreadable_master_key_degrades_instead_of_failing`)を追加(失敗確認)→ `KeystoreInit::Unreadable` / `UnavailableCause::MasterKeyUnreadable` を導入して修正。修正後の実機再検証: 定型警告「保護鍵ファイルを読み取れません」+ 全ペルソナ `usable:false` + index.txt 200 継続 + 鍵操作は `persona_unusable` 拒否 + ログに秘密鍵/nsec 非出力を確認。他アカウント遮断も確認済み(`sudo -u nobody cat master.key app.db` → 両ファイルとも「許可がありません」— 利用者実施・2026-07-07)
+  - 2026-07-07 完了(利用者実施): 検証 3-6 Windows ノードとの相互発見(SC-005)を確認。あわせて「掲載終了前にペルソナを破棄すると掲載終了イベントを伝搬できない」挙動を観測 — 破棄後は署名不能(ADR-0003 の破棄意味論)による設計どおりの挙動で、他ノード側は鮮度窓(600 秒)で自然消滅するため許容と判断。**残: nsec エクスポート/破棄の Windows/Linux 同一意味論の手動比較(検証 3-7 — FR-007 自体は既存 001 テストが両 OS CI で同一通過することで自動検証済み)**
 
 **Checkpoint**: US1 と US2 が独立に動作(Linux で掲載ノードとして完全機能、SC-003/SC-005/SC-006)
 
@@ -143,8 +144,9 @@
 **Purpose**: ドキュメント・最終検証・リリースゲート
 
 - [X] T032 [P] `README.md` に Linux 導入・稼働手順と systemd サービス登録手順(quickstart 検証 4 の手順・複数インスタンス用テンプレート unit `peca-p2p-yp@.service` への言及を含む)を追記する(FR-012)
-- [ ] T033 [P] Linux/Windows 実機で quickstart 検証 5〜7 を実施する: 複数インスタンス同時稼働(FR-010)、起動失敗の定型エラー(FR-014)、Windows 後方互換(レガシー DPAPI BLOB のペルソナが利用可・新規は `PYK1` scheme 0x01)
+- [X] T033 [P] Linux/Windows 実機で quickstart 検証 5〜7 を実施する: 複数インスタンス同時稼働(FR-010)、起動失敗の定型エラー(FR-014)、Windows 後方互換(レガシー DPAPI BLOB のペルソナが利用可・新規は `PYK1` scheme 0x01)
   - 2026-07-07 部分実施済み(Debian 12 実機・実バイナリ): **検証 5** — 2 インスタンスが独立 data-dir(各 `0700`・個別 `master.key 0600`/`app.db 0600`)で同時稼働、ピア登録 → 双方向 established(片側は PEX 学習 `source:"pex"`)を確認。**検証 6** — 特権ポート(`--p2p-bind 0.0.0.0:80`)は「P2P 待受アドレスにバインドできませんでした(権限が不足しています)」、使用中ポートは「HTTP 待受アドレスにバインドできませんでした(ポートが使用中です)」で exit 1、スタックトレース・内部パスなし。**残(要 Windows 実機): 検証 7 — 002 実装前 DB のレガシー DPAPI BLOB 後方互換の手動確認(読込後方互換自体は windows CI の契約テスト `legacy_dpapi_blob_without_magic_decrypts` で自動検証済み)**
+  - 2026-07-07 完了(利用者実施): 検証 7 Windows 後方互換を実機で確認(レガシー DPAPI BLOB のペルソナが利用可)
 - [X] T034 `specs/002-linux-support/quickstart.md` のトレーサビリティ表の各セルを実装済みテスト ID(ファイル名・テスト関数名)へ更新し、割り当てのないシナリオがないことを確認する
 - [X] T035 最終ゲートを確認する: `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit` が緑、windows-latest / ubuntu-latest 両 CI ジョブで全テスト(cucumber 含む)が同一に通過(SC-002)、`SecurityCategory::ALL` 14 件の一致確認(data-model — リリース前ゲート)
   - 2026-07-07 完了: ローカル(Linux)で `cargo fmt -- --check`・`cargo clippy --all-targets`・`cargo audit`(脆弱性 0・許容済み警告 1 件のみ)・`cargo test` 全緑(unit 218・contract/integration 全通過・cucumber 21/21)。`SecurityCategory::ALL` は 14 件で data-model と一致(`security/mod.rs` の網羅 unit テストも通過)。PR #2 の CI run 28804098219 で windows-latest / ubuntu-latest 両ジョブ + Trivy が全て success(SC-002)。なお trivy ジョブの `pull-requests: read` 権限不足(PR イベントで 403)を発見し修正(01144ef)
