@@ -88,9 +88,11 @@ Assumptions の要求。checklists/security.md CHK031 対応):
 3. エンベロープ形式・scheme 識別方式・レガシー後方互換と「レガシー残存の受容」
    「ロールバック非対応」(research R3、contracts/key-envelope.md §3)
 4. master.key 配置パス(`<data-dir>/master.key`)・生成順序・ライフサイクル・生成競合
-   (research R4、contracts/key-envelope.md §5)
+   (research R4、contracts/key-envelope.md §5)。あわせて用語(「保護鍵」「マスター鍵」
+   「master.key」)の正式名称と表記を統一する
 5. 脅威モデルの限界の受容(root・data-dir 全体持出し・パーミッション依存の保証水準差 —
-   contracts/key-envelope.md §4、spec Assumptions)
+   contracts/key-envelope.md §4、spec Assumptions)、および停止タイムアウト超過時の
+   `SIGKILL` 受容(contracts/systemd-service.md §2「停止タイムアウト超過時の受容」)
 6. パーミッション検査の範囲と意図的除外(ACL・security.log・稼働中再検査 —
    contracts/cli-config.md §4)
 7. Principle V(形式的検証)非適用の判定理由(本表「形式的検証の要否判定」)
@@ -137,10 +139,13 @@ contrib/
     └── peca-p2p-yp.service   # unit 定義例(FR-012 の提供物)
 
 tests/
-├── contract/key_envelope.rs  # 新規: エンベロープ形式・後方互換の契約テスト
-├── integration/              # 既存フローは両 OS で同一に通す(SC-002)
-└── cucumber(features/)       # 新規シナリオ: at-rest 保護・パーミッション是正・
-                              # 復号不能隔離・SIGTERM 安全終了(spec Gherkin 対応)
+├── contract/key_envelope.rs          # 新規: エンベロープ形式・後方互換の契約テスト
+├── contract/cli_config.rs            # 新規: data-dir 解決順・パーミッション是正の契約テスト
+├── integration/platform_startup.rs   # 新規: 起動失敗定型エラー・複数インスタンスの統合テスト
+├── integration/graceful_shutdown.rs  # 新規(unix): SIGTERM / sd_notify の統合テスト
+├── integration/                      # 既存フローは両 OS で同一に通す(SC-002)
+└── cucumber(features/)               # 新規シナリオ: at-rest 保護・パーミッション是正・
+                                      # 復号不能隔離・SIGTERM 安全終了(spec Gherkin 対応)
 
 .github/workflows/ci.yml      # ubuntu-latest の build+test ジョブ追加(SC-002)
 docs/adr/0008-linux-key-protection.md  # 実装フェーズ冒頭で確定(research.md を正とする)

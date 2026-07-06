@@ -260,8 +260,9 @@ Feature: Linux におけるペルソナ秘密鍵の at-rest 保護
 - Linux の秘密鍵 at-rest 保護は「初回起動時に乱数生成したマスター鍵を実行アカウントの
   ディレクトリに `0600` で保管し、それで秘密鍵を AEAD 暗号化」する方式を採用(FR-003、
   Clarifications 2026-07-06)。マスター鍵ファイルの具体的な配置パス・AEAD アルゴリズム選定・
-  Windows(DPAPI BLOB)と Linux 表現を同一 `secret_enc` に格納する際の識別方式は plan 段階で
-  ADR 化して確定する(DPAPI 相当の自己完結性を Linux で成立させることが目的)
+  Windows(DPAPI BLOB)と Linux 表現を同一 `secret_enc` に格納する際の識別方式は、plan
+  (research/contracts)の決定を正として実装フェーズ冒頭に ADR(ADR-0008)として確定する
+  (DPAPI 相当の自己完結性を Linux で成立させることが目的。ADR 確定は実装タスクの先頭ゲート)
 - ネットワークプロトコル・イベントスキーマ・信頼境界・脅威モデルはプラットフォーム非依存で
   あり、本機能で変更しない(既存 spec 001 / ADR を正とする)
 - トランスポート非暗号化・plain HTTP・loopback 強制(ADR-0006)は両プラットフォームで不変

@@ -78,6 +78,8 @@ sudo systemctl enable --now peca-p2p-yp
 4. `sudo systemctl start peca-p2p-yp && sudo kill -9 $(systemctl show -p MainPID --value peca-p2p-yp)`
    → 自動再起動(Restart=on-failure)
 5. data-dir は `/var/lib/peca-p2p-yp`(StateDirectory — FR-010)
+6. 上記 1〜5 がデスクトップセッション・GUI・対話操作なしで完了している(nologin の
+   サービスアカウントによるヘッドレス無人稼働 — FR-005/SC-003)
 
 ## 検証 5: 複数インスタンス(FR-010)
 

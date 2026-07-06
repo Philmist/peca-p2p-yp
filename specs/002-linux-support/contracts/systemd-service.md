@@ -9,7 +9,7 @@
 | 事象 | 契約 |
 |------|------|
 | 起動完了 | 全リスナー(HTTP・PCP・P2P(有効時))のバインド成功**後**に `READY=1` を通知する(SHOULD — FR-009)。`NOTIFY_SOCKET` 未設定時は通知なしで正常稼働(MUST) |
-| 停止要求 | `SIGTERM` 受信で `STOPPING=1` を通知し、既存 graceful shutdown 経路(watch チャネル伝播)で全サブシステムを停止して終了コード 0 で終える(MUST — FR-008)。systemd 既定タイムアウト 90 秒以内(SC-004) |
+| 停止要求 | `SIGTERM` 受信で `STOPPING=1` を通知し、既存 graceful shutdown 経路(watch チャネル伝播)で全サブシステムを停止して終了コード 0 で終える(MUST — FR-008)。systemd 既定タイムアウト 90 秒以内(SC-004)。超過時は systemd の `SIGKILL` に委ねる(§2 設計上の要点「停止タイムアウト超過時の受容」) |
 | `SIGINT` | SIGTERM と同一挙動(手動起動の Ctrl+C 互換) |
 | 起動失敗 | バインド失敗・権限不足は原因が識別できる定型メッセージを stderr/ログへ出して非 0 終了(MUST — FR-014)。内部詳細(スタックトレース・絶対パス)は出さない(MUST NOT) |
 | 終了コード | 0 = 正常停止 / 1 = 実行時異常 / 2 = 引数・設定不正(既存 main.rs の規約を維持) |
@@ -71,6 +71,11 @@ WantedBy=multi-user.target
   `$STATE_DIRECTORY` を注入(FR-010)。`StateDirectoryMode=0700` + `UMask=0077` で
   新規ファイルが既定で群/他者不可視(FR-013 の予防側)
 - `TimeoutStopSec` は**指定しない**(systemd 既定 90 秒に委ねる — spec Clarifications)
+- **停止タイムアウト超過時の受容**(spec Edge Cases): graceful shutdown が 90 秒を
+  超えた場合は systemd による `SIGKILL` 強制終了に委ね、アプリ側の追加フェイルセーフは
+  実装しない。SQLite は WAL + トランザクション境界により強制終了でもデータ破壊に至らず
+  次回起動時に通常復旧し、`master.key` は生成後に書き換えないため影響を受けない。
+  この受容判断は ADR-0008 の受容事項に含める(Principle I — データ完全性)
 - `RestrictAddressFamilies` に `AF_UNIX` を含める(NOTIFY_SOCKET 送信に必要)
 - `Restart=on-failure`: 異常終了時の自動復帰(US3 シナリオ 4)。正常停止(exit 0)では
   再起動しない
