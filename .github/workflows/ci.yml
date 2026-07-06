@@ -62,6 +62,11 @@ jobs:
   trivy:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
+    # dorny/paths-filter は pull_request イベントで PR の変更ファイル一覧 API を
+    # 呼ぶため pull-requests: read が必要(無指定だと既定権限で 403 になる)
+    permissions:
+      contents: read
+      pull-requests: read
 
     steps:
       - uses: actions/checkout@v4
