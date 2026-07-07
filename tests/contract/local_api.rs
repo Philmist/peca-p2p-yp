@@ -786,3 +786,238 @@ async fn index_txt_post_is_405() {
         "GET/HEAD 以外は 405"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ペルソナ選択とロック(T011 / T020 — contracts/local-api.md §1/§2/§3)
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::broadcast::BroadcastState;
+use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
+use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
+use peca_p2p_yp::identity::{IdentityManager, Keystore};
+use peca_p2p_yp::store::PersonaState;
+
+/// 発行イベントを捨てるだけの sink。
+struct NullSink;
+impl EventSink for NullSink {
+    fn publish_local(&self, _event: nostr::Event) -> bool {
+        true
+    }
+}
+
+/// identity・broadcast を配線した AppState と、共有ハンドルを返す。
+fn identity_state(
+    security: Arc<SecurityLog>,
+) -> (
+    AppState,
+    Arc<IdentityManager>,
+    Arc<BroadcastState>,
+    Arc<PublishEngine>,
+    Arc<Store>,
+) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let broadcast = Arc::new(BroadcastState::new());
+    let identity = Arc::new(
+        IdentityManager::new(Arc::clone(&store), Keystore::ephemeral())
+            .with_broadcast_state(Arc::clone(&broadcast)),
+    );
+    let sink: Arc<dyn EventSink> = Arc::new(NullSink);
+    let engine = Arc::new(PublishEngine::new(
+        Arc::clone(&identity),
+        sink,
+        60,
+        Arc::clone(&broadcast),
+    ));
+    let mut hosts = HashSet::new();
+    hosts.insert(GOOD_HOST.to_string());
+    let limiter = RateLimiter::with_clock(web::RATE_LIMIT_PER_SEC, Box::new(|| 1_000));
+    let state = AppState::with_parts(Arc::clone(&store), security, TOKEN, hosts, limiter)
+        .with_identity(Arc::clone(&identity))
+        .with_broadcast(Arc::clone(&broadcast));
+    (state, identity, broadcast, engine, store)
+}
+
+fn ch_listing() -> ChannelListing {
+    ChannelListing {
+        channel_id: "000000000000000000000000000000bb".into(),
+        title: "配信".into(),
+        summary: None,
+        genre: Some("game".into()),
+        status: ChannelStatus::Live,
+        starts: 1_700_000_000,
+        current_participants: 1,
+        streaming: None,
+        bitrate_kbps: Some(500),
+        content_type: Some("FLV".into()),
+        tip: Some("198.51.100.1:7144".into()),
+        contact: None,
+        relays: 0,
+        track: Some(Track::default()),
+    }
+}
+
+async fn send(
+    state: &AppState,
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    body: Body,
+) -> Value {
+    let app = web::build_router(state.clone());
+    let resp = app
+        .oneshot(build_request(method, uri, Some(GOOD_HOST), token, body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    serde_json::json!({ "status": status.as_u16(), "body": body })
+}
+
+// --- T011: 選択と選択可能ガード -----------------------------------------------
+
+#[tokio::test]
+async fn put_select_active_returns_204() {
+    let (security, _p, _d) = temp_security_log();
+    let (state, identity, _b, _e, _s) = identity_state(security);
+    let a = identity.create("A").unwrap(); // 自動選択
+    let b = identity.create("B").unwrap();
+
+    let r = send(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/personas/{}", b.pubkey),
+        Some(TOKEN),
+        Body::from(r#"{"select":true}"#),
+    )
+    .await;
+    assert_eq!(r["status"], 204);
+    assert_eq!(identity.selected().unwrap(), Some(b.pubkey));
+    let _ = a;
+}
+
+#[tokio::test]
+async fn put_select_archived_returns_409_not_selectable() {
+    let (security, _p, _d) = temp_security_log();
+    let (state, identity, _b, _e, _s) = identity_state(security);
+    let d = identity.create("D").unwrap();
+    identity
+        .set_state(&d.pubkey, PersonaState::Archived)
+        .unwrap();
+
+    let r = send(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/personas/{}", d.pubkey),
+        Some(TOKEN),
+        Body::from(r#"{"select":true}"#),
+    )
+    .await;
+    assert_eq!(r["status"], 409);
+    assert_eq!(r["body"]["error"], "persona_not_selectable");
+    assert_eq!(r["body"].as_object().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn put_select_unusable_returns_422() {
+    let (security, _p, _d) = temp_security_log();
+    let (state, _identity, _b, _e, store) = identity_state(security);
+    // 復号できない(破損した)エンベロープのペルソナを共有ストアへ直接挿入する
+    // (ephemeral keystore は同一プロセスでは相互復号できるため破損 blob で再現する)。
+    let pubkey = "ab".repeat(32);
+    store
+        .insert_persona(&pubkey, b"garbage-not-an-envelope", "E")
+        .unwrap();
+
+    let r = send(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/personas/{pubkey}"),
+        Some(TOKEN),
+        Body::from(r#"{"select":true}"#),
+    )
+    .await;
+    assert_eq!(r["status"], 422);
+    assert_eq!(r["body"]["error"], "persona_unusable");
+}
+
+// --- T020: 配信中ロックと status.broadcasting --------------------------------
+
+#[tokio::test]
+async fn broadcasting_locks_put_select() {
+    let (security, _p, _d) = temp_security_log();
+    let (state, identity, _b, engine, _s) = identity_state(security);
+    let a = identity.create("A").unwrap(); // selected
+    let b = identity.create("B").unwrap();
+    assert!(engine.publish_listing(&ch_listing()).unwrap(), "発行で予約");
+
+    let r = send(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/personas/{}", b.pubkey),
+        Some(TOKEN),
+        Body::from(r#"{"select":true}"#),
+    )
+    .await;
+    assert_eq!(r["status"], 409);
+    assert_eq!(r["body"]["error"], "broadcasting_locked");
+    assert_eq!(
+        identity.selected().unwrap(),
+        Some(a.pubkey),
+        "selected 不変"
+    );
+}
+
+#[tokio::test]
+async fn broadcasting_locks_put_archived_and_delete() {
+    let (security, _p, _d) = temp_security_log();
+    let (state, identity, _b, engine, _s) = identity_state(security);
+    let a = identity.create("A").unwrap(); // selected
+    assert!(engine.publish_listing(&ch_listing()).unwrap());
+
+    let uri = format!("/api/v1/personas/{}", a.pubkey);
+    let r = send(
+        &state,
+        Method::PUT,
+        &uri,
+        Some(TOKEN),
+        Body::from(r#"{"state":"archived"}"#),
+    )
+    .await;
+    assert_eq!(r["status"], 409);
+    assert_eq!(r["body"]["error"], "broadcasting_locked");
+
+    let r = send(
+        &state,
+        Method::DELETE,
+        &format!("{uri}?confirm=true"),
+        Some(TOKEN),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(r["status"], 409);
+    assert_eq!(r["body"]["error"], "broadcasting_locked");
+}
+
+#[tokio::test]
+async fn status_includes_broadcasting_flag() {
+    let (security, _p, _d) = temp_security_log();
+    let (state, identity, _b, engine, _s) = identity_state(security);
+
+    // 発行前は false。
+    let r = send(&state, Method::GET, "/api/v1/status", None, Body::empty()).await;
+    assert_eq!(r["status"], 200);
+    assert_eq!(r["body"]["broadcasting"], false);
+
+    // 発行(予約)後は true。
+    identity.create("A").unwrap();
+    assert!(engine.publish_listing(&ch_listing()).unwrap());
+    let r = send(&state, Method::GET, "/api/v1/status", None, Body::empty()).await;
+    assert_eq!(r["body"]["broadcasting"], true);
+}

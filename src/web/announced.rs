@@ -159,6 +159,9 @@ struct StatusResponse {
     clock_skew: ClockSkewStatus,
     /// 着信可能か(T053 / FR-016 — `false` は「外向き接続のみで参加中」)。
     inbound_reachable: bool,
+    /// 1 つ以上のチャンネルを発行中か(T025 / FR-008 — UI のロック表示に使う)。
+    /// 保留中(未発行)チャンネルは含めない。供給元(BroadcastState)未配線時は `false`。
+    broadcasting: bool,
 }
 
 /// `GET /api/v1/status`。
@@ -167,6 +170,12 @@ struct StatusResponse {
 /// 時計ずれ自己診断(T048)を返す。供給元未配線時は既定(到達不能でない・
 /// 時計ずれ標本なし)を返す。
 async fn get_status(State(state): State<AppState>) -> Response {
+    // 配信中真偽は供給元未配線なら false(contracts §3)。
+    let broadcasting = state
+        .broadcast
+        .as_ref()
+        .map(|b| b.is_broadcasting())
+        .unwrap_or(false);
     let response = match state.node_status.as_ref() {
         Some(s) => StatusResponse {
             pcp_listening: s.pcp_listening(),
@@ -180,6 +189,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
             all_peers_unreachable: s.all_peers_unreachable(),
             clock_skew: s.clock_skew(),
             inbound_reachable: s.inbound_reachable(),
+            broadcasting,
         },
         None => StatusResponse {
             pcp_listening: false,
@@ -190,6 +200,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
                 warning: false,
             },
             inbound_reachable: false,
+            broadcasting,
         },
     };
     Json(response).into_response()

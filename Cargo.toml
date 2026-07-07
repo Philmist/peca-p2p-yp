@@ -109,3 +109,7 @@ path = "tests/integration/dual_listener.rs"
 [[test]]
 name = "scale"
 path = "tests/integration/scale.rs"
+
+[[test]]
+name = "persona_lock"
+path = "tests/integration/persona_lock.rs"
