@@ -61,6 +61,7 @@ HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015
 - ADR-0007: 許容的ライセンス(MIT)と GPL 結合回避の根拠
 - ADR-0008: P2P 待受のデュアルスタック化(`p2p_bind` カンマ区切り複数バインド)
 - ADR-0009: Linux 鍵保護(keystore 抽象・エンベロープ・マスター鍵)
+- ADR-0010: DNS 解決ピアの限定サポート(manual 限定・名前空間分離・resolved_ip 射影)
 - security-review-checklist.md: セキュリティ PR のレビュー観点(実装中ゲート 6)
 - release-gate-check-2026-07-04.md: リリース前ゲート 8〜10 の適用記録
 

@@ -41,16 +41,18 @@
 | フィールド | 型 | 制約 |
 |-----------|-----|------|
 | id | INTEGER PK | |
-| addr | TEXT UNIQUE | `host:port`(IPv4/IPv6 リテラルまたはホスト名、長さ ≤ 256)。IPv6 リテラルは `[addr]:port` のブラケット表記のみ許容(例 `[2001:db8::1]:7147`)。ブラケットなしでコロンを複数含む文字列はポート境界が曖昧なためパース不能として拒否 |
+| addr | TEXT UNIQUE | `host:port`(IPv4/IPv6 リテラルまたはホスト名、長さ ≤ 256)。IPv6 リテラルは `[addr]:port` のブラケット表記のみ許容(例 `[2001:db8::1]:7147`)。ブラケットなしでコロンを複数含む文字列はポート境界が曖昧なためパース不能として拒否。**ホスト名は manual 登録経路のみ許容**(RFC 1123・ASCII・末尾ドット正規化 — ADR-0010) |
 | source | TEXT | `manual`(手動登録)/ `pex`(ピア交換で獲得) |
 | verified | INTEGER | 0/1。**自ノードが接続に成功した実績**があるか(research R14)。未検証ピアは PEX で再共有してはならない (MUST NOT) |
 | enabled | INTEGER | 0/1。無効化 = 切り離し(FR-008 緩和策) |
 | added_at | INTEGER | |
 | last_ok_at | INTEGER NULL | 最終接続成功時刻(UI の健全性表示・PEX 共有判定用) |
 | fail_count | INTEGER | 連続接続失敗数。**8 回**の連続失敗で平常時の接続候補から降格(research R14)。接続成功で 0 にリセット。降格からの復帰は、利用者の手動操作(削除→再登録・enabled 再設定)または全ピア到達不能時の再試行(contracts/p2p-gossip.md §接続管理)での接続成功による |
+| resolved_ip | TEXT NULL | 外向き接続成立時に捕捉した実ソケット IP(canonical)。**ホスト名 manual ピアの PEX 射影専用**(ADR-0010)。ダイヤルには使わない(外向きは常にホスト名を再解決)。IP リテラルピアでは冗長 |
 
 **検証ルール**: 登録数上限 1,024(LRU で降格・削除)。自分自身のアドレス(ループバック検出)は登録拒否。
-`manual` は利用者が明示削除するまで LRU 対象外。
+`manual` は利用者が明示削除するまで LRU 対象外。ホスト名 manual ピアはダイヤル毎に再解決し、
+**PEX には解決済み IP(`resolved_ip`)のみを射影**して共有する(ホスト名は網に出さない — ADR-0010)。
 
 ### MuteEntry(ミュート)
 

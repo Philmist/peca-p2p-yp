@@ -19,13 +19,14 @@ CREATE TABLE IF NOT EXISTS personas (
 -- ピア(gossip 接続の候補・実績。手動シードまたは PEX で獲得)
 CREATE TABLE IF NOT EXISTS peers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    addr        TEXT NOT NULL UNIQUE,   -- host:port(長さ ≤ 256)
+    addr        TEXT NOT NULL UNIQUE,   -- host:port(長さ ≤ 256)。manual はホスト名も可(ADR-0010)
     source      TEXT NOT NULL,          -- 'manual' / 'pex'
     verified    INTEGER NOT NULL DEFAULT 0,  -- 0/1。自ノードの外向き接続成功実績
     enabled     INTEGER NOT NULL DEFAULT 1,  -- 0/1。無効化=切り離し
     added_at    INTEGER NOT NULL,
     last_ok_at  INTEGER,                -- 最終接続成功時刻(NULL 可)
-    fail_count  INTEGER NOT NULL DEFAULT 0   -- 連続接続失敗数
+    fail_count  INTEGER NOT NULL DEFAULT 0,  -- 連続接続失敗数
+    resolved_ip TEXT                    -- 外向き成功時の実ソケット IP(canonical。PEX 射影専用・ダイヤル不使用 — ADR-0010)
 );
 
 -- ミュート(ローカル保存のみ。ネットワークへは公開しない)

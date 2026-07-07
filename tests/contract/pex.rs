@@ -37,6 +37,27 @@ fn peer(
         added_at: 0,
         last_ok_at,
         fail_count: 0,
+        resolved_ip: None,
+    }
+}
+
+/// ホスト名 manual ピア(resolved_ip 付き)を組み立てる(ADR-0010)。
+fn hostname_peer(
+    id: i64,
+    addr: &str,
+    resolved_ip: Option<&str>,
+    last_ok_at: Option<i64>,
+) -> PeerEndpoint {
+    PeerEndpoint {
+        id,
+        addr: addr.to_string(),
+        source: PeerSource::Manual,
+        verified: true,
+        enabled: true,
+        added_at: 0,
+        last_ok_at,
+        fail_count: 0,
+        resolved_ip: resolved_ip.map(str::to_string),
     }
 }
 
@@ -74,27 +95,57 @@ async fn get_peers_and_peers_round_trip() {
 
 #[test]
 fn select_returns_verified_only_by_recency() {
+    // PEX は IP リテラルを共有する(ホスト名は網に出さない — ADR-0010)。
     let peers = vec![
-        peer(1, "a:7147", true, true, Some(100)),
-        peer(2, "b:7147", true, true, Some(300)),
-        peer(3, "c:7147", true, true, Some(200)),
+        peer(1, "192.0.2.1:7147", true, true, Some(100)),
+        peer(2, "192.0.2.2:7147", true, true, Some(300)),
+        peer(3, "192.0.2.3:7147", true, true, Some(200)),
         // 未検証は選定対象外(再共有しない)
-        peer(4, "d:7147", false, true, Some(999)),
+        peer(4, "192.0.2.4:7147", false, true, Some(999)),
         // 無効は選定対象外
-        peer(5, "e:7147", true, false, Some(999)),
+        peer(5, "192.0.2.5:7147", true, false, Some(999)),
         // last_ok_at 無し(実績なし)は verified でも最下位
-        peer(6, "f:7147", true, true, None),
+        peer(6, "192.0.2.6:7147", true, true, None),
     ];
     let selected = pex::select_peers_for_pex(&peers, PEX_MAX_PEERS);
     assert_eq!(
         selected,
         vec![
-            "b:7147".to_string(),
-            "c:7147".to_string(),
-            "a:7147".to_string(),
-            "f:7147".to_string(),
+            "192.0.2.2:7147".to_string(),
+            "192.0.2.3:7147".to_string(),
+            "192.0.2.1:7147".to_string(),
+            "192.0.2.6:7147".to_string(),
         ],
         "verified=1 のみを last_ok_at 新しい順に返す(未検証 d・無効 e は含めない)"
+    );
+}
+
+#[test]
+fn select_projects_hostname_peer_to_resolved_ip() {
+    // ホスト名 manual ピアは接続成立時の実 IP へ射影して共有する(ADR-0010 決定 4)。
+    // 実 IP 未取得のホスト名ピアは共有しない。ホスト名自体は網に出さない。
+    let peers = vec![
+        hostname_peer(
+            1,
+            "seed.example.org:7147",
+            Some("192.0.2.10:7147"),
+            Some(300),
+        ),
+        peer(2, "198.51.100.5:7147", true, true, Some(200)),
+        hostname_peer(3, "pending.example.org:7147", None, Some(400)),
+    ];
+    let selected = pex::select_peers_for_pex(&peers, PEX_MAX_PEERS);
+    assert_eq!(
+        selected,
+        vec![
+            "192.0.2.10:7147".to_string(),
+            "198.51.100.5:7147".to_string()
+        ],
+        "ホスト名は resolved_ip へ射影、実 IP 未取得のホスト名ピアは除外"
+    );
+    assert!(
+        !selected.iter().any(|s| s.contains("example.org")),
+        "ホスト名は PEX に出してはならない"
     );
 }
 
@@ -115,14 +166,14 @@ fn select_never_shares_unverified_peers() {
 fn select_caps_at_max() {
     // 上限 64 を超える verified ピア → 最大 64 件、かつ最新実績が優先される
     let peers: Vec<PeerEndpoint> = (0..70)
-        .map(|i| peer(i, &format!("h{i}:7147"), true, true, Some(i)))
+        .map(|i| peer(i, &format!("10.0.0.{i}:7147"), true, true, Some(i)))
         .collect();
     let selected = pex::select_peers_for_pex(&peers, PEX_MAX_PEERS);
     assert_eq!(selected.len(), PEX_MAX_PEERS, "最大 64 件に制限される");
     // last_ok_at が最大(=69)のものが先頭
-    assert_eq!(selected[0], "h69:7147");
+    assert_eq!(selected[0], "10.0.0.69:7147");
     // 最古(0..5)は落ちる
-    assert!(!selected.contains(&"h0:7147".to_string()));
+    assert!(!selected.contains(&"10.0.0.0:7147".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -160,19 +211,28 @@ fn incoming_rejects_malformed_forms() {
 }
 
 #[test]
-fn incoming_accepts_valid_ipv4_and_bracketed_ipv6() {
+fn incoming_accepts_ip_literals_and_rejects_hostnames() {
+    // 名前空間分離(ADR-0010): IP リテラルのみ候補化し、ホスト名は破棄する。
     let peers = vec![
         "192.0.2.10:7147".to_string(),
         "[2001:db8::1]:7147".to_string(),
-        "example.com:7147".to_string(),
+        "example.com:7147".to_string(), // ホスト名 → 破棄
     ];
     let result = pex::validate_incoming_peers(&peers, no_self, PEX_MAX_PEERS);
-    assert_eq!(result.accepted.len(), 3, "正当なアドレスは採用される");
-    assert!(result.rejected.is_empty());
+    assert_eq!(result.accepted.len(), 2, "IP リテラルのみ採用される");
+    assert_eq!(
+        result.rejected,
+        vec!["example.com:7147".to_string()],
+        "ホスト名候補は名前空間分離により破棄される"
+    );
     // canonical 化されている(IPv6 は圧縮小文字・ブラケット表記)
     let canons: HashSet<String> = result.accepted.iter().map(|p| p.canonical()).collect();
     assert!(canons.contains("[2001:db8::1]:7147"));
-    assert!(canons.contains("example.com:7147"));
+    assert!(canons.contains("192.0.2.10:7147"));
+    assert!(
+        !canons.contains("example.com:7147"),
+        "ホスト名は候補化されない"
+    );
 }
 
 #[test]

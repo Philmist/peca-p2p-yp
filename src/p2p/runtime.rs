@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use crate::p2p::frame::{Message, close_reason, read_frame, write_frame};
 use crate::p2p::hub::GossipHub;
 use crate::p2p::peers::{
-    CandidateMode, InboundOutcome, OutboundOutcome, PeerManager, ReachabilityState,
+    CandidateMode, InboundOutcome, OutboundOutcome, PeerAddr, PeerManager, ReachabilityState,
 };
 use crate::p2p::pex::{self, PEX_MAX_PEERS};
 use crate::p2p::session::{
@@ -58,6 +58,16 @@ enum PumpEnd {
     ClosedCleanly,
     /// established 後に異常切断(keepalive 無応答・I/O エラー・受信違反)。
     Dropped,
+}
+
+/// [`P2pRuntime::pump`] が駆動する接続の相手情報(引数束ね)。
+struct ConnTarget<'a> {
+    /// ダイヤル/接続元アドレス(ホスト名または IP リテラル)。
+    addr: &'a str,
+    /// 接続方向。
+    direction: Direction,
+    /// 外向き established 時に記録する実ソケット IP(canonical — ADR-0010)。inbound は `None`。
+    resolved_ip: Option<&'a str>,
 }
 
 /// P2P 接続ランタイム。`Arc<P2pRuntime>` として待受・維持ループ・各接続タスクで共有する。
@@ -247,8 +257,19 @@ impl P2pRuntime {
             Some(self.security.clone()),
         );
         let (r, w) = stream.into_split();
-        self.pump(session, r, w, &addr, Direction::Inbound, shutdown)
-            .await;
+        // 着信は resolved_ip を記録しない(着信可否は自ノードの外向き接続で検証する)。
+        self.pump(
+            session,
+            r,
+            w,
+            ConnTarget {
+                addr: &addr,
+                direction: Direction::Inbound,
+                resolved_ip: None,
+            },
+            shutdown,
+        )
+        .await;
         self.peers.end_inbound(&addr);
     }
 
@@ -346,6 +367,13 @@ impl P2pRuntime {
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
         match connected {
             Ok(stream) => {
+                // 実際に繋がったソケットの IP(複数 A/AAAA は OS が順に試行、繋がったものが
+                // 検証済み IP)を canonical 化して捕捉する(ホスト名 manual ピアの PEX 射影 —
+                // ADR-0010)。取得失敗時は None(射影しない)。
+                let resolved_ip = stream
+                    .peer_addr()
+                    .ok()
+                    .map(|sa| PeerAddr::from_socket_addr(sa).canonical());
                 let (r, mut w) = stream.into_split();
                 // HELLO を先に送る(失敗は接続失敗として扱う)。
                 if let Some(msg) = hello
@@ -357,7 +385,17 @@ impl P2pRuntime {
                     return;
                 }
                 let end = self
-                    .pump(session, r, w, &addr, Direction::Outbound, shutdown)
+                    .pump(
+                        session,
+                        r,
+                        w,
+                        ConnTarget {
+                            addr: &addr,
+                            direction: Direction::Outbound,
+                            resolved_ip: resolved_ip.as_deref(),
+                        },
+                        shutdown,
+                    )
                     .await;
                 self.peers.end_outbound(&addr);
                 // 正常終了(相手 CLOSE / EOF / ローカル shutdown)は成功記録済みのため
@@ -409,14 +447,18 @@ impl P2pRuntime {
         mut session: Session,
         mut reader: R,
         mut writer: W,
-        addr: &str,
-        direction: Direction,
+        target: ConnTarget<'_>,
         mut shutdown: watch::Receiver<bool>,
     ) -> PumpEnd
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        let ConnTarget {
+            addr,
+            direction,
+            resolved_ip,
+        } = target;
         let mut established = false;
         // established 後に正常終了(相手 CLOSE / EOF / ローカル shutdown)したら true。
         // 異常切断(keepalive 無応答・I/O・違反)は false のままとし fail_count に反映する。
@@ -513,7 +555,7 @@ impl P2pRuntime {
                                             .map(|p| p.ts - unix_now())
                                             .unwrap_or(0);
                                         self.hub.register_peer(id, addr, direction, outbox_tx.clone(), clock_skew);
-                                        self.on_established(direction, addr);
+                                        self.on_established(direction, addr, resolved_ip);
                                         // inbound 相手の候補化(申告 listen_port を接続元 host と
                                         // 組み合わせ source=pex・verified=0 で登録 — contracts §接続管理)。
                                         if direction == Direction::Inbound {
@@ -708,13 +750,18 @@ impl P2pRuntime {
         let _ = self.peers.add_peer(&candidate, PeerSource::Pex);
     }
 
-    fn on_established(&self, direction: Direction, addr: &str) {
+    fn on_established(&self, direction: Direction, addr: &str, resolved_ip: Option<&str>) {
         // 接続確立は到達可能の証拠。全断からの回復ならここで通知が出る(方向を問わない)。
         self.reachability.mark_reachable();
         match direction {
             Direction::Outbound => {
                 // 外向き接続の成功のみ verified=1・last_ok_at・fail_count=0 を立てる。
                 let _ = self.peers.record_success(addr, unix_now());
+                // 接続成立時の実ソケット IP を記録する(ホスト名 manual ピアの PEX 射影 —
+                // ADR-0010)。ダイヤルには使わず、PEX 射影専用の派生属性として保存する。
+                if let Some(ip) = resolved_ip {
+                    let _ = self.peers.record_resolved_ip(addr, ip);
+                }
                 tracing::info!(target: "p2p", peer = %addr, direction = "outbound", "established");
             }
             Direction::Inbound => {
@@ -818,7 +865,17 @@ mod tests {
                     Some(server.security.clone()),
                 );
                 server
-                    .pump(session, ar, aw, "peer", Direction::Inbound, rx)
+                    .pump(
+                        session,
+                        ar,
+                        aw,
+                        ConnTarget {
+                            addr: "peer",
+                            direction: Direction::Inbound,
+                            resolved_ip: None,
+                        },
+                        rx,
+                    )
                     .await
             })
         };
@@ -837,7 +894,17 @@ mod tests {
                     write_frame(&mut bw, &msg).await.unwrap();
                 }
                 client
-                    .pump(session, br, bw, "peer", Direction::Outbound, rx)
+                    .pump(
+                        session,
+                        br,
+                        bw,
+                        ConnTarget {
+                            addr: "peer",
+                            direction: Direction::Outbound,
+                            resolved_ip: None,
+                        },
+                        rx,
+                    )
                     .await
             })
         };
@@ -866,6 +933,61 @@ mod tests {
         );
     }
 
+    /// 実 TCP loopback で外向き established に達すると、ホスト名 manual ピアの
+    /// `resolved_ip` に接続成立時の実ソケット IP が記録される(ADR-0010 決定 4/6)。
+    /// ホスト名 `localhost` をダイヤルし、実 IP `127.0.0.1:<port>` が捕捉されることを確認する。
+    #[tokio::test]
+    async fn outbound_records_resolved_ip_for_hostname_peer() {
+        let (server, _sg) = runtime(1, 0);
+        let (client, _cg) = runtime(2, 0);
+        // サーバは 127.0.0.1 のみで待ち受ける(localhost が ::1 に解決しても実 IP は v4 になる)。
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = watch::channel(false);
+
+        {
+            let server = Arc::clone(&server);
+            let rx = rx.clone();
+            tokio::spawn(async move { server.run_listener(listener, rx).await });
+        }
+
+        // ホスト名を manual 登録し、ダイヤル毎の再解決経路(handle_outbound_conn)で接続する。
+        let dial = format!("localhost:{port}");
+        client.peers.add_peer(&dial, PeerSource::Manual).unwrap();
+        {
+            let client = Arc::clone(&client);
+            let rx = rx.clone();
+            let dial = dial.clone();
+            tokio::spawn(async move { client.handle_outbound_conn(dial, rx).await });
+        }
+
+        // established → on_established → resolved_ip 記録をポーリングで待つ。
+        let mut recorded = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Some(ip) = client
+                .peers
+                .get_peer(&dial)
+                .unwrap()
+                .and_then(|p| p.resolved_ip)
+            {
+                recorded = Some(ip);
+                break;
+            }
+        }
+        let _ = tx.send(true); // 双方を graceful shutdown させる。
+
+        assert_eq!(
+            recorded.as_deref(),
+            Some(format!("127.0.0.1:{port}").as_str()),
+            "接続成立時の実ソケット IP が resolved_ip に記録される"
+        );
+        // canonical キーはあくまでホスト名のまま(resolved_ip はダイヤルに使わない)。
+        let peer = client.peers.get_peer(&dial).unwrap().unwrap();
+        assert_eq!(peer.addr, dial, "登録キーはホスト名のまま維持される");
+        assert!(peer.verified, "外向き成功で verified=1");
+    }
+
     /// 自己接続(同一 nonce)で outbound 側がダイヤル先アドレスを自己として学習し、
     /// ピア登録が削除・以後の登録が拒否されることを確認する(contracts §接続管理 / T018)。
     #[tokio::test]
@@ -891,8 +1013,18 @@ mod tests {
                     "127.0.0.1:50000".into(),
                     Some(rt.security.clone()),
                 );
-                rt.pump(session, ar, aw, "127.0.0.1:50000", Direction::Inbound, rx)
-                    .await
+                rt.pump(
+                    session,
+                    ar,
+                    aw,
+                    ConnTarget {
+                        addr: "127.0.0.1:50000",
+                        direction: Direction::Inbound,
+                        resolved_ip: None,
+                    },
+                    rx,
+                )
+                .await
             })
         };
         let cli = {
@@ -910,8 +1042,18 @@ mod tests {
                 if let Some(msg) = hello {
                     write_frame(&mut bw, &msg).await.unwrap();
                 }
-                rt.pump(session, br, bw, &addr, Direction::Outbound, rx)
-                    .await
+                rt.pump(
+                    session,
+                    br,
+                    bw,
+                    ConnTarget {
+                        addr: &addr,
+                        direction: Direction::Outbound,
+                        resolved_ip: None,
+                    },
+                    rx,
+                )
+                .await
             })
         };
 
@@ -1006,8 +1148,18 @@ mod tests {
                     "peer".into(),
                     Some(rt.security.clone()),
                 );
-                rt.pump(session, ar, aw, "peer", Direction::Inbound, rx)
-                    .await
+                rt.pump(
+                    session,
+                    ar,
+                    aw,
+                    ConnTarget {
+                        addr: "peer",
+                        direction: Direction::Inbound,
+                        resolved_ip: None,
+                    },
+                    rx,
+                )
+                .await
             })
         };
 

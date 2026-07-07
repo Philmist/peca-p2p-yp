@@ -81,6 +81,28 @@ impl std::error::Error for StoreError {
     }
 }
 
+/// スキーマ適用後の冪等マイグレーション。
+///
+/// `CREATE TABLE IF NOT EXISTS` は既存 DB の列追加を行わないため、旧バージョンで
+/// 作成された `peers` に不足列がある場合に `ALTER TABLE ADD COLUMN` で補う。
+/// 列の存在は `PRAGMA table_info` で確認し、既にあれば何もしない(冪等)。
+fn migrate(conn: &Connection) -> Result<()> {
+    if !peers_has_column(conn, "resolved_ip")? {
+        conn.execute("ALTER TABLE peers ADD COLUMN resolved_ip TEXT", [])
+            .map_err(map_sqlite)?;
+    }
+    Ok(())
+}
+
+/// `peers` テーブルに指定名の列が存在するか(`PRAGMA table_info`)。
+fn peers_has_column(conn: &Connection, name: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM pragma_table_info('peers') WHERE name = ?1")
+        .map_err(map_sqlite)?;
+    let exists = stmt.exists([name]).map_err(map_sqlite)?;
+    Ok(exists)
+}
+
 /// SQLite エラーを [`StoreError`] へ写像する。UNIQUE 違反は [`StoreError::Duplicate`]。
 fn map_sqlite(e: rusqlite::Error) -> StoreError {
     if let rusqlite::Error::SqliteFailure(err, _) = &e
@@ -178,6 +200,11 @@ pub struct PeerEndpoint {
     pub added_at: i64,
     pub last_ok_at: Option<i64>,
     pub fail_count: i64,
+    /// 外向き接続成功時に捕捉した実ソケット IP(canonical `host:port` / `[v6]:port`)。
+    ///
+    /// ホスト名 manual ピア(ADR-0010)の PEX 射影専用。**ダイヤルには使わない**
+    /// (外向きは常にホスト名を再解決する)。IP リテラルピアでは冗長(addr と一致)。
+    pub resolved_ip: Option<String>,
 }
 
 /// ミュート単位(data-model §MuteEntry)。
@@ -252,6 +279,7 @@ impl Store {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA).map_err(map_sqlite)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -465,6 +493,22 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// 外向き接続成立時の実ソケット IP を記録する(ADR-0010)。
+    ///
+    /// **外向き接続の成立(established)時のみ**呼ぶこと。ホスト名 manual ピアの PEX 射影に
+    /// 用いる「直近に自ノードが実際に握手した IP」を単一エントリへ上書き保存する。
+    /// `ip` は canonical 表記(`host:port` / `[v6]:port`)。存在すれば `true`。
+    pub fn set_peer_resolved_ip(&self, addr: &str, ip: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute(
+                "UPDATE peers SET resolved_ip = ?1 WHERE addr = ?2",
+                rusqlite::params![ip, addr],
+            )
+            .map_err(map_sqlite)?;
+        Ok(n > 0)
+    }
+
     /// 接続失敗を記録し(fail_count を +1)、更新後の fail_count を返す。
     /// ピアが存在しない場合は `None`。
     pub fn record_peer_failure(&self, addr: &str) -> Result<Option<i64>> {
@@ -584,8 +628,7 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 /// ピア行の共通 SELECT(列順は [`row_to_peer`] と一致させる)。
-const PEER_SELECT: &str =
-    "SELECT id, addr, source, verified, enabled, added_at, last_ok_at, fail_count FROM peers";
+const PEER_SELECT: &str = "SELECT id, addr, source, verified, enabled, added_at, last_ok_at, fail_count, resolved_ip FROM peers";
 
 fn row_to_persona(row: &Row<'_>) -> rusqlite::Result<Persona> {
     Ok(Persona {
@@ -608,6 +651,7 @@ fn row_to_peer(row: &Row<'_>) -> rusqlite::Result<PeerEndpoint> {
         added_at: row.get(5)?,
         last_ok_at: row.get(6)?,
         fail_count: row.get(7)?,
+        resolved_ip: row.get(8)?,
     })
 }
 
@@ -811,6 +855,82 @@ mod tests {
         // 存在しないピア
         assert_eq!(s.record_peer_failure("nope:1").unwrap(), None);
         assert!(!s.record_peer_success("nope:1", 1).unwrap());
+    }
+
+    #[test]
+    fn peer_resolved_ip_set_and_cleared_on_delete() {
+        let s = store();
+        // 既定は NULL(未解決)。
+        s.upsert_peer("seed.example.org:7147", PeerSource::Manual)
+            .unwrap();
+        assert!(
+            s.get_peer("seed.example.org:7147")
+                .unwrap()
+                .unwrap()
+                .resolved_ip
+                .is_none()
+        );
+        // 外向き成立時の実 IP を記録できる。
+        assert!(
+            s.set_peer_resolved_ip("seed.example.org:7147", "192.0.2.10:7147")
+                .unwrap()
+        );
+        assert_eq!(
+            s.get_peer("seed.example.org:7147")
+                .unwrap()
+                .unwrap()
+                .resolved_ip
+                .as_deref(),
+            Some("192.0.2.10:7147")
+        );
+        // DDNS の IP 変化は上書きされる(単一エントリ)。
+        s.set_peer_resolved_ip("seed.example.org:7147", "192.0.2.11:7147")
+            .unwrap();
+        assert_eq!(
+            s.get_peer("seed.example.org:7147")
+                .unwrap()
+                .unwrap()
+                .resolved_ip
+                .as_deref(),
+            Some("192.0.2.11:7147")
+        );
+        // 削除で一括消去(派生属性も行ごと消える)。
+        assert!(s.delete_peer("seed.example.org:7147").unwrap());
+        assert!(s.get_peer("seed.example.org:7147").unwrap().is_none());
+        // 存在しないピアへの記録は false。
+        assert!(!s.set_peer_resolved_ip("nope:1", "192.0.2.1:1").unwrap());
+    }
+
+    #[test]
+    fn migration_adds_resolved_ip_to_legacy_peers_table() {
+        // resolved_ip 列を持たない旧スキーマの peers テーブルを用意する。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE peers (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 addr TEXT NOT NULL UNIQUE,
+                 source TEXT NOT NULL,
+                 verified INTEGER NOT NULL DEFAULT 0,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 added_at INTEGER NOT NULL,
+                 last_ok_at INTEGER,
+                 fail_count INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO peers (addr, source, verified, enabled, added_at, fail_count)
+             VALUES ('10.0.0.1:7147', 'manual', 1, 1, 100, 0);",
+        )
+        .unwrap();
+        // from_connection は SCHEMA 冪等適用 + migrate を行う。旧行が読める。
+        let s = Store::from_connection(conn).unwrap();
+        let p = s.get_peer("10.0.0.1:7147").unwrap().unwrap();
+        assert!(p.resolved_ip.is_none());
+        // 追加された列へ書き込める。
+        assert!(
+            s.set_peer_resolved_ip("10.0.0.1:7147", "10.0.0.1:7147")
+                .unwrap()
+        );
+        // 2 回目の migrate 呼び出しも冪等(列は既存)。
+        assert!(peers_has_column(&s.lock().unwrap(), "resolved_ip").unwrap());
     }
 
     #[test]
