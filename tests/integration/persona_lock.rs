@@ -10,7 +10,7 @@ use peca_p2p_yp::broadcast::BroadcastState;
 use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::{ChannelListing, ChannelStatus, Track};
 use peca_p2p_yp::identity::{IdentityError, IdentityManager, Keystore};
-use peca_p2p_yp::store::Store;
+use peca_p2p_yp::store::{PersonaState, Store};
 
 /// 署名イベントの pubkey(= どのペルソナで署名したか)を記録する sink。
 #[derive(Default)]
@@ -144,4 +144,66 @@ fn release_after_ended_unlocks_select() {
         "解錠後は追加リセットなく選択できる"
     );
     assert_eq!(identity.selected().unwrap(), Some(b.pubkey));
+}
+
+/// 別チャンネル(新規到着 = 未発行)の listing。selected 解決に依存させる。
+fn other_listing() -> ChannelListing {
+    ChannelListing {
+        channel_id: "000000000000000000000000000000dd".into(),
+        ..listing()
+    }
+}
+
+/// T028(US3): selected を archived にすると `list()` の全要素 `selected==false` になり、
+/// 新規到着チャンネルの掲載が `Ok(false)`(保留)に落ちる(FR-011 / R5)。
+///
+/// 非配信中で archive するため配信中ロックは介在しない。selected() が archived を
+/// 未選択相当に落とすことで、UI の警告表示(全 false)と発行の保留が同時に成立する。
+#[test]
+fn archiving_selected_deselects_and_holds_new_listing() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let broadcast = Arc::new(BroadcastState::new());
+    let identity = Arc::new(
+        IdentityManager::new(store, Keystore::ephemeral())
+            .with_broadcast_state(Arc::clone(&broadcast)),
+    );
+    let a = identity.create("A").unwrap(); // 自動選択
+    let sink = Arc::new(CapturingSink::default());
+    let engine = Arc::new(PublishEngine::new(
+        Arc::clone(&identity),
+        Arc::clone(&sink) as Arc<dyn EventSink>,
+        60,
+        Arc::clone(&broadcast),
+    ));
+
+    // 事前: selected があるので新規到着チャンネルは発行される。
+    // 終了発行で解錠してから archive する(archive 自体は配信中ロック非介在)。
+    assert!(
+        engine.publish_listing(&listing()).unwrap(),
+        "archive 前は selected があるので発行される"
+    );
+    assert!(engine.publish_ended(&listing()).unwrap());
+    assert!(!broadcast.is_broadcasting(), "終了発行で解錠");
+
+    // selected(A)を archive(非配信中)→ 未選択相当。
+    identity
+        .set_state(&a.pubkey, PersonaState::Archived)
+        .unwrap();
+
+    // GET /personas 相当(list())の全要素が selected==false(UI は警告 → 全 false)。
+    let list = identity.list().unwrap();
+    assert!(
+        list.iter().all(|p| !p.selected),
+        "archived 化で選択中は全 false になる(FR-011)"
+    );
+
+    // 新規到着チャンネル(未発行)は署名鍵が解決できず掲載保留に落ちる。
+    assert!(
+        !engine.publish_listing(&other_listing()).unwrap(),
+        "selected が archived なら新規掲載は保留(Ok(false))"
+    );
+    assert!(
+        !broadcast.is_broadcasting(),
+        "保留は配信中に含めない(予約しない — FR-008)"
+    );
 }

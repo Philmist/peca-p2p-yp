@@ -26,6 +26,8 @@
     .banner { padding: 0.6rem 0.9rem; margin-bottom: 0.8rem; border-radius: 4px; font-weight: bold; }
     .banner-alert { background: #f8d7da; border: 1px solid #b00; color: #700; }
     .banner-warn  { background: #fff3cd; border: 1px solid #b06000; color: #663c00; }
+    .banner-info  { background: #e7f1ff; border: 1px solid #4a76c4; color: #1c3b6e; font-weight: normal; }
+    #selected-persona a { margin-left: 0.5rem; }
     #confirm-dialog { display: none; position: fixed; top: 30%; left: 50%; transform: translateX(-50%);
       background: #fff; border: 1px solid #ccc; padding: 1rem; box-shadow: 0 4px 12px rgba(0,0,0,.2); z-index: 100; }
     #confirm-dialog p { margin: 0 0 1rem; }
@@ -46,6 +48,10 @@
   </div>
   <!-- 時計ずれ警告バナー(T048) -->
   <div id="banner-clockskew" class="banner banner-warn" hidden></div>
+
+  <!-- 現在名乗っているペルソナ(読み取り専用 — FR-010)。archived/利用不可化した場合は
+       未選択相当となり警告表示にして再選択を促す(FR-011)。 -->
+  <div id="selected-persona" class="banner banner-warn" hidden></div>
 
   <!-- ノードステータス -->
   <div id="status-bar">
@@ -165,6 +171,42 @@
           skewBanner.hidden = true;
         }
       } catch (_) {}
+    }
+
+    // 現在名乗っているペルソナ(選択中)を読み取り専用で常時明示する(FR-010)。
+    // 新フィールドは使わず GET /personas の selected/label/pubkey から導出する(R7)。
+    // selected が後から archived/利用不可になると selected() が None に落ち(R5)、
+    // GET /personas の selected が全 false になるため、ここは自然に警告表示になる(FR-011)。
+    async function loadSelectedPersona() {
+      const el = document.getElementById('selected-persona');
+      try {
+        const res = await fetch('/api/v1/personas');
+        if (!res.ok) { el.hidden = true; return; }
+        const personas = await res.json();
+        const sel = personas.find(p => p.selected);
+        if (sel) {
+          // 通常表示(読み取り専用の情報バナー)。操作導線はペルソナ管理画面に限定。
+          el.className = 'banner banner-info';
+          el.textContent = '名乗っているペルソナ: ' + (sel.label || '(名称なし)')
+            + ' (' + shortPubkey(sel.pubkey) + ')';
+          el.hidden = false;
+        } else if (personas.length === 0) {
+          // ペルソナが 1 つもない → 作成導線(FR-013)。
+          el.className = 'banner banner-warn';
+          el.innerHTML = '⚠ ペルソナがありません。掲載するにはペルソナを作成してください。'
+            + '<a href="/personas.html">ペルソナ管理</a>';
+          el.hidden = false;
+        } else {
+          // 選択中がアーカイブ/利用不可で外れた、もしくは未選択 → 警告 + 再選択導線(FR-011)。
+          el.className = 'banner banner-warn';
+          el.innerHTML = '⚠ 名乗るペルソナが選択されていません(掲載は保留中)。'
+            + 'ペルソナを選択してください。'
+            + '<a href="/personas.html">ペルソナ管理</a>';
+          el.hidden = false;
+        }
+      } catch (_) {
+        el.hidden = true;
+      }
     }
 
     // 掲載中チャンネル一覧(自ノード)を取得して表示する
@@ -309,9 +351,11 @@
 
     (async () => {
       try { await loadToken(); } catch(_) {}
-      await Promise.all([loadStatus(), loadAnnounced(), loadChannels()]);
-      // ステータスを定期更新し、全断→回復・自動再開や時計ずれ解消を反映する(T048)。
+      await Promise.all([loadStatus(), loadSelectedPersona(), loadAnnounced(), loadChannels()]);
+      // ステータス・名乗りペルソナを定期更新し、全断→回復・自動再開や時計ずれ解消、
+      // selected の archived/利用不可化(未選択への転落)を再読込なしで反映する(T048/FR-010)。
       setInterval(loadStatus, 5000);
+      setInterval(loadSelectedPersona, 5000);
     })();
   </script>
 </body>

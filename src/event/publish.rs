@@ -120,7 +120,10 @@ impl PublishEngine {
         // 署名ペルソナ解決。初回発行時は「予約先行」(INV-2 — ADR-0011): 配信中ロック下で
         // persona を解決し、Some ならチャンネルを配信中集合へ予約してから(ロック外で)署名する。
         // これにより発行開始と `select()` のどちらが先にロックを取っても不変条件
-        // 「配信中の区間 selected は不変」が保たれる(research R2)。
+        // 「配信中の区間 selected は不変」が保たれる(research R2)。解決(`persona_for_channel`)は
+        // selected の usable 判定で復号を伴うが、これは archived/unusable の selected を保留に
+        // 落とす判定(FR-011)を select/archive と同じロック下で原子的に行うため意図的(TOCTOU
+        // 閉塞)。ロック外に出すのは署名の暗号処理のみ。
         let resolved = if first_publish {
             self.broadcast
                 .reserve_and_read_selected(&listing.channel_id, || {

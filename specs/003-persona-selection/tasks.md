@@ -104,13 +104,13 @@
 
 ### Tests for User Story 3 ⚠️（先に書いて失敗を確認)
 
-- [ ] T027 [P] [US3] `src/identity/mod.rs` の `#[cfg(test)]` に `selected()` セマンティクス拡張の単体テストを追加する: 対象が破棄済み・archived・unusable のいずれでも `None` を返す(R5/FR-011)
-- [ ] T028 [P] [US3] `tests/integration/persona_lock.rs`(または新規 `tests/integration/persona_display.rs`)に統合テストを追加する: selected を archived にすると `GET /personas` の全要素 `selected==false` になり、新規到着チャンネルの掲載が `Ok(false)`(保留)に落ちる(FR-011)
+- [x] T027 [P] [US3] `src/identity/mod.rs` の `#[cfg(test)]` に `selected()` セマンティクス拡張の単体テストを追加する: 対象が破棄済み・archived・unusable のいずれでも `None` を返す(R5/FR-011)
+- [x] T028 [P] [US3] `tests/integration/persona_lock.rs`(または新規 `tests/integration/persona_display.rs`)に統合テストを追加する: selected を archived にすると `GET /personas` の全要素 `selected==false` になり、新規到着チャンネルの掲載が `Ok(false)`(保留)に落ちる(FR-011)
 
 ### Implementation for User Story 3
 
-- [ ] T029 [US3] `src/identity/mod.rs` の `selected()` を拡張する: 対象が破棄済みに加え archived または unusable(復号失敗)の場合も `None` を返す。設定値 `selected_persona` は消去せず都度判定にする(FR-011、R5)
-- [ ] T030 [US3] `ui/channels.html` を変更する: `GET /api/v1/personas` の `selected`・`label`・`pubkey` から現在の selected を label+短縮 pubkey で読み取り専用表示する。未選択(全 false / 0 個)は「未選択(ペルソナを作成してください)」、archived/unusable 相当は警告表示にして再選択を促す(FR-010/011、R7、新 API フィールド不要)
+- [x] T029 [US3] `src/identity/mod.rs` の `selected()` を拡張する: 対象が破棄済みに加え archived または unusable(復号失敗)の場合も `None` を返す。設定値 `selected_persona` は消去せず都度判定にする(FR-011、R5)
+- [x] T030 [US3] `ui/channels.html` を変更する: `GET /api/v1/personas` の `selected`・`label`・`pubkey` から現在の selected を label+短縮 pubkey で読み取り専用表示する。未選択(全 false / 0 個)は「未選択(ペルソナを作成してください)」、archived/unusable 相当は警告表示にして再選択を促す(FR-010/011、R7、新 API フィールド不要)
 
 **Checkpoint**: 全ストーリーが独立に機能。誤爆防止の常時明示が完成。
 
@@ -120,8 +120,8 @@
 
 **Purpose**: 品質ゲートとトレーサビリティの最終確認。
 
-- [ ] T031 [P] ロック順序・TOCTOU 閉塞・予約先行の意図コメントを `src/broadcast.rs`・`src/event/publish.rs`・`src/identity/mod.rs` でレビューし、保安上複雑なロジックに意図が明記されていることを確認する(Principle III MUST)
-- [ ] T032 [P] `docs/adr/0011-broadcasting-lock.md` と spec/contracts の参照原則番号・FR/SC 対応の齟齬がないか最終確認する(Principle VI、checklists/security.md・api.md 参照)
+- [x] T031 [P] ロック順序・TOCTOU 閉塞・予約先行の意図コメントを `src/broadcast.rs`・`src/event/publish.rs`・`src/identity/mod.rs` でレビューし、保安上複雑なロジックに意図が明記されていることを確認する(Principle III MUST)
+- [x] T032 [P] `docs/adr/0011-broadcasting-lock.md` と spec/contracts の参照原則番号・FR/SC 対応の齟齬がないか最終確認する(Principle VI、checklists/security.md・api.md 参照)
 - [ ] T033 `cargo fmt -- --check` を通す(CLAUDE.md / CI)
 - [ ] T034 `cargo clippy` を警告なしで通す(CI)
 - [ ] T035 `quickstart.md` のシナリオ 1〜6 を手動実行し、SC-001〜SC-005 の受け入れを確認する

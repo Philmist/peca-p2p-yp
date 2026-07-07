@@ -212,9 +212,15 @@ impl IdentityManager {
         let keys = Keys::generate();
         let pubkey = keys.public_key().to_hex();
         let secret_enc = self.keystore.protect(keys.secret_key().as_secret_bytes())?;
+        // 「最初のペルソナ」判定は挿入前の在庫で行う(FR-004 MUST NOT の厳格化)。
+        // `selected().is_none()` を条件にすると、選択中が後から archived/unusable 化して
+        // 未選択相当になった状態(R5 の拡張)で 2 個目以降が自動選択されてしまい、
+        // 「2 個目以降は選択中を自動変更しない」に反する。未選択のまま明示再選択を促す
+        // (誤爆防止 — FR-011/FR-012)。
+        let is_first_persona = self.store.list_personas()?.is_empty();
         let persona = self.store.insert_persona(&pubkey, &secret_enc, label)?;
-        // 最初のペルソナは自動的に選択中とする(UI が必ず 1 つ明示できるように)。
-        if self.selected()?.is_none() {
+        // 最初のペルソナだけ自動的に選択中とする(UI が必ず 1 つ明示できるように)。
+        if is_first_persona {
             self.select(&pubkey)?;
         }
         Ok(PersonaInfo {
@@ -320,13 +326,28 @@ impl IdentityManager {
         })
     }
 
-    /// 「現在選択中」ペルソナの pubkey。未選択・破棄済みなら `None`。
+    /// 「現在選択中」ペルソナの pubkey。未選択なら `None`。
+    ///
+    /// 選択中が後から**破棄済み・archived・利用不可(復号失敗)**のいずれかになった場合も
+    /// `None`(未選択相当)を返す(FR-011、R5 — 保安上の意図: 利用者がアーカイブ/破棄した、
+    /// あるいは鍵が使えなくなったペルソナで意図せず名乗り続けないため)。これにより
+    /// `persona_for_channel` 経由の署名鍵解決が `None` に落ち、`publish_listing` が
+    /// `Ok(false)`(掲載保留)になり、UI 警告表示と整合する。設定値 `selected_persona` は
+    /// **消さない**(再 active 化・鍵回復で復帰できるよう、判定は都度行う)。
     pub fn selected(&self) -> Result<Option<String>, IdentityError> {
         let Some(pubkey) = self.store.get_setting(SELECTED_PERSONA_KEY)? else {
             return Ok(None);
         };
         // 破棄済みペルソナが残っていたら選択解除扱いにする。
-        if self.store.get_persona_by_pubkey(&pubkey)?.is_none() {
+        let Some(persona) = self.store.get_persona_by_pubkey(&pubkey)? else {
+            return Ok(None);
+        };
+        // archived は選択対象外(FR-011)。
+        if persona.state != PersonaState::Active {
+            return Ok(None);
+        }
+        // 復号不可(利用不可)も未選択相当(FR-011)。共有保管物が利用不可なら一律 None。
+        if self.health.is_unavailable() || self.keystore.unprotect(&persona.secret_enc).is_err() {
             return Ok(None);
         }
         Ok(Some(pubkey))
@@ -631,5 +652,74 @@ mod tests {
         // 非 selected ペルソナのアーカイブ・破棄は配信中でも許可(FR-007)。
         assert!(m.set_state(&c.pubkey, PersonaState::Archived).is_ok());
         assert!(m.delete(&c.pubkey).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // T027(US3): selected() のセマンティクス拡張(破棄済み/archived/unusable → None。
+    // R5/FR-011)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn selected_none_when_target_archived() {
+        let m = manager();
+        let a = m.create("A").unwrap(); // 自動選択
+        assert_eq!(m.selected().unwrap(), Some(a.pubkey.clone()));
+        // selected をアーカイブすると未選択相当(掲載は保留に落ちる — FR-011)。
+        m.set_state(&a.pubkey, PersonaState::Archived).unwrap();
+        assert_eq!(
+            m.selected().unwrap(),
+            None,
+            "archived の selected は未選択相当"
+        );
+        // 設定値は消さず都度判定なので、再 active 化で復帰する(R5)。
+        m.set_state(&a.pubkey, PersonaState::Active).unwrap();
+        assert_eq!(
+            m.selected().unwrap(),
+            Some(a.pubkey),
+            "再 active 化で選択が復帰する"
+        );
+    }
+
+    #[test]
+    fn selected_none_when_target_deleted() {
+        let m = manager();
+        let a = m.create("A").unwrap();
+        m.delete(&a.pubkey).unwrap();
+        assert_eq!(m.selected().unwrap(), None, "破棄済みの selected は None");
+    }
+
+    #[test]
+    fn selected_none_when_target_unusable() {
+        // 復号不可(破損エンベロープ)の selected は未選択相当(利用不可 → None。FR-011)。
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let m = IdentityManager::new(Arc::clone(&store), Keystore::ephemeral());
+        let pubkey = "cd".repeat(32);
+        store
+            .insert_persona(&pubkey, b"garbage-not-an-envelope", "壊れ")
+            .unwrap();
+        // 設定値としては選択されているが復号できない。
+        store.set_setting(SELECTED_PERSONA_KEY, &pubkey).unwrap();
+        assert_eq!(
+            m.selected().unwrap(),
+            None,
+            "unusable(復号不可)の selected は未選択相当"
+        );
+    }
+
+    /// FR-004 MUST NOT: 2 個目以降の作成では selected を自動変更しない。
+    /// T029 で selected() が archived を None にしても、A→archive→B 作成で B を
+    /// 自動選択しない(未選択のまま = 明示再選択を促す。FR-011/FR-012)。
+    #[test]
+    fn archived_selected_does_not_auto_select_new_persona() {
+        let m = manager();
+        let a = m.create("A").unwrap(); // 自動選択
+        m.set_state(&a.pubkey, PersonaState::Archived).unwrap();
+        assert_eq!(m.selected().unwrap(), None);
+        let b = m.create("B").unwrap();
+        assert!(
+            !b.selected,
+            "2 個目は selected が空でも自動選択しない(FR-004)"
+        );
+        assert_eq!(m.selected().unwrap(), None, "作成後も未選択のまま");
     }
 }

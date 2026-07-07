@@ -76,4 +76,4 @@ constitution Principle V のクリティカル 3 基準(すべて充足で該当
 - Principle II: UI のみでなくバックエンド中核での拒否強制、定型エラーコードのみ(決定 §1/§3)
 - Principle V: クリティカル 3 基準の判定と非該当理由・代替担保の明示(MUST)
 - Principle VI: 本 ADR が参照原則・関連 ADR(0003・0004 §7・0005)を明示
-- 関連: [ADR-0003](./0003-persona-key-management.md)(ペルソナ状態・破棄・利用不可)、[ADR-0004 §7](./0004-threat-model.md)(リンク推定)、spec FR-002/004/005/006/007/008/009/011/012・SC-002/003/005
+- 関連: [ADR-0003](./0003-persona-key-management.md)(ペルソナ状態・破棄・利用不可)、[ADR-0004 §7](./0004-threat-model.md)(リンク推定)、spec FR-002/004/005/006/007/008/009/010/011/012・SC-002/003/005

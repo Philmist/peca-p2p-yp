@@ -17,9 +17,13 @@
 //!   「配信中の区間、当該チャンネルの署名ペルソナは変化しない」が保たれる(research R2)。
 //! - **INV-2(予約先行)**: あるチャンネルの初回署名は、当該チャンネルを配信中集合へ
 //!   **予約した後に**行う([`reserve_and_read_selected`](BroadcastState::reserve_and_read_selected))。
-//!   署名(暗号処理)はロックの外で行い(ロック保持時間を最小化)、失敗時は予約を
+//!   **署名の暗号処理はロックの外**で行い(ロック保持時間を最小化)、失敗時は予約を
 //!   巻き戻す。予約を署名より先に置かないと「署名中に select が空集合を見て通る」窓が
-//!   残る(research R2)。
+//!   残る(research R2)。なお `read`(署名ペルソナ解決 = `persona_for_channel` →
+//!   `selected`)は selected の usable 判定のため復号(`unprotect`)を伴い、これは**意図的に
+//!   ロック下**で行う(FR-011/R5)。selected の usable 判定を `select`/archive の直列化と
+//!   同じロック下に置くことで「判定は通ったが直後に archive されて archived 鍵で署名」という
+//!   TOCTOU を閉塞する。ロック下で禁じるのは**署名の暗号処理**であって解決時の復号ではない。
 //! - **INV-3(確実な解錠)**: チャンネルは終了発行(`publish_ended`)・署名失敗の巻き戻しで
 //!   配信中集合から必ず除去される([`release`](BroadcastState::release))。PCP 異常切断も
 //!   ended 経路を通るため配信中状態が取り残されない(FR-009)。
@@ -61,8 +65,11 @@ impl BroadcastState {
     ///
     /// `read` はロック保持下で評価する「このチャンネルの署名ペルソナ解決」
     /// (`persona_for_channel` 相当)。`Some` を返したときのみチャンネルを予約する
-    /// (`None` = ペルソナ未選択で掲載保留のときは予約しない)。返した署名は呼び出し側が
-    /// **ロックの外で**行う(INV-2 — ロック保持中に暗号処理をしない)。
+    /// (`None` = ペルソナ未選択・archived・利用不可で掲載保留のときは予約しない)。
+    /// `read` は selected の usable 判定で復号を伴い、それは `select`/archive との原子性の
+    /// ため**意図的にロック下**で行う(TOCTOU 閉塞 — INV-2)。一方、返したペルソナでの
+    /// **署名**(暗号処理)は呼び出し側が**ロックの外で**行う(INV-2 — ロック保持中に
+    /// 署名の暗号処理をしない)。
     pub fn reserve_and_read_selected<E>(
         &self,
         channel_id: &str,
