@@ -29,13 +29,22 @@
     (<code id="current-persona-pubkey"></code>)
   </div>
   <div id="no-current-banner" class="notice">
-    現在、チャンネルに割り当てられているペルソナはありません。
+    現在選択中のペルソナはありません(未選択)。
+  </div>
+  <!-- 配信中ロックの理由表示 (FR-005 UI 側 — best-effort。真の強制はバックエンド) -->
+  <div id="broadcasting-banner" class="warning-box" hidden>
+    <strong>配信中です。</strong>配信中はペルソナを変更できません(切り替え・破棄・アーカイブは配信停止後に行えます)。
   </div>
 
   <!-- リンク推定の注意文言 (ADR-0004 §7 — MUST 常設) -->
   <div class="warning-box">
     <strong>注意:</strong>
     同一ノード・同一トラッカーから複数のペルソナで掲載すると、ネットワーク観測によりペルソナ間のリンクが推定されうることに留意してください。
+  </div>
+
+  <!-- ペルソナ 0 個時の作成導線 (FR-013) -->
+  <div id="empty-guidance" class="notice" hidden>
+    ペルソナがまだありません。まず 1 つ作成すると、それが自動的に選択中になり、掲載時に名乗るペルソナになります。
   </div>
 
   <section>
@@ -51,7 +60,7 @@
     <table id="personas-table" hidden>
       <thead>
         <tr>
-          <th>公開鍵(短縮)</th><th>表示名</th><th>状態</th><th>作成日時</th><th>操作</th>
+          <th>選択</th><th>公開鍵(短縮)</th><th>表示名</th><th>状態</th><th>作成日時</th><th>操作</th>
         </tr>
       </thead>
       <tbody id="personas-body"></tbody>
@@ -62,6 +71,9 @@
   <script>
     let token = null;
     let currentPersonas = [];
+    // 配信中フラグ(GET /status の 5 秒ポーリングで更新 — FR-005 UI 側)。
+    // UI の無効化は best-effort であり、真の強制はバックエンドの 409 拒否(ADR-0011)。
+    let broadcasting = false;
 
     async function loadToken() {
       const res = await fetch('/api/v1/token');
@@ -79,6 +91,39 @@
       return new Date(sec * 1000).toLocaleString();
     }
 
+    // 配信中真偽を GET /status から取得しバナー表示を更新する。
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/v1/status');
+        if (res.ok) broadcasting = !!(await res.json()).broadcasting;
+      } catch (e) { /* 取得失敗時は前回値を保持 */ }
+      document.getElementById('broadcasting-banner').hidden = !broadcasting;
+    }
+
+    // 選択中ペルソナの切り替え(即時・確認ダイアログなし — FR-012)。
+    async function selectPersona(pk) {
+      const r = await fetch('/api/v1/personas/' + pk, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
+        body: JSON.stringify({ select: true }),
+      });
+      if (r.ok) { await refreshStatus(); loadPersonas(); return; }
+      // 送信時点で配信中だった等(古い画面状態の競合)は理由を提示し画面を最新化する。
+      let err = '';
+      try { err = (await r.json()).error || ''; } catch (e) { /* body なし */ }
+      if (err === 'broadcasting_locked') {
+        alert('配信中はペルソナを変更できません。配信を停止してからお試しください。');
+      } else if (err === 'persona_not_selectable') {
+        alert('このペルソナ(アーカイブ済み)は選択できません。');
+      } else if (err === 'persona_unusable') {
+        alert('このペルソナは利用できません(鍵の復号に失敗しました)。');
+      } else {
+        alert('選択に失敗しました: ' + r.status);
+      }
+      await refreshStatus();
+      loadPersonas();
+    }
+
     async function loadPersonas() {
       const statusEl = document.getElementById('list-status');
       try {
@@ -88,44 +133,65 @@
         const tbody = document.getElementById('personas-body');
         tbody.innerHTML = '';
 
-        // 現在選択中ペルソナの表示
-        const currentActive = currentPersonas.find(p => p.channel_assigned && p.state === 'active');
-        if (currentActive) {
+        // 現在選択中ペルソナの表示(GET /personas の selected フラグから導出)。
+        const selected = currentPersonas.find(p => p.selected);
+        if (selected) {
           document.getElementById('current-persona-banner').hidden = false;
           document.getElementById('no-current-banner').hidden = true;
-          document.getElementById('current-persona-label').textContent = currentActive.label;
-          document.getElementById('current-persona-pubkey').textContent = shortPubkey(currentActive.pubkey);
+          document.getElementById('current-persona-label').textContent = selected.label;
+          document.getElementById('current-persona-pubkey').textContent = shortPubkey(selected.pubkey);
         } else {
           document.getElementById('current-persona-banner').hidden = true;
           document.getElementById('no-current-banner').hidden = false;
         }
 
         if (currentPersonas.length === 0) {
-          statusEl.textContent = 'ペルソナはありません。';
+          // 0 個時は作成導線を出す(FR-013)。
+          statusEl.textContent = '';
+          document.getElementById('empty-guidance').hidden = false;
           document.getElementById('personas-table').hidden = true;
           return;
         }
+        document.getElementById('empty-guidance').hidden = true;
         statusEl.textContent = '';
         document.getElementById('personas-table').hidden = false;
 
         for (const p of currentPersonas) {
           const tr = document.createElement('tr');
-          const isUnavailable = p.state === 'unavailable';
-          const isCurrent = p.channel_assigned && p.state === 'active';
-          if (isCurrent) tr.className = 'current-persona';
+          const isUnusable = p.usable === false;
+          const isActive = p.state === 'active';
+          const selectable = isActive && !isUnusable;
+          if (p.selected) tr.className = 'current-persona';
 
-          let stateLabel = p.state === 'active' ? '有効' : p.state === 'archived' ? 'アーカイブ' : '利用不可';
-          if (isUnavailable) stateLabel = '<span class="unavailable">利用不可(復号失敗)</span>';
+          let stateLabel = isUnusable ? '<span class="unavailable">利用不可(復号失敗)</span>'
+            : isActive ? '有効' : 'アーカイブ';
 
+          // 選択列: 選択中はラベル、選択可能はボタン(配信中は best-effort 無効化)、
+          // archived/unusable は無効化ボタン(グレーアウト — FR-003)。
+          let selCell;
+          if (p.selected) {
+            selCell = '<span class="ok">選択中</span>';
+          } else if (selectable) {
+            const dis = broadcasting ? 'disabled title="配信中は変更できません"' : '';
+            selCell = `<button class="select-btn" data-pk="${escHtml(p.pubkey)}" ${dis}>選択</button>`;
+          } else {
+            selCell = '<button disabled title="有効かつ利用可能なペルソナのみ選択できます">選択</button>';
+          }
+
+          // 配信中は selected 行の破棄・アーカイブを無効化する(FR-005 UI 側)。
+          const lockSelectedOps = broadcasting && p.selected;
           let ops = '';
-          if (!isUnavailable) {
-            ops += `<button class="archive-btn" data-pk="${escHtml(p.pubkey)}" data-state="${escHtml(p.state)}">
+          if (!isUnusable) {
+            const adis = lockSelectedOps ? 'disabled title="配信中は変更できません"' : '';
+            ops += `<button class="archive-btn" data-pk="${escHtml(p.pubkey)}" data-state="${escHtml(p.state)}" ${adis}>
               ${p.state === 'archived' ? '有効化' : 'アーカイブ'}</button> `;
             ops += `<button class="export-btn" data-pk="${escHtml(p.pubkey)}" data-label="${escHtml(p.label)}">nsec エクスポート</button> `;
           }
-          ops += `<button class="delete-btn" data-pk="${escHtml(p.pubkey)}" data-label="${escHtml(p.label)}">破棄</button>`;
+          const ddis = lockSelectedOps ? 'disabled title="配信中は変更できません"' : '';
+          ops += `<button class="delete-btn" data-pk="${escHtml(p.pubkey)}" data-label="${escHtml(p.label)}" ${ddis}>破棄</button>`;
 
           tr.innerHTML = `
+            <td>${selCell}</td>
             <td title="${escHtml(p.pubkey)}">${shortPubkey(p.pubkey)}</td>
             <td>${escHtml(p.label)}</td>
             <td>${stateLabel}</td>
@@ -134,6 +200,11 @@
           `;
           tbody.appendChild(tr);
         }
+
+        // 選択ボタン(即時・確認ダイアログなし — FR-012)
+        document.querySelectorAll('.select-btn').forEach(btn => {
+          btn.addEventListener('click', () => selectPersona(btn.dataset.pk));
+        });
 
         // アーカイブ/有効化ボタン
         document.querySelectorAll('.archive-btn').forEach(btn => {
@@ -144,12 +215,19 @@
               headers: { 'Content-Type': 'application/json', 'X-Api-Token': token },
               body: JSON.stringify({ state: newState }),
             });
-            if (r.ok) loadPersonas();
-            else alert('操作失敗: ' + r.status);
+            if (r.ok) { loadPersonas(); return; }
+            let err = ''; try { err = (await r.json()).error || ''; } catch (e) {}
+            if (err === 'broadcasting_locked') {
+              alert('配信中は選択中ペルソナをアーカイブできません。配信を停止してからお試しください。');
+              await refreshStatus();
+            } else {
+              alert('操作失敗: ' + r.status);
+            }
+            loadPersonas();
           });
         });
 
-        // nsec エクスポートボタン (contracts/local-api.md §export — 警告 + 確認)
+        // nsec エクスポートボタン (contracts/local-api.md §export — 警告 + 確認は維持 FR-012)
         document.querySelectorAll('.export-btn').forEach(btn => {
           btn.addEventListener('click', async () => {
             const label = btn.dataset.label;
@@ -174,7 +252,7 @@
           });
         });
 
-        // 破棄ボタン
+        // 破棄ボタン (確認ダイアログは維持 — FR-012)
         document.querySelectorAll('.delete-btn').forEach(btn => {
           btn.addEventListener('click', async () => {
             if (!confirm(`ペルソナ「${btn.dataset.label}」を破棄しますか？\nこの操作は復元できません。`)) return;
@@ -182,8 +260,15 @@
               method: 'DELETE',
               headers: { 'X-Api-Token': token },
             });
-            if (r.ok) loadPersonas();
-            else alert('破棄失敗: ' + r.status);
+            if (r.ok) { loadPersonas(); return; }
+            let err = ''; try { err = (await r.json()).error || ''; } catch (e) {}
+            if (err === 'broadcasting_locked') {
+              alert('配信中は選択中ペルソナを破棄できません。配信を停止してからお試しください。');
+              await refreshStatus();
+            } else {
+              alert('破棄失敗: ' + r.status);
+            }
+            loadPersonas();
           });
         });
 
@@ -217,9 +302,18 @@
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    // 配信中フラグの 5 秒ポーリング。状態が変わったら一覧を再描画してボタン活性を追随させる。
+    async function pollStatus() {
+      const prev = broadcasting;
+      await refreshStatus();
+      if (broadcasting !== prev) loadPersonas();
+    }
+
     (async () => {
       try { await loadToken(); } catch(e) {}
+      await refreshStatus();
       await loadPersonas();
+      setInterval(pollStatus, 5000);
     })();
   </script>
 </body>

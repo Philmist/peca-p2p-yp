@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
+use peca_p2p_yp::broadcast::BroadcastState;
 use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::VerifyConfig;
 use peca_p2p_yp::event::store::StoreConfig;
@@ -121,14 +122,21 @@ impl AnnouncerNode {
             }));
         }
 
-        // ペルソナ(自動選択)+ 掲載エンジン + 変更契機ブリッジ。
-        let identity = Arc::new(IdentityManager::new(
-            Arc::clone(&store),
-            Keystore::ephemeral(),
-        ));
+        // ペルソナ(自動選択)+ 掲載エンジン + 変更契機ブリッジ。identity と engine は
+        // 同一の BroadcastState を共有する(ADR-0011)。
+        let broadcast = Arc::new(BroadcastState::new());
+        let identity = Arc::new(
+            IdentityManager::new(Arc::clone(&store), Keystore::ephemeral())
+                .with_broadcast_state(Arc::clone(&broadcast)),
+        );
         let persona_pubkey = identity.create("US1 テスト").unwrap().pubkey;
         let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
-        let engine = Arc::new(PublishEngine::new(Arc::clone(&identity), sink, 60));
+        let engine = Arc::new(PublishEngine::new(
+            Arc::clone(&identity),
+            sink,
+            60,
+            Arc::clone(&broadcast),
+        ));
         handles.push(spawn_publish_bridge(
             registry.subscribe(),
             engine,

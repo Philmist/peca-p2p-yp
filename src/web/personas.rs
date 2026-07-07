@@ -58,6 +58,14 @@ fn identity_err(e: IdentityError) -> Response {
         IdentityError::Unusable => {
             error_response(StatusCode::UNPROCESSABLE_ENTITY, "persona_unusable")
         }
+        // archived の選択(選択対象外)は 409 — 復号不可(422)と区別する(contracts §1/§5)。
+        IdentityError::NotSelectable => {
+            error_response(StatusCode::CONFLICT, "persona_not_selectable")
+        }
+        // 配信中は selected の切替/破棄/アーカイブを拒否(ADR-0011、contracts §1/§2/§5)。
+        IdentityError::BroadcastingLocked => {
+            error_response(StatusCode::CONFLICT, "broadcasting_locked")
+        }
         IdentityError::Crypto | IdentityError::Store(_) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }

@@ -28,6 +28,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
+use crate::broadcast::BroadcastState;
 use crate::event::view::ChannelDirectory;
 use crate::identity::IdentityManager;
 use crate::security::{SecurityCategory, SecurityLog};
@@ -77,6 +78,9 @@ pub struct AppState {
     pub announced: Option<Arc<dyn AnnouncedProvider>>,
     /// ノード状態の供給元(T031)。未配線時は `None`(全て 0/false)。
     pub node_status: Option<Arc<dyn NodeStatusProvider>>,
+    /// 配信中ロックの共有状態(T025 — `GET /status` の `broadcasting`)。
+    /// 未配線時は `None`(= `broadcasting: false`。contracts §3)。
+    pub broadcast: Option<Arc<BroadcastState>>,
 }
 
 impl AppState {
@@ -94,6 +98,7 @@ impl AppState {
             identity: None,
             announced: None,
             node_status: None,
+            broadcast: None,
         }
     }
 
@@ -116,6 +121,7 @@ impl AppState {
             identity: None,
             announced: None,
             node_status: None,
+            broadcast: None,
         }
     }
 
@@ -140,6 +146,12 @@ impl AppState {
     /// ノード状態の供給元を配線する(起動配線・テストで使用)。
     pub fn with_node_status(mut self, node_status: Arc<dyn NodeStatusProvider>) -> Self {
         self.node_status = Some(node_status);
+        self
+    }
+
+    /// 配信中ロックの共有状態を配線する(T025 — `GET /status` の `broadcasting`)。
+    pub fn with_broadcast(mut self, broadcast: Arc<BroadcastState>) -> Self {
+        self.broadcast = Some(broadcast);
         self
     }
 

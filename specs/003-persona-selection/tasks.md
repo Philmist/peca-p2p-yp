@@ -24,7 +24,7 @@
 
 **Purpose**: BDD シナリオの受け皿を用意する(実シナリオは各ストーリーのテストタスクで追加)。
 
-- [ ] T001 cucumber ランナー `tests/cucumber.rs` に新規ステップモジュール `persona_selection` を登録し、空のステップ定義ファイル `tests/steps/persona_selection.rs` と空の feature ファイル `tests/features/persona_selection.feature` を作成する(以降の Given/When/Then の受け皿)
+- [x] T001 cucumber ランナー `tests/cucumber.rs` に新規ステップモジュール `persona_selection` を登録し、空のステップ定義ファイル `tests/steps/persona_selection.rs` と空の feature ファイル `tests/features/persona_selection.feature` を作成する(以降の Given/When/Then の受け皿)
 
 ---
 
@@ -34,14 +34,14 @@
 
 **⚠️ CRITICAL**: 本フェーズ完了までどのユーザーストーリーも着手不可。
 
-- [ ] T002 `src/broadcast.rs` を新規作成し `BroadcastState { channels: Mutex<HashSet<String>> }` と公開 API シグネチャ(`is_broadcasting() -> bool`、`reserve_and_read_selected(...)`、`release(&channel_id)`、`guard_selected_mutation(...)`)を定義する。本体は後続 US2 で実装するが、既定で never-broadcasting(空集合)として `is_broadcasting()` は `false` を返す。ファイル冒頭に不変条件 INV-1(相互排他)/INV-2(予約先行)/INV-3(確実な解錠)の意図コメントを置く(Principle III MUST、data-model §BroadcastState)
-- [ ] T003 `src/lib.rs` に `pub mod broadcast;` を追加してクレートへ登録する
-- [ ] T004 [P] `src/identity/mod.rs` の `IdentityError` に新規バリアント `BroadcastingLocked` と `NotSelectable` を追加する(data-model §エラー写像)
-- [ ] T005 `src/identity/mod.rs` の `IdentityManager` に `Arc<BroadcastState>` フィールドと `with_broadcast_state(Arc<BroadcastState>)` ビルダを追加する。既定フィールドは never-broadcasting の空 `Arc` とし、既存の `new(store, keystore)` 経路のテストがロックガード no-op で挙動不変になるようにする(research R3)
-- [ ] T006 [P] `src/web/mod.rs` の `AppState` に `broadcast: Option<Arc<BroadcastState>>` フィールドと `with_broadcast(Arc<BroadcastState>)` ビルダを追加する(既存 `with_announced`/`with_node_status` に倣う)
-- [ ] T007 [P] `src/event/publish.rs` の `PublishEngine` に `broadcast: Arc<BroadcastState>` フィールドを追加し、`PublishEngine::new(...)` の引数に受け取る(配線のみ。予約/解除ロジックは US2 の T023 で実装)
-- [ ] T008 `src/main.rs` で単一の `Arc<BroadcastState>` を生成し、`IdentityManager`(`with_broadcast_state`)・`PublishEngine::new`・`AppState`(`with_broadcast`)の 3 者へ同一インスタンスを配布する(T002–T007 に依存)
-- [ ] T009 [P] `src/web/personas.rs` の `identity_err()` に写像を追加する: `BroadcastingLocked` → 409 `{"error":"broadcasting_locked"}`、`NotSelectable` → 409 `{"error":"persona_not_selectable"}`(既存 `Unusable`→422 は流用。T004 に依存、contracts §5)
+- [x] T002 `src/broadcast.rs` を新規作成し `BroadcastState { channels: Mutex<HashSet<String>> }` と公開 API シグネチャ(`is_broadcasting() -> bool`、`reserve_and_read_selected(...)`、`release(&channel_id)`、`guard_selected_mutation(...)`)を定義する。本体は後続 US2 で実装するが、既定で never-broadcasting(空集合)として `is_broadcasting()` は `false` を返す。ファイル冒頭に不変条件 INV-1(相互排他)/INV-2(予約先行)/INV-3(確実な解錠)の意図コメントを置く(Principle III MUST、data-model §BroadcastState)
+- [x] T003 `src/lib.rs` に `pub mod broadcast;` を追加してクレートへ登録する
+- [x] T004 [P] `src/identity/mod.rs` の `IdentityError` に新規バリアント `BroadcastingLocked` と `NotSelectable` を追加する(data-model §エラー写像)
+- [x] T005 `src/identity/mod.rs` の `IdentityManager` に `Arc<BroadcastState>` フィールドと `with_broadcast_state(Arc<BroadcastState>)` ビルダを追加する。既定フィールドは never-broadcasting の空 `Arc` とし、既存の `new(store, keystore)` 経路のテストがロックガード no-op で挙動不変になるようにする(research R3)
+- [x] T006 [P] `src/web/mod.rs` の `AppState` に `broadcast: Option<Arc<BroadcastState>>` フィールドと `with_broadcast(Arc<BroadcastState>)` ビルダを追加する(既存 `with_announced`/`with_node_status` に倣う)
+- [x] T007 [P] `src/event/publish.rs` の `PublishEngine` に `broadcast: Arc<BroadcastState>` フィールドを追加し、`PublishEngine::new(...)` の引数に受け取る(配線のみ。予約/解除ロジックは US2 の T023 で実装)
+- [x] T008 `src/main.rs` で単一の `Arc<BroadcastState>` を生成し、`IdentityManager`(`with_broadcast_state`)・`PublishEngine::new`・`AppState`(`with_broadcast`)の 3 者へ同一インスタンスを配布する(T002–T007 に依存)
+- [x] T009 [P] `src/web/personas.rs` の `identity_err()` に写像を追加する: `BroadcastingLocked` → 409 `{"error":"broadcasting_locked"}`、`NotSelectable` → 409 `{"error":"persona_not_selectable"}`(既存 `Unusable`→422 は流用。T004 に依存、contracts §5)
 
 **Checkpoint**: 共有状態と配線が整い、各ストーリーの実装に着手可能。
 
@@ -55,16 +55,16 @@
 
 ### Tests for User Story 1 ⚠️（先に書いて失敗を確認)
 
-- [ ] T010 [P] [US1] `src/identity/mod.rs` の `#[cfg(test)]` に `select()` の状態ガード単体テストを追加する: active+usable → `Ok`、archived → `NotSelectable`、unusable → `Unusable`、不在 → `NotFound`(R4/FR-002)
-- [ ] T011 [P] [US1] `tests/contract/local_api.rs` に `PUT /api/v1/personas/{pubkey}` `{select:true}` の契約テストを追記する: 有効 → 204、archived → 409 `persona_not_selectable`、unusable → 422 `persona_unusable`(contracts §1)
-- [ ] T012 [P] [US1] `tests/features/persona_selection.feature` に「非配信中に有効ペルソナを選択できる」「archived / unusable は選択できない」シナリオ(contracts §1 Gherkin)を追加し、`tests/steps/persona_selection.rs` に対応ステップを実装する
+- [x] T010 [P] [US1] `src/identity/mod.rs` の `#[cfg(test)]` に `select()` の状態ガード単体テストを追加する: active+usable → `Ok`、archived → `NotSelectable`、unusable → `Unusable`、不在 → `NotFound`(R4/FR-002)
+- [x] T011 [P] [US1] `tests/contract/local_api.rs` に `PUT /api/v1/personas/{pubkey}` `{select:true}` の契約テストを追記する: 有効 → 204、archived → 409 `persona_not_selectable`、unusable → 422 `persona_unusable`(contracts §1)
+- [x] T012 [P] [US1] `tests/features/persona_selection.feature` に「非配信中に有効ペルソナを選択できる」「archived / unusable は選択できない」シナリオ(contracts §1 Gherkin)を追加し、`tests/steps/persona_selection.rs` に対応ステップを実装する
 
 ### Implementation for User Story 1
 
-- [ ] T013 [US1] `src/identity/mod.rs` の `select()` に選択可能ガードを追加する: 対象が存在し `state == Active` かつ keystore 復号可能(`usable`)でなければ `NotSelectable`/`Unusable` を返す。UI だけでなくバックエンドで拒否(FR-002、R4)(T004 に依存)
-- [ ] T014 [US1] `src/identity/mod.rs` の `create()` の最初ペルソナ自動選択が新ガードを通過すること(作成直後は active+usable)を確認し、2 個目以降で selected を自動変更しない既存挙動を維持する(FR-004)
-- [ ] T015 [US1] `ui/personas.html` を変更する: 各 active 行に「選択」ボタン(現在 selected 行は「選択中」ラベル+強調、ラジオ的に常に 1 つ)、押下で **確認ダイアログを挟まず**即時に `PUT /api/v1/personas/{pubkey}` `{select:true}` を送信し「現在選択中」バナー表示(FR-012 — 常時明示で誤爆防止)。archived/unusable 行の選択ボタンは無効化(グレーアウト)。**既存の破棄・秘密鍵エクスポートの確認フローは変更しない**(FR-012 後段)(FR-001/003/010/012)
-- [ ] T016 [US1] `ui/personas.html` にペルソナ 0 個時の作成導線を追加する(FR-013、spec US1 シナリオ 2)
+- [x] T013 [US1] `src/identity/mod.rs` の `select()` に選択可能ガードを追加する: 対象が存在し `state == Active` かつ keystore 復号可能(`usable`)でなければ `NotSelectable`/`Unusable` を返す。UI だけでなくバックエンドで拒否(FR-002、R4)(T004 に依存)
+- [x] T014 [US1] `src/identity/mod.rs` の `create()` の最初ペルソナ自動選択が新ガードを通過すること(作成直後は active+usable)を確認し、2 個目以降で selected を自動変更しない既存挙動を維持する(FR-004)
+- [x] T015 [US1] `ui/personas.html` を変更する: 各 active 行に「選択」ボタン(現在 selected 行は「選択中」ラベル+強調、ラジオ的に常に 1 つ)、押下で **確認ダイアログを挟まず**即時に `PUT /api/v1/personas/{pubkey}` `{select:true}` を送信し「現在選択中」バナー表示(FR-012 — 常時明示で誤爆防止)。archived/unusable 行の選択ボタンは無効化(グレーアウト)。**既存の破棄・秘密鍵エクスポートの確認フローは変更しない**(FR-012 後段)(FR-001/003/010/012)
+- [x] T016 [US1] `ui/personas.html` にペルソナ 0 個時の作成導線を追加する(FR-013、spec US1 シナリオ 2)
 
 **Checkpoint**: 非配信中の選択操作が UI・API 双方で完結し独立検証可能。
 
@@ -78,19 +78,19 @@
 
 ### Tests for User Story 2 ⚠️（先に書いて失敗を確認)
 
-- [ ] T017 [P] [US2] `src/identity/mod.rs` の `#[cfg(test)]` にロックガード単体テストを追加する: 共有 `BroadcastState` を非空にした状態で `select`/`delete`/`set_state(→archived)` が `BroadcastingLocked`、`set_label` と非 selected ペルソナ操作は許可(FR-005/006/007)
-- [ ] T018 [P] [US2] `tests/integration/persona_lock.rs`(新規)に**並行性統合テスト**を追加する: 「発行開始(予約)」と「`select(B)`」を交錯させ、どちらが先にロックを取っても不変条件「配信中の区間 selected は不変」が保たれることを確認する(SC-005 / R2、ADR-0011 代替担保)
-- [ ] T019 [P] [US2] `tests/integration/persona_lock.rs` に解錠統合テストを追加する: 全チャンネルが `publish_ended` で集合から除去され `is_broadcasting()==false` になった後、`select` が成功する(SC-003 / FR-009)
-- [ ] T020 [P] [US2] `tests/contract/local_api.rs` に配信中拒否の契約テストを追記する: 配信中の `PUT {select:true}` / `PUT {state:"archived"}` / `DELETE ?confirm=true` がいずれも 409 `broadcasting_locked`、および `GET /api/v1/status` が `broadcasting: bool` を含む(contracts §1/§2/§3)
-- [ ] T021 [P] [US2] `tests/features/persona_selection.feature` に配信中ネガティブシナリオ(直接 API での切替/破棄/アーカイブ → 409、label と他ペルソナ操作は許可、停止後は解錠、**および古い画面状態から送信した制限操作 → 409 + `GET /status` が最新の `broadcasting` を返す**=競合 edge case)を追加し、`tests/steps/persona_selection.rs` にステップを実装する(Principle IV、spec edge case「UI の状態が古いまま制限操作を送信」、contracts §1 Gherkin)
+- [x] T017 [P] [US2] `src/identity/mod.rs` の `#[cfg(test)]` にロックガード単体テストを追加する: 共有 `BroadcastState` を非空にした状態で `select`/`delete`/`set_state(→archived)` が `BroadcastingLocked`、`set_label` と非 selected ペルソナ操作は許可(FR-005/006/007)
+- [x] T018 [P] [US2] `tests/integration/persona_lock.rs`(新規)に**並行性統合テスト**を追加する: 「発行開始(予約)」と「`select(B)`」を交錯させ、どちらが先にロックを取っても不変条件「配信中の区間 selected は不変」が保たれることを確認する(SC-005 / R2、ADR-0011 代替担保)
+- [x] T019 [P] [US2] `tests/integration/persona_lock.rs` に解錠統合テストを追加する: 全チャンネルが `publish_ended` で集合から除去され `is_broadcasting()==false` になった後、`select` が成功する(SC-003 / FR-009)
+- [x] T020 [P] [US2] `tests/contract/local_api.rs` に配信中拒否の契約テストを追記する: 配信中の `PUT {select:true}` / `PUT {state:"archived"}` / `DELETE ?confirm=true` がいずれも 409 `broadcasting_locked`、および `GET /api/v1/status` が `broadcasting: bool` を含む(contracts §1/§2/§3)
+- [x] T021 [P] [US2] `tests/features/persona_selection.feature` に配信中ネガティブシナリオ(直接 API での切替/破棄/アーカイブ → 409、label と他ペルソナ操作は許可、停止後は解錠、**および古い画面状態から送信した制限操作 → 409 + `GET /status` が最新の `broadcasting` を返す**=競合 edge case)を追加し、`tests/steps/persona_selection.rs` にステップを実装する(Principle IV、spec edge case「UI の状態が古いまま制限操作を送信」、contracts §1 Gherkin)
 
 ### Implementation for User Story 2
 
-- [ ] T022 [US2] `src/broadcast.rs` の本体を実装する: 単一 `Mutex` 下で `reserve_and_read_selected`(selected 読取 + チャンネル予約を原子的に)、`guard_selected_mutation`(配信中集合が非空なら拒否)、`release`(集合から除去)を相互排他に行う。ロック外で署名する前提を意図コメントで明記(INV-1/INV-2、R2)
-- [ ] T023 [US2] `src/event/publish.rs` を変更する: あるチャンネルの**初回発行時に予約を署名の前**に実行(`reserve_and_read_selected`)、`publish_ended` および署名失敗時に `release` で巻き戻す。周期再発行・終了時最終発行の発行契機自体は変更しない(FR-015、INV-2/INV-3、R2)(T022 に依存)
-- [ ] T024 [US2] `src/identity/mod.rs` の `select()`・`delete()`・`set_state(→archived)` に `guard_selected_mutation` を通し、対象が現在の selected かつ配信中なら `BroadcastingLocked` を返す。`set_label` は配信中でも許可(FR-005/006/007)(T022 に依存)
-- [ ] T025 [US2] `src/web/announced.rs` の `StatusResponse` に `broadcasting: bool` を追加し、`get_status()` で `BroadcastState::is_broadcasting()` を反映する(供給元未配線時は `false`)(FR-008、R6、contracts §3)
-- [ ] T026 [US2] `ui/personas.html` を変更する: 既存 5 秒ポーリングの `GET /status` の `broadcasting` を見て、selected 行の選択/破棄/アーカイブボタンを無効化し「配信中はペルソナを変更できません」と理由表示する(best-effort、真の強制は T024 のバックエンド拒否)(FR-005 UI 側)
+- [x] T022 [US2] `src/broadcast.rs` の本体を実装する: 単一 `Mutex` 下で `reserve_and_read_selected`(selected 読取 + チャンネル予約を原子的に)、`guard_selected_mutation`(配信中集合が非空なら拒否)、`release`(集合から除去)を相互排他に行う。ロック外で署名する前提を意図コメントで明記(INV-1/INV-2、R2)
+- [x] T023 [US2] `src/event/publish.rs` を変更する: あるチャンネルの**初回発行時に予約を署名の前**に実行(`reserve_and_read_selected`)、`publish_ended` および署名失敗時に `release` で巻き戻す。周期再発行・終了時最終発行の発行契機自体は変更しない(FR-015、INV-2/INV-3、R2)(T022 に依存)
+- [x] T024 [US2] `src/identity/mod.rs` の `select()`・`delete()`・`set_state(→archived)` に `guard_selected_mutation` を通し、対象が現在の selected かつ配信中なら `BroadcastingLocked` を返す。`set_label` は配信中でも許可(FR-005/006/007)(T022 に依存)
+- [x] T025 [US2] `src/web/announced.rs` の `StatusResponse` に `broadcasting: bool` を追加し、`get_status()` で `BroadcastState::is_broadcasting()` を反映する(供給元未配線時は `false`)(FR-008、R6、contracts §3)
+- [x] T026 [US2] `ui/personas.html` を変更する: 既存 5 秒ポーリングの `GET /status` の `broadcasting` を見て、selected 行の選択/破棄/アーカイブボタンを無効化し「配信中はペルソナを変更できません」と理由表示する(best-effort、真の強制は T024 のバックエンド拒否)(FR-005 UI 側)
 
 **Checkpoint**: US1 + US2 で安全な選択機能が成立(P1 完了・リンク推定を構造的に防止)。
 

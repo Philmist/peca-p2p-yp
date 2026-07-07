@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
+use peca_p2p_yp::broadcast::BroadcastState;
 use peca_p2p_yp::config::{self, CliOverrides, Settings};
 use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
@@ -229,16 +230,20 @@ async fn run() -> Result<(), i32> {
     // 14. ペルソナ管理と掲載エンジン(T028/T029)。keystore 初期化・パーミッション検査は
     //     リスナーバインド前(手順 5b)に済ませており、その健全性を IdentityManager へ渡す
     //     (Unavailable なら全ペルソナ利用不可・鍵操作は利用不可エラー — FR-013)。
-    let identity = Arc::new(IdentityManager::new_with_health(
-        Arc::clone(&store),
-        keystore,
-        keystore_health,
-    ));
+    // 配信中ロックの共有状態(ADR-0011)。identity(selected 変更ガード)・engine
+    //(発行開始の予約)・AppState(status 表示)へ同一インスタンスを配布し、発行開始と
+    // selected 変更を単一ロックで相互排他にする。
+    let broadcast = Arc::new(BroadcastState::new());
+    let identity = Arc::new(
+        IdentityManager::new_with_health(Arc::clone(&store), keystore, keystore_health)
+            .with_broadcast_state(Arc::clone(&broadcast)),
+    );
     let sink: Arc<dyn EventSink> = Arc::new(HubSink(Arc::clone(&hub)));
     let engine = Arc::new(PublishEngine::new(
         Arc::clone(&identity),
         sink,
         settings.republish_interval_sec,
+        Arc::clone(&broadcast),
     ));
     // 14a. PCP 変更契機の即時発行(announced/updated → live、ended → 最終発行)。
     handles.push(spawn_publish_bridge(
@@ -294,7 +299,8 @@ async fn run() -> Result<(), i32> {
             inbound_reachable: inbound_reachable.clone(),
             pcp_listening: true,
             max_clock_skew_sec: settings.max_clock_skew_sec as i64,
-        }));
+        }))
+        .with_broadcast(Arc::clone(&broadcast));
     let app = build_router(state);
     let http_listener = TcpListener::bind(http_addr)
         .await

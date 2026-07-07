@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use nostr::nips::nip19::ToBech32;
 use nostr::{Keys, SecretKey};
 
+use crate::broadcast::BroadcastState;
 use crate::store::{PersonaState, Store, StoreError};
 
 pub use keystore::{Keystore, KeystoreInit};
@@ -89,6 +90,10 @@ pub enum IdentityError {
     NotFound,
     /// keystore 復号に失敗した(ペルソナ利用不可 — ADR-0003 §4)。
     Unusable,
+    /// 選択不可(archived — 利用不可ではなく「選択対象外」。data-model §選択可能ガード)。
+    NotSelectable,
+    /// 配信中のため selected の切替/破棄/アーカイブを行えない(ADR-0011、FR-005)。
+    BroadcastingLocked,
     /// keystore 暗号化・鍵構築の失敗(内部詳細は含めない — Principle II)。
     Crypto,
     /// 永続層のエラー。
@@ -100,6 +105,10 @@ impl std::fmt::Display for IdentityError {
         match self {
             IdentityError::NotFound => write!(f, "ペルソナが見つかりません"),
             IdentityError::Unusable => write!(f, "このペルソナは利用できません(復号失敗)"),
+            IdentityError::NotSelectable => write!(f, "このペルソナは選択できません"),
+            IdentityError::BroadcastingLocked => {
+                write!(f, "配信中はペルソナを変更できません")
+            }
             IdentityError::Crypto => write!(f, "鍵の保護処理に失敗しました"),
             IdentityError::Store(e) => write!(f, "{e}"),
         }
@@ -140,6 +149,10 @@ pub struct IdentityManager {
     health: KeystoreHealth,
     /// チャンネルへの割当(channel_id hex32 → pubkey hex64)。揮発。
     assignments: Mutex<HashMap<String, String>>,
+    /// 配信中ロックの共有状態(ADR-0011)。既定は never-broadcasting の空 `Arc` で、
+    /// `with_broadcast_state` で `PublishEngine`・`AppState` と同一インスタンスを共有する。
+    /// 未共有(既定)のときロックガードは no-op になり既存挙動が変わらない(research R3)。
+    broadcast: Arc<BroadcastState>,
 }
 
 /// ポイズン時も内部値を回収してロックを返す(パニックしない)。
@@ -170,7 +183,24 @@ impl IdentityManager {
             keystore,
             health,
             assignments: Mutex::new(HashMap::new()),
+            // 既定は never-broadcasting(空集合)。共有インスタンスは
+            // `with_broadcast_state` で注入する。
+            broadcast: Arc::new(BroadcastState::new()),
         }
+    }
+
+    /// 配信中ロックの共有状態を注入する(起動配線・並行性テストで使用)。
+    ///
+    /// `PublishEngine`(発行開始の予約)・`AppState`(status 表示)と**同一インスタンス**を
+    /// 共有することで、発行開始と selected 変更が単一ロックで相互排他になる(ADR-0011)。
+    pub fn with_broadcast_state(mut self, broadcast: Arc<BroadcastState>) -> Self {
+        self.broadcast = broadcast;
+        self
+    }
+
+    /// 配信中ロックの共有状態への参照(配線・テスト用)。
+    pub fn broadcast_state(&self) -> &Arc<BroadcastState> {
+        &self.broadcast
     }
 
     /// ペルソナを新規作成する(鍵生成 → keystore 暗号化 → 保存)。
@@ -231,7 +261,24 @@ impl IdentityManager {
     }
 
     /// 状態(active ⇄ archived)を変更する。
+    ///
+    /// active → archived は selected ペルソナに対して配信中だとロック(FR-005)。
+    /// archived → active はロック対象外(既存挙動)。
     pub fn set_state(&self, pubkey: &str, state: PersonaState) -> Result<(), IdentityError> {
+        if state == PersonaState::Archived {
+            // 配信中に selected をアーカイブすると次回再発行で署名鍵が消え、
+            // 「旧 ended → 新 live/保留」の観測差が生じうるため拒否する(ADR-0011)。
+            return self.broadcast.guard_selected_mutation(|broadcasting| {
+                if broadcasting && self.is_current_selected(pubkey)? {
+                    return Err(IdentityError::BroadcastingLocked);
+                }
+                if self.store.update_persona_state(pubkey, state)? {
+                    Ok(())
+                } else {
+                    Err(IdentityError::NotFound)
+                }
+            });
+        }
         if self.store.update_persona_state(pubkey, state)? {
             Ok(())
         } else {
@@ -239,13 +286,38 @@ impl IdentityManager {
         }
     }
 
+    /// 対象 pubkey が現在の「選択中」設定値そのものか(配信中ロックの判定用 — raw 比較)。
+    fn is_current_selected(&self, pubkey: &str) -> Result<bool, IdentityError> {
+        Ok(self.store.get_setting(SELECTED_PERSONA_KEY)?.as_deref() == Some(pubkey))
+    }
+
     /// 「現在選択中」ペルソナを設定する(新規掲載の既定署名鍵 — UI 誤爆防止)。
+    ///
+    /// 選択可能ガード(FR-002 — UI だけでなくバックエンドで拒否): 対象が存在し
+    /// `active` かつ `usable`(keystore 復号可能)でなければ拒否する。archived は
+    /// [`NotSelectable`](IdentityError::NotSelectable)、復号不可は
+    /// [`Unusable`](IdentityError::Unusable)。
+    ///
+    /// 配信中ロック(FR-005): 発行中チャンネルがあれば selected を一律動かせない
+    /// (切替先が何であれ selected 自体を凍結する — data-model §操作マトリクス)。
     pub fn select(&self, pubkey: &str) -> Result<(), IdentityError> {
-        if self.store.get_persona_by_pubkey(pubkey)?.is_none() {
-            return Err(IdentityError::NotFound);
+        let persona = self
+            .store
+            .get_persona_by_pubkey(pubkey)?
+            .ok_or(IdentityError::NotFound)?;
+        if persona.state != PersonaState::Active {
+            return Err(IdentityError::NotSelectable);
         }
-        self.store.set_setting(SELECTED_PERSONA_KEY, pubkey)?;
-        Ok(())
+        if self.health.is_unavailable() || self.keystore.unprotect(&persona.secret_enc).is_err() {
+            return Err(IdentityError::Unusable);
+        }
+        self.broadcast.guard_selected_mutation(|broadcasting| {
+            if broadcasting {
+                return Err(IdentityError::BroadcastingLocked);
+            }
+            self.store.set_setting(SELECTED_PERSONA_KEY, pubkey)?;
+            Ok(())
+        })
     }
 
     /// 「現在選択中」ペルソナの pubkey。未選択・破棄済みなら `None`。
@@ -285,16 +357,24 @@ impl IdentityManager {
     }
 
     /// ペルソナを破棄する(行削除 — 復元不可)。割当・選択からも取り除く。
+    ///
+    /// selected ペルソナに対して配信中なら拒否する(FR-005)。配信に無関係な
+    /// (selected でない)ペルソナは配信中でも破棄できる(FR-007)。
     pub fn delete(&self, pubkey: &str) -> Result<(), IdentityError> {
         // 共有保管物が利用不可なら鍵操作は「利用不可」エラー(FR-013)。
         if self.health.is_unavailable() {
             return Err(IdentityError::Unusable);
         }
-        if !self.store.delete_persona(pubkey)? {
-            return Err(IdentityError::NotFound);
-        }
-        lock(&self.assignments).retain(|_, v| v != pubkey);
-        Ok(())
+        self.broadcast.guard_selected_mutation(|broadcasting| {
+            if broadcasting && self.is_current_selected(pubkey)? {
+                return Err(IdentityError::BroadcastingLocked);
+            }
+            if !self.store.delete_persona(pubkey)? {
+                return Err(IdentityError::NotFound);
+            }
+            lock(&self.assignments).retain(|_, v| v != pubkey);
+            Ok(())
+        })
     }
 
     /// 署名用の鍵ペアをロードする(掲載エンジン用)。復号失敗は利用不可。
@@ -445,5 +525,111 @@ mod tests {
             m.select(&"0".repeat(64)),
             Err(IdentityError::NotFound)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // T010(US1): select の選択可能ガード(active+usable。R4/FR-002)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_active_usable_is_ok() {
+        let m = manager();
+        let a = m.create("A").unwrap(); // 自動選択
+        let b = m.create("B").unwrap();
+        assert!(m.select(&b.pubkey).is_ok(), "active+usable は選択できる");
+        assert_eq!(m.selected().unwrap(), Some(b.pubkey));
+        let _ = a;
+    }
+
+    #[test]
+    fn select_archived_is_not_selectable() {
+        let m = manager();
+        let a = m.create("A").unwrap();
+        m.set_state(&a.pubkey, PersonaState::Archived).unwrap();
+        assert!(
+            matches!(m.select(&a.pubkey), Err(IdentityError::NotSelectable)),
+            "archived は選択対象外(409 相当)"
+        );
+    }
+
+    #[test]
+    fn select_unusable_is_unusable() {
+        // 復号できない(破損した)エンベロープを持つペルソナは選択不可(利用不可)。
+        // ephemeral keystore は同一プロセス・同一ユーザーでは相互復号できる(unix はマスタ鍵
+        // 共有ではないが windows は DPAPI が同一ユーザー)ため、破損 blob を直接挿入して再現する。
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let m = IdentityManager::new(Arc::clone(&store), Keystore::ephemeral());
+        let pubkey = "ab".repeat(32);
+        store
+            .insert_persona(&pubkey, b"garbage-not-an-envelope", "壊れ")
+            .unwrap();
+        assert!(
+            matches!(m.select(&pubkey), Err(IdentityError::Unusable)),
+            "復号不可は利用不可(422 相当)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T017(US2): 配信中ロックガード(FR-005/006/007)
+    // -----------------------------------------------------------------------
+
+    fn manager_with_broadcast() -> (IdentityManager, Arc<BroadcastState>) {
+        let broadcast = Arc::new(BroadcastState::new());
+        let m = IdentityManager::new(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Keystore::ephemeral(),
+        )
+        .with_broadcast_state(Arc::clone(&broadcast));
+        (m, broadcast)
+    }
+
+    /// 配信中(集合非空)を作る: A の署名で 1 チャンネルを予約する。
+    fn begin_broadcast(broadcast: &BroadcastState, persona: &str) {
+        broadcast
+            .reserve_and_read_selected::<IdentityError>("aa".repeat(16).as_str(), || {
+                Ok(Some(persona.to_string()))
+            })
+            .unwrap();
+        assert!(broadcast.is_broadcasting());
+    }
+
+    #[test]
+    fn broadcasting_locks_select_delete_archive_of_selected() {
+        let (m, broadcast) = manager_with_broadcast();
+        let a = m.create("A").unwrap(); // 自動選択
+        begin_broadcast(&broadcast, &a.pubkey);
+        let b = m.create("B").unwrap();
+
+        assert!(
+            matches!(m.select(&b.pubkey), Err(IdentityError::BroadcastingLocked)),
+            "配信中は切替不可"
+        );
+        assert!(
+            matches!(m.delete(&a.pubkey), Err(IdentityError::BroadcastingLocked)),
+            "配信中は selected の破棄不可"
+        );
+        assert!(
+            matches!(
+                m.set_state(&a.pubkey, PersonaState::Archived),
+                Err(IdentityError::BroadcastingLocked)
+            ),
+            "配信中は selected のアーカイブ不可"
+        );
+        // selected は変わっていない。
+        assert_eq!(m.selected().unwrap(), Some(a.pubkey));
+    }
+
+    #[test]
+    fn broadcasting_allows_label_and_other_persona_ops() {
+        let (m, broadcast) = manager_with_broadcast();
+        let a = m.create("A").unwrap(); // selected
+        begin_broadcast(&broadcast, &a.pubkey);
+        let c = m.create("C").unwrap();
+
+        // selected の label 変更は配信中でも許可(FR-006)。
+        assert!(m.set_label(&a.pubkey, "新名").is_ok());
+        // 非 selected ペルソナのアーカイブ・破棄は配信中でも許可(FR-007)。
+        assert!(m.set_state(&c.pubkey, PersonaState::Archived).is_ok());
+        assert!(m.delete(&c.pubkey).is_ok());
     }
 }

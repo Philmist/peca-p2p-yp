@@ -20,6 +20,8 @@ pub(crate) mod mock_peer;
 mod keystore;
 #[path = "steps/outbound_only.rs"]
 mod outbound_only;
+#[path = "steps/persona_selection.rs"]
+mod persona_selection;
 #[path = "steps/security.rs"]
 mod security;
 #[path = "steps/us1.rs"]
@@ -44,6 +46,8 @@ pub struct AppWorld {
     security: Option<security::SecurityWorld>,
     /// US2 鍵保管セキュリティシナリオの状態。各シナリオの Given で初期化する(T036)。
     keystore: Option<keystore::KeystoreWorld>,
+    /// 掲載前ペルソナ選択・配信中ロックシナリオの状態(Background で初期化 — T012/T021)。
+    persona_selection: Option<persona_selection::PersonaSelectionWorld>,
 }
 
 /// ステップの async 未来型は debug ビルドで巨大になり、Windows 既定の main スレッド

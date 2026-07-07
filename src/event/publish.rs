@@ -21,6 +21,7 @@ use nostr::Event;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::broadcast::BroadcastState;
 use crate::event::schema::{ChannelListing, ChannelStatus, EventBuildError};
 use crate::identity::{IdentityError, IdentityManager};
 
@@ -69,6 +70,9 @@ pub struct PublishEngine {
     /// 発行側 PoW 難易度(v1 既定 0 = 付与しない)。
     pow_bits: u8,
     states: Mutex<HashMap<String, ChannelPublishState>>,
+    /// 配信中ロックの共有状態(ADR-0011)。`IdentityManager`・`AppState` と同一
+    /// インスタンスを共有し、発行開始の予約(INV-2)と selected 変更を相互排他にする。
+    broadcast: Arc<BroadcastState>,
 }
 
 /// ポイズン時も内部値を回収してロックを返す(パニックしない)。
@@ -85,10 +89,15 @@ fn unix_now() -> u64 {
 
 impl PublishEngine {
     /// エンジンを作成する。
+    ///
+    /// `broadcast` は `IdentityManager`(selected 変更ガード)・`AppState`(status 表示)と
+    /// **同一インスタンス**を共有すること(発行開始の予約と selected 変更を単一ロックで
+    /// 相互排他にするため — ADR-0011)。
     pub fn new(
         identity: Arc<IdentityManager>,
         sink: Arc<dyn EventSink>,
         republish_interval_sec: u64,
+        broadcast: Arc<BroadcastState>,
     ) -> Self {
         Self {
             identity,
@@ -96,6 +105,7 @@ impl PublishEngine {
             republish_interval: Duration::from_secs(republish_interval_sec.max(1)),
             pow_bits: 0,
             states: Mutex::new(HashMap::new()),
+            broadcast,
         }
     }
 
@@ -104,11 +114,27 @@ impl PublishEngine {
     /// ペルソナ未選択・未割当なら発行せず `Ok(false)`(利用者がペルソナを
     /// 作成・選択するまで掲載は保留される)。
     pub fn publish_listing(&self, listing: &ChannelListing) -> Result<bool, PublishError> {
-        let Some(pubkey) = self
-            .identity
-            .persona_for_channel(&listing.channel_id)
-            .map_err(PublishError::Identity)?
-        else {
+        // 初回発行(このチャンネルをまだ一度も署名していない)か。
+        let first_publish = !lock(&self.states).contains_key(&listing.channel_id);
+
+        // 署名ペルソナ解決。初回発行時は「予約先行」(INV-2 — ADR-0011): 配信中ロック下で
+        // persona を解決し、Some ならチャンネルを配信中集合へ予約してから(ロック外で)署名する。
+        // これにより発行開始と `select()` のどちらが先にロックを取っても不変条件
+        // 「配信中の区間 selected は不変」が保たれる(research R2)。
+        let resolved = if first_publish {
+            self.broadcast
+                .reserve_and_read_selected(&listing.channel_id, || {
+                    self.identity.persona_for_channel(&listing.channel_id)
+                })
+                .map_err(PublishError::Identity)?
+        } else {
+            self.identity
+                .persona_for_channel(&listing.channel_id)
+                .map_err(PublishError::Identity)?
+        };
+
+        let Some(pubkey) = resolved else {
+            // ペルソナ未選択 → 掲載保留。予約は Some のときのみ行うため巻き戻し不要。
             tracing::warn!(
                 target: "publish",
                 channel = %listing.channel_id,
@@ -136,7 +162,15 @@ impl PublishEngine {
             }
         }
 
-        self.sign_and_send(&pubkey, listing)?;
+        // 署名・送信はロックの外(INV-2)。初回発行が署名失敗したら予約を巻き戻す(INV-3)。
+        // 同一チャンネルの初回発行は実契機(PCP announce)上は単一フライトのため、巻き戻しが
+        // 別の初回発行の予約を消す競合は起きない。
+        if let Err(e) = self.sign_and_send(&pubkey, listing) {
+            if first_publish {
+                self.broadcast.release(&listing.channel_id);
+            }
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -154,6 +188,8 @@ impl PublishEngine {
         }) else {
             // 一度も掲載していない(ペルソナ未選択のまま終了)なら何もしない。
             lock(&self.states).remove(&listing.channel_id);
+            // 予約していなくても no-op で安全(INV-3 — 配信中状態を取り残さない)。
+            self.broadcast.release(&listing.channel_id);
             return Ok(false);
         };
 
@@ -161,6 +197,8 @@ impl PublishEngine {
         ended.status = ChannelStatus::Ended;
         let result = self.sign_and_send(&pubkey, &ended);
         lock(&self.states).remove(&listing.channel_id);
+        // 配信中集合から確実に除去する(INV-3 — 署名成否によらず解錠する。FR-009)。
+        self.broadcast.release(&listing.channel_id);
         result?;
         Ok(true)
     }
@@ -231,6 +269,7 @@ impl PublishEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcast::BroadcastState;
     use crate::event::schema::Track;
     use crate::identity::Keystore;
     use crate::store::Store;
@@ -275,12 +314,18 @@ mod tests {
 
     fn engine() -> (Arc<PublishEngine>, Arc<IdentityManager>, Arc<RecordingSink>) {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let identity = Arc::new(IdentityManager::new(store, Keystore::ephemeral()));
+        // identity・engine は同一の BroadcastState を共有する(ADR-0011)。
+        let broadcast = Arc::new(BroadcastState::new());
+        let identity = Arc::new(
+            IdentityManager::new(store, Keystore::ephemeral())
+                .with_broadcast_state(Arc::clone(&broadcast)),
+        );
         let sink = Arc::new(RecordingSink::default());
         let engine = Arc::new(PublishEngine::new(
             Arc::clone(&identity),
             Arc::clone(&sink) as Arc<dyn EventSink>,
             60,
+            Arc::clone(&broadcast),
         ));
         (engine, identity, sink)
     }
