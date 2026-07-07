@@ -15,7 +15,7 @@
 //! 注入するのは**時刻**(未検証候補の 1 件/秒スロットル窓)のみ。
 
 use std::collections::HashSet;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -90,6 +90,12 @@ pub struct PeerAddr {
     pub port: u16,
     /// IPv6 リテラルか。
     pub is_ipv6: bool,
+    /// ホスト名(DNS 解決が必要なアドレス)か。IP リテラル(v4/v6)は false。
+    ///
+    /// 分類器の結果(ADR-0010 §7): `host` が `Ipv4Addr`/IPv6 リテラルなら false、
+    /// それ以外(RFC 1123 ホスト名)は true。PEX 名前空間分離の判定に用いる
+    /// (ホスト名は網に出さず resolved_ip に射影する — [`crate::p2p::pex`])。
+    pub is_hostname: bool,
 }
 
 impl PeerAddr {
@@ -101,13 +107,35 @@ impl PeerAddr {
             format!("{}:{}", self.host, self.port)
         }
     }
+
+    /// 実接続の [`SocketAddr`] から IP リテラルの [`PeerAddr`] を作る。
+    ///
+    /// [`canonical`](PeerAddr::canonical) を wire 表記の唯一の出典とするため、resolved_ip
+    /// の canonical 化(ADR-0010)は本コンストラクタ経由で行う(v4/v6 のブラケット差を
+    /// 二重実装しない)。
+    pub fn from_socket_addr(sa: SocketAddr) -> PeerAddr {
+        PeerAddr {
+            host: sa.ip().to_string(),
+            port: sa.port(),
+            is_ipv6: sa.is_ipv6(),
+            is_hostname: false,
+        }
+    }
 }
+
+/// ホスト全体の最大長(RFC 1123 — 末尾ドット除去後)。
+const HOSTNAME_MAX_LEN: usize = 253;
+/// 1 ラベルの最大長(RFC 1123)。
+const HOSTNAME_LABEL_MAX_LEN: usize = 63;
 
 /// `host:port` を検証・正規化する。
 ///
 /// - IPv6 リテラルは `[addr]:port` のブラケット表記のみ許容し、圧縮小文字へ正規化する。
 /// - ブラケットなしで複数コロンを含む文字列はポート境界が曖昧なため拒否する。
-/// - ホスト名・IPv4 のホスト部は小文字化して正規化する(大小の違いによる多重登録を防ぐ)。
+/// - ホスト部は末尾ドットを 1 個正規化したうえで、`Ipv4Addr` としてパースできれば IP リテラル、
+///   できなければ RFC 1123 ホスト名として検証する(ADR-0010 §7)。ホスト名は ASCII のみ・
+///   各ラベル `[a-z0-9-]`(先頭/末尾ハイフン禁止)・ラベル ≤63・全体 ≤253。単一ラベルも許容。
+///   IPv4・ホスト名とも小文字化して正規化する(大小の違いによる多重登録を防ぐ)。
 pub fn parse_addr(input: &str) -> std::result::Result<PeerAddr, AddrError> {
     if input.is_empty() {
         return Err(AddrError::Empty);
@@ -128,6 +156,7 @@ pub fn parse_addr(input: &str) -> std::result::Result<PeerAddr, AddrError> {
             host: ip.to_string(),
             port,
             is_ipv6: true,
+            is_hostname: false,
         });
     }
 
@@ -143,15 +172,58 @@ pub fn parse_addr(input: &str) -> std::result::Result<PeerAddr, AddrError> {
     if host.is_empty() {
         return Err(AddrError::InvalidHost);
     }
-    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    let port = parse_port(port_str)?;
+
+    // 末尾ドットを 1 個だけ正規化する(`seed.example.org.` と `seed.example.org` の二重登録防止)。
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
         return Err(AddrError::InvalidHost);
     }
-    let port = parse_port(port_str)?;
+
+    // 分類器: Ipv4Addr としてパースできれば IP リテラル、できなければホスト名検証へ。
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return Ok(PeerAddr {
+            host: v4.to_string(),
+            port,
+            is_ipv6: false,
+            is_hostname: false,
+        });
+    }
+
+    let host = validate_hostname(host)?;
     Ok(PeerAddr {
-        host: host.to_ascii_lowercase(),
+        host,
         port,
         is_ipv6: false,
+        is_hostname: true,
     })
+}
+
+/// RFC 1123 ホスト名を検証し、小文字化して返す(ADR-0010 §7 — manual 経路専用)。
+///
+/// ASCII のみ(IDN は利用者が punycode `xn--` へ変換して入力)、各ラベルは `[a-z0-9-]` で
+/// 先頭/末尾ハイフン禁止・アンダースコア拒否、ラベル ≤63、全体 ≤253。ドット必須にはしない
+/// (単一ラベル `localhost` 等を許容 — 引けなければ resolution 失敗で fail_count 降格)。
+/// 末尾ドットの正規化は呼び出し側が済ませている前提。
+fn validate_hostname(host: &str) -> std::result::Result<String, AddrError> {
+    if !host.is_ascii() || host.len() > HOSTNAME_MAX_LEN {
+        return Err(AddrError::InvalidHost);
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > HOSTNAME_LABEL_MAX_LEN {
+            return Err(AddrError::InvalidHost);
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(AddrError::InvalidHost);
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(AddrError::InvalidHost);
+        }
+    }
+    Ok(host.to_ascii_lowercase())
 }
 
 fn parse_port(s: &str) -> std::result::Result<u16, AddrError> {
@@ -415,6 +487,16 @@ impl PeerManager {
         Ok(self.store.record_peer_success(&canonical, at)?)
     }
 
+    /// 外向き接続成立時の実ソケット IP を記録する(ADR-0010)。
+    ///
+    /// `addr` はダイヤルに用いたアドレス(ホスト名または IP リテラル)、`resolved_ip` は
+    /// `stream.peer_addr()` を canonical 化した実接続先。ホスト名 manual ピアの PEX 射影に
+    /// 使う。ダイヤルには一切使わない(外向きは常にホスト名を再解決する)。存在すれば `true`。
+    pub fn record_resolved_ip(&self, addr: &str, resolved_ip: &str) -> Result<bool> {
+        let canonical = parse_addr(addr).map_err(PeerError::Addr)?.canonical();
+        Ok(self.store.set_peer_resolved_ip(&canonical, resolved_ip)?)
+    }
+
     /// 接続失敗を記録し、更新後の fail_count を返す(ピアが無ければ `None`)。
     pub fn record_failure(&self, addr: &str) -> Result<Option<i64>> {
         let canonical = parse_addr(addr).map_err(PeerError::Addr)?.canonical();
@@ -674,8 +756,92 @@ mod tests {
         let a = parse_addr("192.0.2.10:7147").unwrap();
         assert_eq!(a.canonical(), "192.0.2.10:7147");
         assert!(!a.is_ipv6);
+        assert!(!a.is_hostname, "IPv4 リテラルはホスト名ではない");
         let h = parse_addr("Example.COM:7147").unwrap();
         assert_eq!(h.canonical(), "example.com:7147");
+        assert!(h.is_hostname, "ホスト名として分類される");
+    }
+
+    #[test]
+    fn peer_addr_from_socket_addr_canonical() {
+        // canonical 形の唯一の出典が PeerAddr::canonical であることを担保する。
+        let v4: std::net::SocketAddr = "192.0.2.10:7147".parse().unwrap();
+        assert_eq!(
+            PeerAddr::from_socket_addr(v4).canonical(),
+            "192.0.2.10:7147"
+        );
+        let v6: std::net::SocketAddr = "[2001:db8::1]:7147".parse().unwrap();
+        assert_eq!(
+            PeerAddr::from_socket_addr(v6).canonical(),
+            "[2001:db8::1]:7147"
+        );
+        // parse_addr 経由と同一の canonical に落ちる(受信側再検証を通る)。
+        assert_eq!(
+            PeerAddr::from_socket_addr(v6).canonical(),
+            parse_addr("[2001:db8::1]:7147").unwrap().canonical()
+        );
+    }
+
+    #[test]
+    fn parse_hostname_rfc1123_accepted() {
+        // 通常の FQDN・ハイフン入り・単一ラベル・数字始まりラベルを許容する。
+        for host in [
+            "seed.example.org",
+            "a-b.example.co.jp",
+            "localhost",
+            "xn--eckwd4c7c.example",
+            "1seed.example",
+        ] {
+            let a = parse_addr(&format!("{host}:7147")).unwrap();
+            assert!(a.is_hostname, "{host} はホスト名として受理されるべき");
+            assert_eq!(a.canonical(), format!("{host}:7147"));
+        }
+    }
+
+    #[test]
+    fn parse_hostname_trailing_dot_normalized() {
+        // 末尾ドットは 1 個除去して正規化(二重登録防止)。
+        let a = parse_addr("seed.example.org.:7147").unwrap();
+        assert_eq!(a.canonical(), "seed.example.org:7147");
+        assert!(a.is_hostname);
+    }
+
+    #[test]
+    fn parse_hostname_rejects_invalid_forms() {
+        // アンダースコア・非 ASCII・先頭/末尾ハイフン・空ラベル・ラベル過長・二重末尾ドット。
+        let bad = [
+            "under_score.example:7147",
+            "日本語.example:7147",
+            "-lead.example:7147",
+            "trail-.example:7147",
+            "a..b:7147",
+            &format!("{}.example:7147", "a".repeat(64)),
+            "seed.example..:7147",
+        ];
+        for input in bad {
+            assert_eq!(
+                parse_addr(input).unwrap_err(),
+                AddrError::InvalidHost,
+                "{input} は拒否されるべき"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_hostname_total_length_cap() {
+        // 全体 253 を超えるホスト名は拒否(各ラベルは 63 以下)。1 桁ポートで
+        // ADDR_MAX_LEN(256)以内に収め、ホスト長 254 > 253 の検査を先に踏ませる。
+        let l63 = "a".repeat(63);
+        let l62 = "a".repeat(62);
+        let host = format!("{l63}.{l63}.{l63}.{l62}"); // 63*3 + 62 + 3 ドット = 254 文字
+        assert_eq!(host.len(), 254);
+        assert!(host.len() > HOSTNAME_MAX_LEN);
+        let input = format!("{host}:1");
+        assert!(
+            input.len() <= ADDR_MAX_LEN,
+            "TooLong より先に長さ検査へ到達する"
+        );
+        assert_eq!(parse_addr(&input).unwrap_err(), AddrError::InvalidHost);
     }
 
     #[test]
@@ -751,6 +917,20 @@ mod tests {
         // 別表記(完全展開形)でも同一エントリとして引ける(多重登録防止)
         let got = m.get_peer("[2001:0db8:0:0:0:0:0:1]:7147").unwrap().unwrap();
         assert_eq!(got.addr, "[2001:db8::1]:7147");
+    }
+
+    #[test]
+    fn record_resolved_ip_via_manager() {
+        let m = manager();
+        m.add_peer("seed.example.org:7147", PeerSource::Manual)
+            .unwrap();
+        // ダイヤルに用いたホスト名で実 IP を記録できる。
+        assert!(
+            m.record_resolved_ip("seed.example.org:7147", "192.0.2.10:7147")
+                .unwrap()
+        );
+        let p = m.get_peer("seed.example.org:7147").unwrap().unwrap();
+        assert_eq!(p.resolved_ip.as_deref(), Some("192.0.2.10:7147"));
     }
 
     // ---- 候補選定 ----
