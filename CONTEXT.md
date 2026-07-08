@@ -45,6 +45,7 @@ contracts / research)、設計判断は `docs/adr/` を正とする。
 | **P2P gossip(`p2p/`)** | インターネット(既定 `0.0.0.0:7147`。唯一の外部露出) | 最大の攻撃面。フレーム長 64KB → レート(256KB/s・200msg/s)→ JSON → イベント検証(サイズ 16KB→署名→形式→時刻→内容→PoW)の多段検証。違反は破棄+切断+セキュリティイベント |
 | **PCP(`pcp/`)** | loopback のみ(`127.0.0.1:7146`、非 loopback は検証拒否) | 利用者自身の PeerCastStation が相手。atom ネスト ≤8・≤64KB、文字列は切詰め許容 |
 | **ローカル HTTP(`web/` `yp/`)** | loopback のみ(`127.0.0.1:7180`) | Host 検証(DNS rebinding 対策)・変更系は `X-Api-Token`・レート制限・ボディ ≤64KB・定型エラー(内部情報漏洩禁止) |
+| **index.txt(オプトイン時)** | LAN(`index_bind` 非空時のみ。既定は無効 — ADR-0012) | 読み取り専用 index.txt の GET/HEAD 専用の第 2 受け口。バインドは loopback / LAN 内プライベートアドレスのみ受理・それ以外は起動拒否。API/UI は物理的に非搭載(それ以外は定型 404)・サイズ上限とレート制限は loopback 側と共有・非 loopback 露出は監査イベント記録 |
 
 横断原則: 「真に信頼できるのは自分だけ」— 他ノード由来の情報(イベント・PEX アドレス・
 HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015 / Principle II)。

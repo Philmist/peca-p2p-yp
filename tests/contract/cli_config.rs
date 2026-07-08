@@ -5,6 +5,64 @@
 //! Rust edition 2024 の `set_var` unsafe を避けるため環境変数は一切書き換えず、
 //! ルックアップ関数をモックで注入する(同モジュール unit テストと同じ方式)。
 
+// ---------------------------------------------------------------------------
+// --index-bind の契約(T013 — ADR-0012 / contract §2.3。全プラットフォーム共通)
+// ---------------------------------------------------------------------------
+//
+// `--index-bind` は `--key value` / `--key=value` 両形式で受理し、危険値(unspecified・
+// グローバル・CGNAT・書式不正)は Settings::validate() の検証エラーで起動拒否となる
+// (bind 失敗の縮退とは区別 — 検証エラーは fail-fast)。ここでは CLI パース →
+// apply_overrides → validate の写像を黒箱で固定する。
+mod index_bind {
+    use peca_p2p_yp::config::{CliOverrides, ConfigError, Settings};
+
+    /// CLI 上書きを適用して検証まで行う(起動シーケンスと同じ写像)。
+    fn parse_and_validate(args: &[&str]) -> Result<Settings, ConfigError> {
+        let overrides = CliOverrides::parse(args.iter().map(|s| s.to_string()))?;
+        let mut settings = Settings::default();
+        settings.apply_overrides(&overrides);
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// `--index-bind <addr:port>`(スペース形式)で LAN 値を受理する。
+    #[test]
+    fn accepts_space_form_lan_value() {
+        let s = parse_and_validate(&["--index-bind", "192.168.1.10:7180"]).unwrap();
+        assert_eq!(s.index_bind, "192.168.1.10:7180");
+    }
+
+    /// `--index-bind=<addr:port>`(イコール形式)で LAN 値を受理する。
+    #[test]
+    fn accepts_equals_form_lan_value() {
+        let s = parse_and_validate(&["--index-bind=192.168.1.10:7180"]).unwrap();
+        assert_eq!(s.index_bind, "192.168.1.10:7180");
+    }
+
+    /// 危険値(unspecified・グローバル・CGNAT)は検証エラーで起動拒否(fail-fast)。
+    #[test]
+    fn rejects_dangerous_values_as_config_error() {
+        for value in ["0.0.0.0:7180", "203.0.113.5:7180", "100.64.0.1:7180"] {
+            let arg = format!("--index-bind={value}");
+            let result = parse_and_validate(&[&arg]);
+            assert!(
+                matches!(result, Err(ConfigError::NonLanBind { key: "index_bind" })),
+                "{value} は NonLanBind で起動拒否されるべき"
+            );
+        }
+    }
+
+    /// 書式不正(ポート欠落)は InvalidBind で起動拒否。
+    #[test]
+    fn rejects_malformed_value_as_config_error() {
+        let result = parse_and_validate(&["--index-bind=192.168.1.10"]);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidBind { key: "index_bind" })
+        ));
+    }
+}
+
 // unix 専用機能のため全体を cfg で囲む。
 // Windows ビルドでは本モジュール全体がコンパイル対象外になり dead_code 警告が出ない。
 #[cfg(unix)]

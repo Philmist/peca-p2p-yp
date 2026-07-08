@@ -81,6 +81,25 @@ pub struct AppState {
     /// 配信中ロックの共有状態(T025 — `GET /status` の `broadcasting`)。
     /// 未配線時は `None`(= `broadcasting: false`。contracts §3)。
     pub broadcast: Option<Arc<BroadcastState>>,
+    /// index.txt の LAN 公開状態(ADR-0012)。`None` = 機能無効(`index_bind` 空)。
+    /// 起動時に一度だけ確定する不変値のため `Mutex` を持たない(research R3)。
+    pub index_lan: Option<Arc<IndexLanStatus>>,
+}
+
+/// index.txt LAN 公開の実行時状態(data-model §3)。起動時に一度だけ確定する不変値。
+///
+/// `GET /api/v1/status` の `index_txt_lan` オブジェクトの供給元となる。3 状態
+/// (無効 = `AppState.index_lan` が `None` / 露出中 = `listening: true` /
+/// 設定有効だが bind 失敗 = `listening: false` + `error`)を表す。
+#[derive(Debug, Clone)]
+pub struct IndexLanStatus {
+    /// 設定されたバインド先(検証済み値の文字列表現)。
+    pub bind: String,
+    /// bind に成功して待受中か。
+    pub listening: bool,
+    /// 失敗理由の定型コード(`addr_in_use` / `permission_denied` /
+    /// `addr_not_available` / `unknown`)。`listening: true` なら `None`。
+    pub error: Option<&'static str>,
 }
 
 impl AppState {
@@ -99,6 +118,7 @@ impl AppState {
             announced: None,
             node_status: None,
             broadcast: None,
+            index_lan: None,
         }
     }
 
@@ -122,6 +142,7 @@ impl AppState {
             announced: None,
             node_status: None,
             broadcast: None,
+            index_lan: None,
         }
     }
 
@@ -152,6 +173,12 @@ impl AppState {
     /// 配信中ロックの共有状態を配線する(T025 — `GET /status` の `broadcasting`)。
     pub fn with_broadcast(mut self, broadcast: Arc<BroadcastState>) -> Self {
         self.broadcast = Some(broadcast);
+        self
+    }
+
+    /// index.txt の LAN 公開状態を配線する(ADR-0012 — `GET /status` の `index_txt_lan`)。
+    pub fn with_index_lan(mut self, index_lan: Arc<IndexLanStatus>) -> Self {
+        self.index_lan = Some(index_lan);
         self
     }
 
@@ -198,6 +225,12 @@ struct RateWindow {
     count: u32,
 }
 
+/// エントリ数がこれ以上のとき、`check` は過去秒の死んだエントリを回収してから処理する。
+/// 固定 1 秒窓では `window` が現在秒でないエントリは次アクセスで必ずリセットされるため、
+/// 回収してもレート制限の判定は変わらない。メモリはおおよそ
+/// 「しきい値 + 同一秒内の新規送信元数」に有界化される(LAN 公開時の送信元多様化対策)。
+const RATE_LIMITER_SWEEP_THRESHOLD: usize = 1024;
+
 /// 接続元 IP ごとの固定 1 秒窓レート制限器。クロックは注入可能(テスト用)。
 pub struct RateLimiter {
     max_per_sec: u32,
@@ -220,6 +253,12 @@ impl RateLimiter {
         }
     }
 
+    /// 現在保持している接続元エントリ数(テスト用)。
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.state.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
     /// 接続元 `ip` のリクエストを許可するなら `true`、上限超過なら `false`。
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = (self.now)();
@@ -227,6 +266,9 @@ impl RateLimiter {
             // ロック異常時は安全側(拒否)に倒す
             return false;
         };
+        if state.len() >= RATE_LIMITER_SWEEP_THRESHOLD {
+            state.retain(|_, w| w.window == now);
+        }
         let entry = state.entry(ip).or_insert(RateWindow {
             window: now,
             count: 0,
@@ -265,6 +307,32 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::yp::index_txt::routes())
         .fallback(static_handler)
         .with_state(state)
+}
+
+/// index.txt 専用の第 2 リスナー(LAN 公開)のルーターを構築する(ADR-0012)。
+///
+/// loopback 側と**同一の** [`crate::yp::index_txt::routes`] を再マウントするだけで、
+/// `/api/v1`(API)や静的アセット(UI)のルートは物理的に持たない。これにより
+/// 「経路フィルタのバグで API が LAN 露出する」という故障モードが構造的に存在しない
+/// (research R2 — Principle II)。
+///
+/// URL 長 ≤ 1KB・ヘッダ ≤ 8KB の上限とレート制限(10 req/秒)は `index_txt` の
+/// ハンドラ内部に実装されており、`routes()` を再マウントするだけで第 2 リスナーにも
+/// そのまま適用される。レート制限器は [`AppState::index_txt_rate_limiter`] を共有する。
+///
+/// index.txt 以外の全パス(`/api/v1/...`・`/`・静的アセット)は fallback の定型 404
+/// `{"error":"not_found"}` を返す(contract §1.1)。`/index.txt` への GET/HEAD 以外は
+/// axum が 405(空ボディ + `Allow`)を自動応答する。
+pub fn build_index_router(state: AppState) -> Router {
+    Router::new()
+        .merge(crate::yp::index_txt::routes())
+        .fallback(index_not_found)
+        .with_state(state)
+}
+
+/// LAN リスナーの未定義パスに対する定型 404(index.txt 以外は API/UI ともに存在しない)。
+async fn index_not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found")
 }
 
 /// `/api/v1` サブルーター。後続タスクはここへルートを追加する。
@@ -450,6 +518,32 @@ mod tests {
         assert!(limiter.check(a));
         assert!(limiter.check(b), "別 IP は独立予算");
         assert!(!limiter.check(a));
+    }
+
+    #[test]
+    fn rate_limiter_evicts_stale_entries_when_over_threshold() {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let c2 = Arc::clone(&clock);
+        let limiter = RateLimiter::with_clock(
+            10,
+            Box::new(move || c2.load(std::sync::atomic::Ordering::SeqCst)),
+        );
+        // 秒 1 にしきい値超の多数送信元からアクセス(敵対的な送信元多様化を模す)
+        let total = RATE_LIMITER_SWEEP_THRESHOLD * 2;
+        for i in 0..total {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+            assert!(limiter.check(ip));
+        }
+        assert_eq!(limiter.entry_count(), total, "秒内はエントリが保持される");
+        // 秒 2 の最初のアクセスで、過去秒の死んだエントリが回収される
+        clock.store(2, std::sync::atomic::Ordering::SeqCst);
+        let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert!(limiter.check(ip));
+        assert_eq!(
+            limiter.entry_count(),
+            1,
+            "window が過去のエントリは全て回収され、現在秒の 1 件のみ残る"
+        );
     }
 
     #[test]

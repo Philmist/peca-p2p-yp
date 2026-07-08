@@ -2,6 +2,9 @@
 
 **Status**: Accepted
 **Date**: 2026-07-03
+**Superseded (partial)**: 決定 4 は read-only index.txt に限り
+[ADR-0012](0012-index-txt-lan-exposure.md) が部分 supersede する(2026-07-08)。
+HTTP API / UI / PCP の loopback 強制は不変
 **Principles**: Principle I (Safety First), Principle II (Security by Design), Principle VI (Principle Traceability)
 **Task**: T008(Phase 2 実装前ゲート)。LAN 公開オプトインの v1 実装可否(デッドライン:
 Phase 2 実装前ゲート完了)を本 ADR で確定する

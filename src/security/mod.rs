@@ -48,11 +48,15 @@ pub enum SecurityCategory {
     KeyPermissionFixed,
     /// 保管物のパーミッションを是正できず影響ペルソナを利用不可とした(unix — FR-013)
     KeyPermissionUnfixable,
+    /// index.txt を LAN へ公開した(ADR-0012)。既存カテゴリと異なり「入力違反の拒否」
+    /// ではなく、**利用者が明示的に選んだ露出状態の監査**である。起動時に非 loopback かつ
+    /// bind 成功のとき 1 件だけ記録する(loopback 値・bind 失敗・機能無効では記録しない)。
+    IndexTxtLanExposed,
 }
 
 impl SecurityCategory {
-    /// 全カテゴリ(データモデルの全量 14 件)。リリース前ゲート(T035)の一致確認に使う。
-    pub const ALL: [SecurityCategory; 14] = [
+    /// 全カテゴリ(データモデルの全量 15 件)。リリース前ゲート(T035)の一致確認に使う。
+    pub const ALL: [SecurityCategory; 15] = [
         SecurityCategory::PcpReject,
         SecurityCategory::P2pInvalidFrame,
         SecurityCategory::P2pOversize,
@@ -67,6 +71,7 @@ impl SecurityCategory {
         SecurityCategory::UrlWarning,
         SecurityCategory::KeyPermissionFixed,
         SecurityCategory::KeyPermissionUnfixable,
+        SecurityCategory::IndexTxtLanExposed,
     ];
 
     /// ログに書き出すカテゴリ名(data-model.md の表記と一致させる)。
@@ -86,6 +91,7 @@ impl SecurityCategory {
             SecurityCategory::UrlWarning => "url_warning",
             SecurityCategory::KeyPermissionFixed => "key_permission_fixed",
             SecurityCategory::KeyPermissionUnfixable => "key_permission_unfixable",
+            SecurityCategory::IndexTxtLanExposed => "index_txt_lan_exposed",
         }
     }
 }
@@ -341,9 +347,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn all_14_categories_have_unique_names() {
+    fn all_15_categories_have_unique_names() {
         let names: HashSet<&str> = SecurityCategory::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         assert!(names.contains("pcp_reject"));
         assert!(names.contains("p2p_invalid_frame"));
         assert!(names.contains("p2p_oversize"));
@@ -358,6 +364,7 @@ mod tests {
         assert!(names.contains("url_warning"));
         assert!(names.contains("key_permission_fixed"));
         assert!(names.contains("key_permission_unfixable"));
+        assert!(names.contains("index_txt_lan_exposed"));
     }
 
     #[test]

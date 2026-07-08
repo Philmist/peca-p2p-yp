@@ -162,6 +162,41 @@ struct StatusResponse {
     /// 1 つ以上のチャンネルを発行中か(T025 / FR-008 — UI のロック表示に使う)。
     /// 保留中(未発行)チャンネルは含めない。供給元(BroadcastState)未配線時は `false`。
     broadcasting: bool,
+    /// index.txt の LAN 公開状態(ADR-0012 / contract §3)。
+    index_txt_lan: IndexTxtLanStatus,
+}
+
+/// `GET /api/v1/status` の `index_txt_lan` オブジェクト(contract §3 の 3 状態表)。
+#[derive(Serialize)]
+struct IndexTxtLanStatus {
+    /// 機能有効か(`index_bind` 非空)。
+    enabled: bool,
+    /// 設定されたバインド先(無効時は `null`)。
+    bind: Option<String>,
+    /// bind 成功して待受中か。
+    listening: bool,
+    /// 失敗理由の定型コード(露出中・無効時は `null`)。
+    error: Option<&'static str>,
+}
+
+impl IndexTxtLanStatus {
+    /// `AppState.index_lan`(`None` = 機能無効)から状態を組み立てる。
+    fn from_state(index_lan: Option<&crate::web::IndexLanStatus>) -> Self {
+        match index_lan {
+            None => IndexTxtLanStatus {
+                enabled: false,
+                bind: None,
+                listening: false,
+                error: None,
+            },
+            Some(s) => IndexTxtLanStatus {
+                enabled: true,
+                bind: Some(s.bind.clone()),
+                listening: s.listening,
+                error: s.error,
+            },
+        }
+    }
 }
 
 /// `GET /api/v1/status`。
@@ -176,6 +211,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
         .as_ref()
         .map(|b| b.is_broadcasting())
         .unwrap_or(false);
+    let index_txt_lan = IndexTxtLanStatus::from_state(state.index_lan.as_deref());
     let response = match state.node_status.as_ref() {
         Some(s) => StatusResponse {
             pcp_listening: s.pcp_listening(),
@@ -190,6 +226,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
             clock_skew: s.clock_skew(),
             inbound_reachable: s.inbound_reachable(),
             broadcasting,
+            index_txt_lan,
         },
         None => StatusResponse {
             pcp_listening: false,
@@ -201,6 +238,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
             },
             inbound_reachable: false,
             broadcasting,
+            index_txt_lan,
         },
     };
     Json(response).into_response()
