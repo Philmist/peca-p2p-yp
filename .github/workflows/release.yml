@@ -1,0 +1,108 @@
+name: Release
+
+# セマンティックバージョン風のタグ(v1.2.3 / v1.2.3-rc1)を push した時だけ発火する。
+# 日常の push/PR は ci.yml が担当し、こちらは「リリースの号砲」を鳴らした時専用。
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# Release の作成・アセット添付に書き込み権限が要る。
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: peca-p2p-yp
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      # 片方の OS が失敗しても、もう片方のビルドは最後まで走らせる。
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ci.yml と同じキャッシュ方針。target を鍵に含めて OS ごとに分離する。
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.target }}-
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Linux: バイナリ + LICENSE + README を1つの .tar.gz にまとめる。
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          staging="${BIN_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
+          cp LICENSE README.md "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+
+      # Windows: .exe を .zip にまとめる。シェルは pwsh を明示。
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "$env:BIN_NAME-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" $staging
+          Copy-Item LICENSE, README.md $staging
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # 各 OS のアーカイブを一旦 Artifacts に退避し、後段の release ジョブで集約する。
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # 全 OS 分のアーカイブを artifacts/ 配下にまとめて回収する。
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # タグに対応する Release を作成し、集めたアーカイブを添付する。
+      # リリースノートはコミット履歴から自動生成させる。
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
