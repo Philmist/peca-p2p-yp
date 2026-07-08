@@ -709,11 +709,26 @@ impl P2pRuntime {
                         // 自アドレス・ストア検証は add_peer 側でも再度弾かれる(二重防壁)。
                         let _ = self.peers.add_peer(&candidate.canonical(), PeerSource::Pex);
                     }
-                    if result.has_rejections() {
+                    // 破棄理由で記録先を分ける(feature 005 / ADR-0013)。破棄そのもの(上で
+                    // 候補登録しない防御)は不変で、ここはログ分類のみ。
+                    // - 不審(件数超過・形式不正・長さ超過・ホスト名)が 1 件でもあれば従来どおり
+                    //   pex_rejected セキュリティイベントを記録する(混在時も不審があるため記録)。
+                    if result.has_suspicious() {
                         self.security.log(
                             SecurityCategory::PexRejected,
                             addr,
                             "invalid PEERS entry discarded",
+                        );
+                    }
+                    // - 良性(自己アドレス反射・重複)のみの破棄は健全な網で常時起きるため、
+                    //   セキュリティイベントにはせず debug へ格下げする。source は接続元、件数は
+                    //   良性破棄数のみで、内部情報は載せない(FR-002 / FR-007)。
+                    if result.has_benign() {
+                        tracing::debug!(
+                            target: "p2p",
+                            source = %addr,
+                            benign = result.benign_rejected.len(),
+                            "PEX: benign self/duplicate entries discarded"
                         );
                     }
                 }

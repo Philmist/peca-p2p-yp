@@ -188,7 +188,10 @@ fn incoming_rejects_over_max_count() {
         .collect();
     let result = pex::validate_incoming_peers(&peers, no_self, PEX_MAX_PEERS);
     assert!(result.accepted.is_empty(), "件数超過は 1 件も採用しない");
-    assert_eq!(result.rejected.len(), peers.len(), "全件が破棄対象");
+    assert_eq!(result.rejected().len(), peers.len(), "全件が破棄対象");
+    // 件数超過は protocol 逸脱=不審。pex_rejected 記録対象(feature 005)。
+    assert!(result.has_suspicious(), "件数超過は不審として記録される");
+    assert!(!result.has_benign());
 }
 
 #[test]
@@ -204,10 +207,13 @@ fn incoming_rejects_malformed_forms() {
     let result = pex::validate_incoming_peers(&peers, no_self, PEX_MAX_PEERS);
     assert!(result.accepted.is_empty(), "不正形式は 1 件も採用しない");
     assert_eq!(
-        result.rejected.len(),
+        result.rejected().len(),
         peers.len(),
         "不正形式・長さ超過・ブラケットなし IPv6 は破棄する"
     );
+    // 形式不正・長さ超過は不正入力=不審(feature 005)。
+    assert!(result.has_suspicious(), "不正形式は不審として記録される");
+    assert!(!result.has_benign());
 }
 
 #[test]
@@ -221,9 +227,14 @@ fn incoming_accepts_ip_literals_and_rejects_hostnames() {
     let result = pex::validate_incoming_peers(&peers, no_self, PEX_MAX_PEERS);
     assert_eq!(result.accepted.len(), 2, "IP リテラルのみ採用される");
     assert_eq!(
-        result.rejected,
+        result.rejected(),
         vec!["example.com:7147".to_string()],
         "ホスト名候補は名前空間分離により破棄される"
+    );
+    // ホスト名は名前空間分離違反(ADR-0010)=不審(feature 005)。
+    assert!(
+        result.has_suspicious(),
+        "ホスト名破棄は不審として記録される"
     );
     // canonical 化されている(IPv6 は圧縮小文字・ブラケット表記)
     let canons: HashSet<String> = result.accepted.iter().map(|p| p.canonical()).collect();
@@ -252,6 +263,59 @@ fn incoming_excludes_self_and_duplicates() {
     );
     // 採用は 198.51.100.7 と 2001:db8::1 の 2 件のみ
     assert_eq!(result.accepted.len(), 2, "自アドレス・重複を除外する");
+    // 採用集合が期待どおり(候補登録の回帰基準 — FR-004 / SC-004 / 観点6)。
+    let accepted: HashSet<String> = result.accepted.iter().map(|p| p.canonical()).collect();
+    assert!(accepted.contains("198.51.100.7:7147"));
+    assert!(accepted.contains("[2001:db8::1]:7147"));
     // 自アドレス・重複 2 件・重複 IPv6 1 件 = 3 件が破棄
-    assert_eq!(result.rejected.len(), 3);
+    assert_eq!(result.rejected().len(), 3);
+    // 自己アドレス・重複のみ = 良性。不審 0 件 → pex_rejected 非対象(feature 005 / US1)。
+    assert_eq!(result.benign_rejected.len(), 3);
+    assert!(!result.has_suspicious(), "良性のみの破棄は記録されない");
+    assert!(result.has_benign());
+}
+
+#[test]
+fn incoming_duplicate_only_is_benign() {
+    // 重複のみ(自アドレス・不審なし)は良性破棄で pex_rejected 非対象(feature 005 / US1)。
+    let peers = vec![
+        "198.51.100.7:7147".to_string(),
+        "198.51.100.7:7147".to_string(),    // 重複 = 良性
+        "[2001:DB8::0:1]:7147".to_string(), // dual-stack 表記ゆれ
+        "[2001:db8::1]:7147".to_string(),   // 上と canonical 一致 = 重複 = 良性
+    ];
+    let result = pex::validate_incoming_peers(&peers, no_self, PEX_MAX_PEERS);
+    // 初出 2 件のみ採用(候補登録の回帰基準 — 観点6)。
+    assert_eq!(result.accepted.len(), 2);
+    let accepted: HashSet<String> = result.accepted.iter().map(|p| p.canonical()).collect();
+    assert!(accepted.contains("198.51.100.7:7147"));
+    assert!(accepted.contains("[2001:db8::1]:7147"));
+    // 重複 2 件は良性のみ。不審 0 件 → 無記録。
+    assert_eq!(result.benign_rejected.len(), 2);
+    assert!(!result.has_suspicious(), "重複のみは記録されない");
+    assert!(result.has_benign());
+}
+
+#[test]
+fn incoming_mixed_benign_and_suspicious_is_recorded() {
+    // 良性(自アドレス)と不審(形式不正)の混在 → 不審が 1 件でもあるため記録(feature 005 / US2)。
+    let self_canon = "203.0.113.5:7147".to_string();
+    let peers = vec![
+        "203.0.113.5:7147".to_string(),  // 自アドレス = 良性
+        "not-an-addr".to_string(),       // 形式不正 = 不審
+        "198.51.100.7:7147".to_string(), // 正当 → 採用
+    ];
+    let result = pex::validate_incoming_peers(
+        &peers,
+        move |canonical| canonical == self_canon,
+        PEX_MAX_PEERS,
+    );
+    // 採用は正当 1 件のみ(候補登録の回帰基準 — 観点6)。
+    assert_eq!(result.accepted.len(), 1);
+    assert_eq!(result.accepted[0].canonical(), "198.51.100.7:7147");
+    assert_eq!(result.benign_rejected.len(), 1, "自アドレスは良性");
+    assert_eq!(result.suspicious_rejected.len(), 1, "形式不正は不審");
+    // 不審が 1 件でもあるため記録される(混在の記録規則 — contracts C2)。
+    assert!(result.has_suspicious(), "混在は不審があるため記録される");
+    assert!(result.has_benign());
 }

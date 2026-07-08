@@ -77,19 +77,48 @@ fn project_for_pex(peer: &PeerEndpoint) -> Option<String> {
 /// 受信 `PEERS` の検証結果。
 ///
 /// `accepted` は候補登録すべき正規化済みアドレス(重複・自アドレスを除外済み)。
-/// `rejected` は破棄した生アドレス(`pex_rejected` としてセキュリティ記録する対象)。
+/// 破棄した生アドレスは**破棄理由で 2 分類**して保持する(feature 005 / ADR-0013):
+/// - `benign_rejected`: 良性(自己アドレス・重複)。健全な網で日常的に発生する反射・dual-stack
+///   重複であり、`pex_rejected` セキュリティイベントの**対象外**(debug ログのみ)。
+/// - `suspicious_rejected`: 不審(件数超過・形式不正・長さ超過・ホスト名)。protocol 逸脱・
+///   不正入力であり、従来どおり `pex_rejected` としてセキュリティ記録する対象。
+///
+/// 分類は**破棄理由のみ**で決まり、破棄する/しない(候補登録の可否)の判定は一切変えない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IncomingPex {
     /// 採用する候補(canonical 化・重複排除済み)。
     pub accepted: Vec<PeerAddr>,
-    /// 破棄した生アドレス(記録対象)。
-    pub rejected: Vec<String>,
+    /// 良性理由(自己アドレス・重複)で破棄した生アドレス(記録対象外・debug のみ)。
+    pub benign_rejected: Vec<String>,
+    /// 不審理由(件数超過・形式不正・長さ超過・ホスト名)で破棄した生アドレス(記録対象)。
+    pub suspicious_rejected: Vec<String>,
 }
 
 impl IncomingPex {
-    /// 破棄が 1 件でもあったか(`pex_rejected` の記録要否)。
+    /// 破棄した生アドレス全体(良性 + 不審)を連結して返す後方互換アクセサ。
+    ///
+    /// 旧 `rejected` フィールドの代替。破棄の総数・全一覧を扱いたい呼び出し側向け。
+    pub fn rejected(&self) -> Vec<String> {
+        let mut all =
+            Vec::with_capacity(self.benign_rejected.len() + self.suspicious_rejected.len());
+        all.extend(self.benign_rejected.iter().cloned());
+        all.extend(self.suspicious_rejected.iter().cloned());
+        all
+    }
+
+    /// 不審な破棄が 1 件でもあるか(`pex_rejected` セキュリティイベントの記録要否)。
+    pub fn has_suspicious(&self) -> bool {
+        !self.suspicious_rejected.is_empty()
+    }
+
+    /// 良性な破棄が 1 件でもあるか(debug ログ出力の要否)。
+    pub fn has_benign(&self) -> bool {
+        !self.benign_rejected.is_empty()
+    }
+
+    /// 破棄が 1 件でもあったか(良性・不審いずれか)。
     pub fn has_rejections(&self) -> bool {
-        !self.rejected.is_empty()
+        self.has_benign() || self.has_suspicious()
     }
 }
 
@@ -103,31 +132,42 @@ impl IncomingPex {
 /// - `is_self`(canonical を受け取り自ノードアドレスなら true)に一致するものは破棄。
 /// - バッチ内で canonical が重複するものは初出のみ採用し、以降は破棄。
 ///
-/// 破棄したものは `rejected` に生アドレスのまま積む(記録用)。
+/// 破棄したものは理由で分類して積む(feature 005 / ADR-0013):
+/// - **良性**(`benign_rejected`): 自己アドレス一致・バッチ内重複。健全な網で常時発生する反射・
+///   dual-stack 重複であり、セキュリティイベントではない。
+/// - **不審**(`suspicious_rejected`): 件数超過(バッチ全破棄)・`parse_addr` 失敗(形式不正・
+///   長さ超過・ブラケットなし複数コロン)・ホスト名(ADR-0010 名前空間分離違反)。protocol
+///   逸脱・不正入力であり `pex_rejected` の記録対象。
+///
+/// **分類は破棄理由のみで決まり、破棄する/しない(候補登録の可否)は一切変更しない**
+/// (FR-004: 防御は不変)。
 pub fn validate_incoming_peers(
     peers: &[String],
     is_self: impl Fn(&str) -> bool,
     max: usize,
 ) -> IncomingPex {
     let mut result = IncomingPex::default();
+    // 件数超過はバッチ全体を破棄する。正当なピアは max 件以下しか送らないため protocol 逸脱=不審。
     if peers.len() > max {
-        result.rejected = peers.to_vec();
+        result.suspicious_rejected = peers.to_vec();
         return result;
     }
     let mut seen: HashSet<String> = HashSet::new();
     for raw in peers {
         match parse_addr(raw) {
-            // ホスト名候補は名前空間分離により拒否する(IP リテラルのみ候補化)。
-            Ok(addr) if addr.is_hostname => result.rejected.push(raw.clone()),
+            // ホスト名候補は名前空間分離違反(ADR-0010)。不正入力として不審に分類。
+            Ok(addr) if addr.is_hostname => result.suspicious_rejected.push(raw.clone()),
             Ok(addr) => {
                 let canonical = addr.canonical();
+                // 自己アドレス反射・バッチ内重複は健全な網で常時起きる良性破棄。
                 if is_self(&canonical) || !seen.insert(canonical) {
-                    result.rejected.push(raw.clone());
+                    result.benign_rejected.push(raw.clone());
                 } else {
                     result.accepted.push(addr);
                 }
             }
-            Err(_) => result.rejected.push(raw.clone()),
+            // 形式不正・長さ超過・ブラケットなし複数コロンは不正入力=不審。
+            Err(_) => result.suspicious_rejected.push(raw.clone()),
         }
     }
     result
@@ -269,7 +309,10 @@ mod tests {
         let r = validate_incoming_peers(&peers, |_| false, PEX_MAX_PEERS);
         let accepted: Vec<String> = r.accepted.iter().map(|p| p.canonical()).collect();
         assert_eq!(accepted, vec!["192.0.2.10:7147", "[2001:db8::1]:7147"]);
-        assert_eq!(r.rejected, vec!["seed.example.org:7147".to_string()]);
+        assert_eq!(r.rejected(), vec!["seed.example.org:7147".to_string()]);
+        // ホスト名は名前空間分離違反=不審に分類される。
+        assert!(r.has_suspicious());
+        assert!(!r.has_benign());
     }
 
     #[test]
@@ -279,7 +322,10 @@ mod tests {
             .collect();
         let r = validate_incoming_peers(&peers, |_| false, PEX_MAX_PEERS);
         assert!(r.accepted.is_empty());
-        assert_eq!(r.rejected.len(), peers.len());
+        assert_eq!(r.rejected().len(), peers.len());
+        // 件数超過は不審(全件)。
+        assert_eq!(r.suspicious_rejected.len(), peers.len());
+        assert!(!r.has_benign());
     }
 
     #[test]
@@ -292,7 +338,10 @@ mod tests {
         ];
         let r = validate_incoming_peers(&peers, |_| false, PEX_MAX_PEERS);
         assert!(r.accepted.is_empty());
-        assert_eq!(r.rejected.len(), peers.len());
+        assert_eq!(r.rejected().len(), peers.len());
+        // 形式不正・長さ超過は不審。
+        assert_eq!(r.suspicious_rejected.len(), peers.len());
+        assert!(!r.has_benign());
     }
 
     #[test]
@@ -306,7 +355,11 @@ mod tests {
         ];
         let r = validate_incoming_peers(&peers, |c| c == "203.0.113.5:7147", PEX_MAX_PEERS);
         assert_eq!(r.accepted.len(), 2);
-        assert_eq!(r.rejected.len(), 3);
+        assert_eq!(r.rejected().len(), 3);
         assert!(r.has_rejections());
+        // 自己アドレス・重複のみ = 良性。不審は 0 件(pex_rejected 非対象)。
+        assert_eq!(r.benign_rejected.len(), 3);
+        assert!(!r.has_suspicious());
+        assert!(r.has_benign());
     }
 }

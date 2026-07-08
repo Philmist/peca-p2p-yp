@@ -420,6 +420,12 @@ impl TestNode {
             .expect("手動ピア登録");
     }
 
+    /// 自ノードアドレスとして学習させる(通常は nonce 駆動の自己接続検出で学習する分を、
+    /// PEX 自己反射の良性化テスト用に直接注入する — feature 005)。
+    pub fn mark_self_addr(&self, addr: &str) {
+        self.peers.add_self_addr(addr);
+    }
+
     /// 現在の一覧スナップショット。
     pub fn snapshot(&self) -> Vec<DiscoveredChannel> {
         self.hub.snapshot()
