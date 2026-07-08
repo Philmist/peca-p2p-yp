@@ -72,6 +72,7 @@ pub async fn put_settings(State(state): State<AppState>, body: Bytes) -> Respons
 fn validation_error_response(e: ConfigError) -> Response {
     let code = match e {
         ConfigError::NonLoopbackBind { .. } => "non_loopback_bind",
+        ConfigError::NonLanBind { .. } => "non_lan_bind",
         ConfigError::InvalidBind { .. } => "invalid_bind",
         ConfigError::InvalidEncoding => "invalid_encoding",
         ConfigError::InvalidArgument => "invalid_request",

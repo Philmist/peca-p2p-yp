@@ -11,7 +11,7 @@
 //! - コマンドライン上書き([`CliOverrides`])は quickstart 手順 2 の同一 PC 多ノード起動用。
 //!   外部クレートを増やさず std の args パースで実装する。
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::store::{Store, StoreError};
@@ -34,6 +34,8 @@ const DEFAULT_MIN_POW_BITS: u32 = 0;
 const DEFAULT_EVENT_STORE_MAX: u64 = 4096;
 // 2026-07-04 実機検証で改訂: 現行 YP は UTF-8 が既定(contracts/http-yp.md)。
 const DEFAULT_INDEX_TXT_ENCODING: &str = "utf-8";
+// 空文字 = index.txt の LAN 公開を無効(既定 — ADR-0012 はオプトイン)。
+const DEFAULT_INDEX_BIND: &str = "";
 
 // settings テーブルのキー名(data-model §Settings と一致)。
 const KEY_PCP_BIND: &str = "pcp_bind";
@@ -49,6 +51,7 @@ const KEY_MAX_CLOCK_SKEW_SEC: &str = "max_clock_skew_sec";
 const KEY_MIN_POW_BITS: &str = "min_pow_bits";
 const KEY_EVENT_STORE_MAX: &str = "event_store_max";
 const KEY_INDEX_TXT_ENCODING: &str = "index_txt_encoding";
+const KEY_INDEX_BIND: &str = "index_bind";
 
 // ---------------------------------------------------------------------------
 // エラー
@@ -62,6 +65,8 @@ pub enum ConfigError {
     Store(StoreError),
     /// 非 loopback バインドの拒否(ADR-0006 決定 4)。
     NonLoopbackBind { key: &'static str },
+    /// LAN 外バインドの拒否(ADR-0012。loopback / LAN 内プライベートアドレス以外)。
+    NonLanBind { key: &'static str },
     /// バインドアドレスの書式不正。
     InvalidBind { key: &'static str },
     /// 不明なコマンドライン引数・値の欠落。
@@ -77,6 +82,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::NonLoopbackBind { key } => write!(
                 f,
                 "{key} は loopback アドレス(127.0.0.1 等)のみ指定できます"
+            ),
+            ConfigError::NonLanBind { key } => write!(
+                f,
+                "{key} は loopback または LAN 内のプライベートアドレスのみ指定できます"
             ),
             ConfigError::InvalidBind { key } => {
                 write!(f, "{key} のアドレス書式が不正です")
@@ -134,6 +143,9 @@ pub struct Settings {
     pub min_pow_bits: u32,
     pub event_store_max: u64,
     pub index_txt_encoding: String,
+    /// index.txt の LAN 公開バインド先(ADR-0012)。空文字 = 機能無効(既定)。
+    /// 非空時は loopback または LAN 内プライベートアドレスのみ受理する。
+    pub index_bind: String,
 }
 
 impl Default for Settings {
@@ -152,6 +164,7 @@ impl Default for Settings {
             min_pow_bits: DEFAULT_MIN_POW_BITS,
             event_store_max: DEFAULT_EVENT_STORE_MAX,
             index_txt_encoding: DEFAULT_INDEX_TXT_ENCODING.to_string(),
+            index_bind: DEFAULT_INDEX_BIND.to_string(),
         }
     }
 }
@@ -189,6 +202,7 @@ impl Settings {
             min_pow_bits: parse_or(&stored, KEY_MIN_POW_BITS, d.min_pow_bits),
             event_store_max: parse_or(&stored, KEY_EVENT_STORE_MAX, d.event_store_max),
             index_txt_encoding: s(KEY_INDEX_TXT_ENCODING, &d.index_txt_encoding),
+            index_bind: s(KEY_INDEX_BIND, &d.index_bind),
         })
     }
 
@@ -216,6 +230,7 @@ impl Settings {
         store.set_setting(KEY_MIN_POW_BITS, &self.min_pow_bits.to_string())?;
         store.set_setting(KEY_EVENT_STORE_MAX, &self.event_store_max.to_string())?;
         store.set_setting(KEY_INDEX_TXT_ENCODING, &self.index_txt_encoding)?;
+        store.set_setting(KEY_INDEX_BIND, &self.index_bind)?;
         Ok(())
     }
 
@@ -230,6 +245,9 @@ impl Settings {
         if let Some(v) = &overrides.p2p_bind {
             self.p2p_bind = v.clone();
         }
+        if let Some(v) = &overrides.index_bind {
+            self.index_bind = v.clone();
+        }
     }
 
     /// 設定の厳格検証(唯一のゲート)。
@@ -238,6 +256,8 @@ impl Settings {
     ///   ADR-0006 決定 4)。空・書式不正も拒否する。
     /// - `p2p_bind` は空文字(待受無効)を許容し、非空は任意アドレスとしてパース可能なこと。
     /// - `index_txt_encoding` は shift_jis / utf-8 のいずれか。
+    /// - `index_bind` は空文字(機能無効)を許容し、非空は loopback / LAN 内
+    ///   プライベートアドレスのみ受理(ADR-0012)。
     pub fn validate(&self) -> Result<(), ConfigError> {
         require_loopback(KEY_PCP_BIND, &self.pcp_bind)?;
         require_loopback(KEY_HTTP_BIND, &self.http_bind)?;
@@ -245,6 +265,10 @@ impl Settings {
         // (loopback 強制なし — ADR-0008)。
         parse_bind_list(KEY_P2P_BIND, &self.p2p_bind)?;
         self.index_encoding()?;
+        // index_bind: 空は機能無効(検証スキップ)、非空は LAN/loopback 許可リスト検証。
+        if !self.index_bind.is_empty() {
+            require_lan_or_loopback(KEY_INDEX_BIND, &self.index_bind)?;
+        }
         Ok(())
     }
 
@@ -280,13 +304,15 @@ impl Settings {
 
 /// コマンドライン引数による上書き(quickstart 手順 2 の多ノード起動用)。
 ///
-/// 対応フラグ: `--pcp-bind` / `--http-bind` / `--p2p-bind` / `--data-dir`。
+/// 対応フラグ: `--pcp-bind` / `--http-bind` / `--p2p-bind` / `--index-bind` / `--data-dir`。
 /// `--key value` と `--key=value` の両形式を受理する。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliOverrides {
     pub pcp_bind: Option<String>,
     pub http_bind: Option<String>,
     pub p2p_bind: Option<String>,
+    /// index.txt の LAN 公開バインド先(ADR-0012)。検証は `Settings::validate` で実施。
+    pub index_bind: Option<String>,
     /// データディレクトリ(`app.db` の配置先)。未指定ならプラットフォーム別の
     /// 既定パスを使う(解決順は `--help` / cli-config.md §1 を参照)。
     pub data_dir: Option<PathBuf>,
@@ -317,6 +343,7 @@ impl CliOverrides {
                 "--pcp-bind" => out.pcp_bind = Some(value),
                 "--http-bind" => out.http_bind = Some(value),
                 "--p2p-bind" => out.p2p_bind = Some(value),
+                "--index-bind" => out.index_bind = Some(value),
                 "--data-dir" => out.data_dir = Some(PathBuf::from(value)),
                 _ => return Err(ConfigError::InvalidArgument),
             }
@@ -383,6 +410,42 @@ fn require_loopback(key: &'static str, value: &str) -> Result<(), ConfigError> {
         Ok(())
     } else {
         Err(ConfigError::NonLoopbackBind { key })
+    }
+}
+
+/// loopback または LAN 内プライベートアドレスのみを許す許可リスト検証(ADR-0012)。
+///
+/// index.txt の LAN 公開(オプトイン)で使う。**許可リスト方式**を採るのは、
+/// unspecified(`0.0.0.0` / `::`)・グローバルユニキャスト・CGNAT(100.64.0.0/10)
+/// といった LAN 外への露出を、個別列挙ではなく構造的に弾くため(Principle II)。
+/// 誤って許可すると index.txt が意図せず外部へ露出しうるセキュリティ上重要な判定である。
+///
+/// - パース失敗(ポート欠落・カンマ区切り複数・非数値ゾーン ID 等)は既存
+///   [`ConfigError::InvalidBind`] を返す(`http_bind` 等と同じ書式不正の扱い)。
+/// - IP を [`IpAddr::to_canonical`] で正規化し、`::ffff:192.168.1.1` のような
+///   v4-mapped 表記の判定漏れを防ぐ。
+/// - 判定基準(すべて data-model §2 の判定テーブルにゴールデン/ネガティブで固定):
+///   - IPv4: loopback / RFC 1918 プライベート / リンクローカル(169.254/16)
+///   - IPv6: loopback / ULA(fc00::/7)/ リンクローカル(fe80::/10)。
+///     `is_unique_local` 等の unstable/新しめ API に依存せず、上位セグメントの
+///     ビット判定で固定する(MSRV 依存の揺れを避ける — research R1)。
+/// - 上記いずれにも該当しなければ [`ConfigError::NonLanBind`] で拒否する。
+fn require_lan_or_loopback(key: &'static str, value: &str) -> Result<(), ConfigError> {
+    let addr = parse_bind(key, value)?;
+    let allowed = match addr.ip().to_canonical() {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // fc00::/7(ULA)と fe80::/10(リンクローカル)を上位セグメントの
+            // ビットマスクで判定する。
+            v6.is_loopback()
+                || v6.segments()[0] & 0xfe00 == 0xfc00
+                || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(ConfigError::NonLanBind { key })
     }
 }
 
@@ -572,6 +635,156 @@ mod tests {
         ));
     }
 
+    // --- require_lan_or_loopback(data-model §2 判定テーブルと 1:1)-----------
+
+    #[test]
+    fn lan_or_loopback_accepts_loopback() {
+        // loopback(v4/v6)
+        for addr in ["127.0.0.1:7180", "[::1]:7180"] {
+            assert!(
+                require_lan_or_loopback("index_bind", addr).is_ok(),
+                "{addr} は受理されるべき(loopback)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_accepts_rfc1918() {
+        // RFC 1918 各ブロック + 172.16/12 の上端境界
+        for addr in [
+            "192.168.1.10:7180",
+            "10.0.0.5:7180",
+            "172.16.0.1:7180",
+            "172.31.255.254:7180",
+        ] {
+            assert!(
+                require_lan_or_loopback("index_bind", addr).is_ok(),
+                "{addr} は受理されるべき(RFC 1918)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_accepts_link_local() {
+        // IPv4 リンクローカル + IPv6 リンクローカル(fe80::/10)と上端境界
+        for addr in ["169.254.10.1:7180", "[fe80::1]:7180", "[febf:ffff::1]:7180"] {
+            assert!(
+                require_lan_or_loopback("index_bind", addr).is_ok(),
+                "{addr} は受理されるべき(リンクローカル)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_accepts_numeric_zone_id() {
+        // 数値ゾーン ID 付きリンクローカル(std がパース可能なら検証通過)
+        assert!(
+            require_lan_or_loopback("index_bind", "[fe80::1%3]:7180").is_ok(),
+            "数値ゾーン ID 付きリンクローカルは受理されるべき"
+        );
+    }
+
+    #[test]
+    fn lan_or_loopback_accepts_ula() {
+        // IPv6 ULA(fc00::/7)と上端境界
+        for addr in [
+            "[fd12:3456::1]:7180",
+            "[fc00::1]:7180",
+            "[fdff:ffff::1]:7180",
+        ] {
+            assert!(
+                require_lan_or_loopback("index_bind", addr).is_ok(),
+                "{addr} は受理されるべき(ULA)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_accepts_v4_mapped() {
+        // v4-mapped(canonical 化で private 判定)
+        assert!(
+            require_lan_or_loopback("index_bind", "[::ffff:192.168.1.10]:7180").is_ok(),
+            "v4-mapped private は受理されるべき"
+        );
+    }
+
+    #[test]
+    fn lan_or_loopback_rejects_unspecified() {
+        for addr in ["0.0.0.0:7180", "[::]:7180"] {
+            assert!(
+                matches!(
+                    require_lan_or_loopback("index_bind", addr),
+                    Err(ConfigError::NonLanBind { key: "index_bind" })
+                ),
+                "{addr} は NonLanBind で拒否されるべき(unspecified)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_rejects_global() {
+        for addr in ["203.0.113.5:7180", "[2001:db8::1]:7180"] {
+            assert!(
+                matches!(
+                    require_lan_or_loopback("index_bind", addr),
+                    Err(ConfigError::NonLanBind { key: "index_bind" })
+                ),
+                "{addr} は NonLanBind で拒否されるべき(グローバル)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_rejects_cgnat() {
+        // CGNAT / 共有アドレス空間(100.64/10)と直前(100.63.255.254 = グローバル扱い)
+        for addr in [
+            "100.64.0.1:7180",
+            "100.127.255.254:7180",
+            "100.63.255.254:7180",
+        ] {
+            assert!(
+                matches!(
+                    require_lan_or_loopback("index_bind", addr),
+                    Err(ConfigError::NonLanBind { key: "index_bind" })
+                ),
+                "{addr} は NonLanBind で拒否されるべき(CGNAT/境界)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_rejects_out_of_range() {
+        // RFC 1918 の境界外・リンクローカルの直外・ULA の直外
+        for addr in ["172.32.0.1:7180", "[fec0::1]:7180", "[fe00::1]:7180"] {
+            assert!(
+                matches!(
+                    require_lan_or_loopback("index_bind", addr),
+                    Err(ConfigError::NonLanBind { key: "index_bind" })
+                ),
+                "{addr} は NonLanBind で拒否されるべき(境界外)"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_or_loopback_rejects_malformed() {
+        // ポート欠落・カンマ区切り複数・非数値ゾーン ID(std パース不可)・空白
+        for addr in [
+            "192.168.1.10",
+            "192.168.1.10:7180,10.0.0.5:7180",
+            "[fe80::1%eth0]:7180",
+            "  ",
+        ] {
+            assert!(
+                matches!(
+                    require_lan_or_loopback("index_bind", addr),
+                    Err(ConfigError::InvalidBind { key: "index_bind" })
+                ),
+                "{addr} は InvalidBind で拒否されるべき(書式不正)"
+            );
+        }
+    }
+
     #[test]
     fn invalid_encoding_rejected() {
         let s = Settings {
@@ -605,6 +818,41 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_index_bind_both_forms() {
+        let o = CliOverrides::parse(["--index-bind", "192.168.1.10:7180"]).unwrap();
+        assert_eq!(o.index_bind.as_deref(), Some("192.168.1.10:7180"));
+        let o = CliOverrides::parse(["--index-bind=192.168.1.10:7180"]).unwrap();
+        assert_eq!(o.index_bind.as_deref(), Some("192.168.1.10:7180"));
+    }
+
+    #[test]
+    fn index_bind_empty_skips_validation() {
+        // 既定(空文字)は機能無効 — 検証をスキップして通過する
+        assert!(Settings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn index_bind_rejects_non_lan_via_validate() {
+        let s = Settings {
+            index_bind: "0.0.0.0:7180".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate(),
+            Err(ConfigError::NonLanBind { key: "index_bind" })
+        ));
+    }
+
+    #[test]
+    fn index_bind_accepts_lan_via_validate() {
+        let s = Settings {
+            index_bind: "192.168.1.10:7180".to_string(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
     fn cli_empty_args_is_default() {
         let o = CliOverrides::parse(Vec::<String>::new()).unwrap();
         assert_eq!(o, CliOverrides::default());
@@ -633,6 +881,7 @@ mod tests {
             p2p_bind: Some("0.0.0.0:7157".to_string()),
             http_bind: Some("127.0.0.1:7190".to_string()),
             pcp_bind: None,
+            index_bind: None,
             data_dir: None,
         };
         s.apply_overrides(&o);

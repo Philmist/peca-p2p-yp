@@ -38,10 +38,10 @@
 
 **⚠️ CRITICAL**: このフェーズ完了までユーザーストーリーの実装を開始しない
 
-- [ ] T003 fail-first ユニットテスト: `require_lan_or_loopback` のゴールデン/ネガティブ判定テーブル(data-model.md §2 と 1:1 — loopback・RFC1918 境界・リンクローカル・ULA 境界・v4-mapped・ゾーン ID の受理、unspecified・グローバル・CGNAT(100.64/10)・境界外・書式不正の拒否)を `src/config.rs` のテストモジュールに追加し、**失敗することを確認**する
-- [ ] T004 `require_lan_or_loopback(key, value)` と `ConfigError::NonLanBind { key }` を `src/config.rs` に実装する(`SocketAddr` パース → `to_canonical()` → IPv4: `is_loopback/is_private/is_link_local`、IPv6: loopback + fc00::/7・fe80::/10 のビット判定 — research R1)。T003 のテストを green にする
-- [ ] T005 `Settings` に `index_bind: String`(既定 `""`)とキー `"index_bind"`(13→14 キー、lenient load / 全キー save の既存規約)を追加し、`validate()` に「空 = 検証スキップ、非空 = `require_lan_or_loopback`」を統合する(`src/config.rs`)
-- [ ] T006 `CliOverrides` に `index_bind: Option<String>` と `--index-bind`(`--key value` / `--key=value` 両形式)を追加する(`src/config.rs`)
+- [X] T003 fail-first ユニットテスト: `require_lan_or_loopback` のゴールデン/ネガティブ判定テーブル(data-model.md §2 と 1:1 — loopback・RFC1918 境界・リンクローカル・ULA 境界・v4-mapped・ゾーン ID の受理、unspecified・グローバル・CGNAT(100.64/10)・境界外・書式不正の拒否)を `src/config.rs` のテストモジュールに追加し、**失敗することを確認**する
+- [X] T004 `require_lan_or_loopback(key, value)` と `ConfigError::NonLanBind { key }` を `src/config.rs` に実装する(`SocketAddr` パース → `to_canonical()` → IPv4: `is_loopback/is_private/is_link_local`、IPv6: loopback + fc00::/7・fe80::/10 のビット判定 — research R1)。T003 のテストを green にする
+- [X] T005 `Settings` に `index_bind: String`(既定 `""`)とキー `"index_bind"`(13→14 キー、lenient load / 全キー save の既存規約)を追加し、`validate()` に「空 = 検証スキップ、非空 = `require_lan_or_loopback`」を統合する(`src/config.rs`)
+- [X] T006 `CliOverrides` に `index_bind: Option<String>` と `--index-bind`(`--key value` / `--key=value` 両形式)を追加する(`src/config.rs`)
 
 **Checkpoint**: `cargo test`(config ユニットテスト)green。既存 `http_bind` / `pcp_bind` / `p2p_bind` の検証は不変(FR-001)。
 
