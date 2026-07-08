@@ -106,3 +106,4 @@ jobs:
           files: artifacts/**/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          draft: true
