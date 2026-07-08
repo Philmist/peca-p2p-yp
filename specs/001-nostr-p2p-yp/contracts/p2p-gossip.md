@@ -82,7 +82,7 @@ established → (SYNC_REQ/EVENT/GET_PEERS/PING の交換) → CLOSE または異
 | 2 | 受信レート | ≤ 256KB/秒・≤ 200 メッセージ/秒(1 ピアあたり) | `p2p_rate_limited` |
 | 3 | JSON 形式 | パース可能、`type` が既知、未知フィールドは無視 | `p2p_invalid_frame` |
 | 4 | EVENT 内容 | contracts/nostr-events.md の受信検証(サイズ→署名→形式→時刻→内容→PoW) | `event_*` |
-| 5 | PEERS 内容 | 件数 ≤ 64、各要素は `host:port` 形式・長さ ≤ 256、自アドレス・重複は破棄。IPv6 リテラルは `[addr]:port` のブラケット表記のみ許容(例 `[2001:db8::1]:7147`。ブラケットなしでコロンを複数含むものはパース不能として破棄)。**ホスト名形式は破棄する**(名前空間分離 — 下記 invariant) | `pex_rejected` |
+| 5 | PEERS 内容 | 件数 ≤ 64、各要素は `host:port` 形式・長さ ≤ 256、自アドレス・重複は破棄。IPv6 リテラルは `[addr]:port` のブラケット表記のみ許容(例 `[2001:db8::1]:7147`。ブラケットなしでコロンを複数含むものはパース不能として破棄)。**ホスト名形式は破棄する**(名前空間分離 — 下記 invariant) | `pex_rejected`(不審な破棄時のみ — 下記 invariant) |
 | 6 | SYNC 応答量 | SYNC_REQ 1 回への応答 EVENT は ≤ event_store_max 件。超過は切断 | `p2p_rate_limited` |
 
 - **SYNC 応答とレート制限の両立**: 検査 2 の受信レート制限は接続時同期の期間中も適用される。
@@ -99,6 +99,13 @@ established → (SYNC_REQ/EVENT/GET_PEERS/PING の交換) → CLOSE または異
     (`stream.peer_addr()`、検証済み)へ射影して共有する。ホスト名自体・**送出時に再解決した
     未検証 IP**を載せてはならない (MUST NOT — research R14)。実 IP を未取得(未接続)の
     ホスト名ピアは共有しない。DNS 解決が必要なピアは manual 登録に限り許容する
+- **PEX 破棄の良性/不審分類 invariant(feature 005 / ADR-0013)**: 検査 5 の破棄そのもの
+  (候補に登録しない防御)は不変だが、`pex_rejected` セキュリティイベントの記録は破棄理由で
+  分ける。
+  - **良性**(自己アドレス反射・バッチ内重複): 健全な網で常時発生するため `pex_rejected` を
+    記録してはならない (MUST NOT)。debug ログにのみ出力してよい (MAY)。
+  - **不審**(件数超過・形式不正・長さ超過・ホスト名): 従来どおり `pex_rejected` を記録
+    しなければならない (MUST)。**良性と不審が混在する場合は不審が 1 件でもあるため記録する**。
 - エラー・CLOSE の reason に内部情報(パス・スタックトレース)を含めてはならない (MUST NOT)
 
 ## 接続管理

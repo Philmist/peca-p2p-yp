@@ -29,6 +29,7 @@ use peca_p2p_yp::p2p::session::PROTOCOL_VERSION;
 use peca_p2p_yp::store::{MuteKind, Store};
 
 use crate::AppWorld;
+use crate::log_capture::{captured_logs, init_capture};
 use crate::mock_peer::{MockPeer, TestNode, unix_now};
 
 /// 正当な配信のチャンネル ID。
@@ -61,6 +62,8 @@ pub struct SecurityWorld {
     observer: Option<MockPeer>,
     /// 被検体ノード。
     node: Option<TestNode>,
+    /// PEX 自己反射テストで、ピア交換前に自ノードへ学習させる自己アドレス(feature 005)。
+    self_addr: Option<String>,
     /// 正当な配信者の鍵。
     keys: Option<Keys>,
     /// 生 TCP クライアント(64KB 超フレームシナリオ)。
@@ -684,8 +687,16 @@ async fn mock_with_bad_pex(world: &mut AppWorld) {
 
 #[when("本ソフトウェアがそのモックピアとピア交換を行う")]
 async fn node_performs_pex(world: &mut AppWorld) {
+    // 良性破棄の debug ログ観測(US1 AC3 / SC-003)のため、PEX 処理前に DEBUG キャプチャを
+    // 有効化する(プロセス共有・冪等)。
+    init_capture();
     let addr = ctx(world).mock.as_ref().unwrap().addr().to_string();
+    let self_addr = ctx(world).self_addr.clone();
     let node = TestNode::spawn(0x5EC0_0006).await;
+    // 自己反射シナリオでは、ピア交換前に自ノードアドレスを学習させておく(feature 005)。
+    if let Some(sa) = self_addr {
+        node.mark_self_addr(&sa);
+    }
     // established 直後に GET_PEERS が自動送信され、モックが上記 PEERS を返す。
     node.add_manual_peer(&addr);
     ctx(world).node = Some(node);
@@ -714,5 +725,120 @@ async fn valid_pex_registered(world: &mut AppWorld) {
     assert!(
         node.wait_for_peer(PEX_VALID, CONNECT_TIMEOUT).await,
         "正当なアドレスは source=pex の候補として登録されるべき"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// シナリオ: PEX 良性破棄(自己アドレス反射・重複)の無記録(feature 005 / US1)
+// ---------------------------------------------------------------------------
+
+/// 自己反射テストで自ノードへ学習させる(=モックが送り返す)自己アドレス。
+const PEX_SELF: &str = "198.51.100.50:7147";
+
+#[given("自ノードのアドレスのみを反射するモックピアが存在する")]
+async fn mock_reflects_self(world: &mut AppWorld) {
+    let mock = MockPeer::spawn().await;
+    // 健全な網の反射を模す: 自ノードアドレスを送り返す。処理完了の観測用に正当分も 1 件混ぜる。
+    mock.share_peer(PEX_SELF);
+    mock.share_peer(PEX_VALID);
+    ctx(world).self_addr = Some(PEX_SELF.to_string());
+    ctx(world).mock = Some(mock);
+}
+
+#[given("同一アドレスを重複して応答するモックピアが存在する")]
+async fn mock_replies_duplicates(world: &mut AppWorld) {
+    let mock = MockPeer::spawn().await;
+    // 同一アドレスを重複させる(dual-stack で自然発生しうる良性破棄)。初出のみ採用される。
+    mock.share_peer(PEX_VALID);
+    mock.share_peer(PEX_VALID);
+    ctx(world).mock = Some(mock);
+}
+
+#[given("良性アドレスと不正アドレスを混在して応答するモックピアが存在する")]
+async fn mock_replies_mixed(world: &mut AppWorld) {
+    let mock = MockPeer::spawn().await;
+    // 良性(自己アドレス反射)+ 不審(形式不正)+ 正当の混在。不審があるため記録される。
+    mock.share_peer(PEX_SELF); // 良性(自己アドレス)
+    mock.share_peer(PEX_BAD_PORT); // 不審(ポート 0)
+    mock.share_peer(PEX_VALID); // 正当 → 採用
+    ctx(world).self_addr = Some(PEX_SELF.to_string());
+    ctx(world).mock = Some(mock);
+}
+
+#[then("自己アドレスは破棄されるが pex_rejected は記録されない")]
+async fn self_reflection_not_recorded(world: &mut AppWorld) {
+    assert_benign_only_not_recorded(world).await;
+}
+
+#[then("重複は破棄されるが pex_rejected は記録されない")]
+async fn duplicate_not_recorded(world: &mut AppWorld) {
+    assert_benign_only_not_recorded(world).await;
+}
+
+/// 良性のみの破棄が pex_rejected を生成せず、debug ログで観測できることを検証する。
+///
+/// 正当アドレスの候補登録(= PEERS バッチ処理完了)を待ってから、記録が定着する猶予を置き、
+/// (1) `pex_rejected` が記録されていないこと(FR-001 / SC-001)、(2) 良性破棄が debug ログに
+/// source(接続元)と件数付きで現れること(FR-002 / SC-003 / US1 AC3)を確認する。
+async fn assert_benign_only_not_recorded(world: &mut AppWorld) {
+    // 接続元アドレス(= モックの待受)。debug ログの source と一致するはず。
+    let mock_addr = ctx(world).mock.as_ref().unwrap().addr().to_string();
+    let node = ctx(world).node.as_ref().unwrap();
+    assert!(
+        node.wait_for_peer(PEX_VALID, CONNECT_TIMEOUT).await,
+        "正当なアドレスは登録され、PEERS バッチが処理されるべき"
+    );
+    // 記録は accepted 登録後・同一ハンドラ内で行われる。定着の猶予を置いてから確認する。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !node.security_log_text().contains("pex_rejected"),
+        "良性のみ(自己アドレス・重複)の破棄は pex_rejected を生成してはならない"
+    );
+    // 良性破棄は debug ログにのみ現れる(source + 件数)。プロセス共有バッファのため、
+    // 本シナリオの接続元アドレスを含む行で特定する。
+    let logs = captured_logs();
+    let observed = logs.lines().any(|l| {
+        l.contains("PEX: benign self/duplicate entries discarded")
+            && l.contains(&mock_addr)
+            && l.contains("benign=")
+    });
+    assert!(
+        observed,
+        "良性破棄は source={mock_addr} と件数付きで debug ログに観測できるべき\n--- captured ---\n{logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// シナリオ: PEX 件数超過(65 件)は不審=記録される(feature 005 / US2 AC1)
+// ---------------------------------------------------------------------------
+
+#[given("上限を超える 65 件のアドレスを応答するモックピアが存在する")]
+async fn mock_replies_over_max(world: &mut AppWorld) {
+    let mock = MockPeer::spawn().await;
+    // 65 件(= PEX_MAX_PEERS 64 + 1)。件数超過はバッチ全体が破棄され、記録対象(不審)。
+    for i in 0..65 {
+        mock.share_peer(&format!("203.0.113.{}:7147", i % 250 + 1));
+    }
+    ctx(world).mock = Some(mock);
+}
+
+#[then("PEX 応答は全件破棄され pex_rejected が記録される")]
+async fn over_max_all_rejected_and_logged(world: &mut AppWorld) {
+    let node = ctx(world).node.as_ref().unwrap();
+    assert!(
+        node.wait_for_security("pex_rejected", CONNECT_TIMEOUT)
+            .await,
+        "件数超過は不審として pex_rejected に記録されるべき(US2 AC1)"
+    );
+    // 件数超過はバッチ全破棄。PEX 由来(203.0.113.x)は 1 件も候補登録されない
+    // (接続先の manual ピア=モック待受は登録済みのため、PEX 分のみを検査する)。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pex_registered = node
+        .known_peers()
+        .iter()
+        .any(|p| p.addr.starts_with("203.0.113."));
+    assert!(
+        !pex_registered,
+        "件数超過バッチの PEX アドレスは 1 件も候補登録してはならない"
     );
 }

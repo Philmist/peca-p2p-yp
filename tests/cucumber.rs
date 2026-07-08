@@ -16,6 +16,11 @@ use cucumber::World;
 #[path = "common/mock_peer.rs"]
 pub(crate) mod mock_peer;
 
+/// tracing 出力の共有キャプチャ(DEBUG レベル。keystore の秘密非漏洩検査と
+/// security の PEX 良性 debug 観測が同一グローバルサブスクライバを共有する)。
+#[path = "common/log_capture.rs"]
+pub(crate) mod log_capture;
+
 #[path = "steps/keystore.rs"]
 mod keystore;
 #[path = "steps/outbound_only.rs"]

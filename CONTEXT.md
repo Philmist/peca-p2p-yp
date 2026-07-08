@@ -65,6 +65,7 @@ HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015
 - ADR-0010: DNS 解決ピアの限定サポート(manual 限定・名前空間分離・resolved_ip 射影)
 - ADR-0011: 配信中ペルソナロック(掲載前選択とリンク推定の構造的防止)+ Principle V 判定
 - ADR-0012: read-only index.txt の LAN 公開オプトイン(ADR-0006 決定 4 の部分 supersede)
+- ADR-0013: PEX 破棄の良性/不審分類(`pex_rejected` は不審な破棄のみ記録・良性は debug 格下げ)
 - security-review-checklist.md: セキュリティ PR のレビュー観点(実装中ゲート 6)
 - release-gate-check-2026-07-04.md: リリース前ゲート 8〜10 の適用記録
 

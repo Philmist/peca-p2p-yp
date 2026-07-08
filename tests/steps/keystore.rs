@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cucumber::{given, then, when};
@@ -35,48 +35,12 @@ const CH_DISCOVER: &str = "0abcdef00000000000000000000000a2";
 
 // ---------------------------------------------------------------------------
 // tracing 出力のキャプチャ(全ログ出力の秘密鍵非漏洩検査 — FR-011)
+//
+// 実体は共有モジュール `crate::log_capture`(DEBUG レベルのグローバルサブスクライバを
+// security の PEX 良性 debug 観測と共有する)。
 // ---------------------------------------------------------------------------
 
-/// プロセス全体で共有する tracing 出力バッファ。
-fn log_buffer() -> &'static Arc<Mutex<Vec<u8>>> {
-    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-    BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-}
-
-/// バッファへ書き込む `io::Write`(tracing の `MakeWriter` として使う)。
-struct BufWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for BufWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Ok(mut b) = self.0.lock() {
-            b.extend_from_slice(buf);
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// tracing のキャプチャ用サブスクライバを一度だけ設定する(既に設定済みなら何もしない)。
-fn init_capture() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let buf = Arc::clone(log_buffer());
-        let _ = tracing_subscriber::fmt()
-            .with_writer(move || BufWriter(Arc::clone(&buf)))
-            .with_ansi(false)
-            .try_init();
-    });
-}
-
-/// キャプチャした全 tracing 出力。
-fn captured_logs() -> String {
-    log_buffer()
-        .lock()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default()
-}
+use crate::log_capture::{captured_logs, init_capture};
 
 /// バイト列を小文字 hex にする(秘密鍵の hex 表現を作る — 漏洩検査用)。
 fn hex(bytes: &[u8]) -> String {
