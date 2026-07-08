@@ -285,14 +285,23 @@ async fn run() -> Result<(), i32> {
     // 14d. 鮮度切れ・期限切れイベントの物理回収。
     handles.push(spawn_sweep_loop(Arc::clone(&hub), shutdown_rx.clone()));
 
-    // 15. index.txt の LAN 公開(オプトイン — ADR-0012)の bind 試行(AppState 注入前)。
-    //     index_bind 非空時のみ index.txt 専用の第 2 リスナーを bind する。既存 3 受け口
-    //     (HTTP/PCP/P2P)と違い bind 失敗は致命エラーとせず(bind_error を使わず)、
-    //     WARN + 状態への失敗理由反映のみで本体は継続稼働する(FR-007)。
-    //     起動時に一度だけ確定する不変状態 IndexLanStatus を組み立て、AppState へ注入する。
-    //     検証は Settings::validate() 済み(空=無効、非空=loopback/LAN のみ)。
+    // 15. HTTP 本体(管理 UI/API)のリスナーを先に bind する(fail-fast)。
+    //     index.txt の LAN 公開(第 2 リスナー)の bind 試行より**前**に行うことで、
+    //     index_bind が管理用受け口と同一ポート(自己競合)の場合でも、本体側が先に
+    //     ポートを確保し、競合するのは第 2 リスナー側になる(spec §Edge Cases — 自己競合は
+    //     US4 の縮退継続として扱い、本体は落とさない)。既存 3 受け口の fail-fast は不変。
+    let http_listener = TcpListener::bind(http_addr)
+        .await
+        .map_err(|e| bind_error("HTTP", &e))?;
+
+    // 15a. index.txt の LAN 公開(オプトイン — ADR-0012)の bind 試行(AppState 注入前)。
+    //      index_bind 非空時のみ index.txt 専用の第 2 リスナーを bind する。既存 3 受け口
+    //      (HTTP/PCP/P2P)と違い bind 失敗は致命エラーとせず(bind_error を使わず)、
+    //      WARN + 状態への失敗理由反映のみで本体は継続稼働する(FR-007)。
+    //      起動時に一度だけ確定する不変状態 IndexLanStatus を組み立て、AppState へ注入する。
+    //      検証は Settings::validate() 済み(空=無効、非空=loopback/LAN のみ)。
     //
-    //     listener は state 構築後に serve するため Option で持ち越す。
+    //      listener は state 構築後に serve するため Option で持ち越す。
     let (index_lan_status, index_listener): (Option<Arc<IndexLanStatus>>, Option<TcpListener>) =
         if settings.index_bind.is_empty() {
             (None, None)
@@ -345,7 +354,7 @@ async fn run() -> Result<(), i32> {
             }
         };
 
-    // 15a. LAN 露出の監査イベント(ADR-0012)。**非 loopback かつ bind 成功**のときのみ
+    // 15b. LAN 露出の監査イベント(ADR-0012)。**非 loopback かつ bind 成功**のときのみ
     //      起動時に 1 件記録する(loopback 値・bind 失敗・機能無効では記録しない)。
     //      loopback 判定は検証(require_lan_or_loopback)と同じく to_canonical() 後に行い、
     //      v4-mapped loopback([::ffff:127.0.0.1])を誤って露出と記録しない。
@@ -373,7 +382,7 @@ async fn run() -> Result<(), i32> {
         Some(s) => format!("バインド失敗:{}(継続)", s.error.unwrap_or("unknown")),
     };
 
-    // 15b. Web 起動(一覧・ペルソナ・掲載状態・LAN 露出状態の供給元を注入)。
+    // 15c. Web 起動(一覧・ペルソナ・掲載状態・LAN 露出状態の供給元を注入)。
     let mut state = AppState::new(Arc::clone(&store), Arc::clone(&security), http_addr.port())
         .with_directory(Arc::clone(&hub) as Arc<_>)
         .with_identity(Arc::clone(&identity))
@@ -393,11 +402,8 @@ async fn run() -> Result<(), i32> {
         state = state.with_index_lan(status);
     }
     let app = build_router(state.clone());
-    let http_listener = TcpListener::bind(http_addr)
-        .await
-        .map_err(|e| bind_error("HTTP", &e))?;
 
-    // 15c. bind に成功していれば index.txt 専用の第 2 リスナーを serve する(既存
+    // 15d. bind に成功していれば index.txt 専用の第 2 リスナーを serve する(既存
     //      サブシステムと同じ shutdown_rx watch 経路 + handles へ push)。
     if let Some(listener) = index_listener {
         let index_app = build_index_router(state.clone());

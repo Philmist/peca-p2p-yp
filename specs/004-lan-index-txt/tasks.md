@@ -131,10 +131,10 @@
 
 **Purpose**: セキュリティレビュー・回帰確認・end-to-end 検証
 
-- [ ] T023 [P] セキュリティレビューチェックリスト(`docs/adr/security-review-checklist.md`)を本変更へ適用し、結果を `specs/004-lan-index-txt/checklists/security.md` に記録する(Principle III MUST — plan Constitution Check)
-- [ ] T024 [P] `specs/004-lan-index-txt/quickstart.md` の手動検証(SC-001〜SC-006、Windows ファイアウォールプロンプトの案内確認を含む)を実施する。§6 の UI 警告ゲート手順は FR-005 の正式な検証手段である(ADR-0012「Principle IV の適用範囲」)
-- [ ] T025 [P] `CONTEXT.md` の信頼境界表に「index.txt(オプトイン時): LAN」を追記する(ADR-0012 帰結)
-- [ ] T026 回帰・品質ゲート: `cargo fmt -- --check`、`cargo clippy`、`cargo test`(全テスト)を通過させる。`index_bind` 未設定時の外部観測挙動が現行と完全一致すること(SC-001 — 既存テストの green で担保)を確認する
+- [X] T023 [P] セキュリティレビューチェックリスト(`docs/adr/security-review-checklist.md`)を本変更へ適用し、結果を `specs/004-lan-index-txt/checklists/security.md` に記録する(Principle III MUST — plan Constitution Check)
+- [X] T024 [P] `specs/004-lan-index-txt/quickstart.md` の手動検証(SC-001〜SC-006、Windows ファイアウォールプロンプトの案内確認を含む)を実施する。§6 の UI 警告ゲート手順は FR-005 の正式な検証手段である(ADR-0012「Principle IV の適用範囲」)。**同一ホストの LAN IP で実施(SC-001〜005 OK)。残: §6 のブラウザ UI 実操作(ユーザー手動確認待ち — settings.html の静的確認は実施済み)、別 PC からの実取得。SC-005 は当初 quickstart §5 記述どおり(index_bind=http と同一ポート)だと実装のリスナー起動順の問題で本体が落ちる欠陥を検出したが、main.rs の http bind 先行への順序修正 + 自己競合の回帰テスト(`self_conflict_with_http_port_degrades_but_keeps_running`)追加で解消。quickstart §5 記述どおりの手順で再検証し OK(本体継続・error:addr_in_use・SecurityEvent 0 件)**
+- [X] T025 [P] `CONTEXT.md` の信頼境界表に「index.txt(オプトイン時): LAN」を追記する(ADR-0012 帰結)
+- [X] T026 回帰・品質ゲート: `cargo fmt -- --check`、`cargo clippy`、`cargo test`(全テスト)を通過させる。`index_bind` 未設定時の外部観測挙動が現行と完全一致すること(SC-001 — 既存テストの green で担保)を確認する
 
 ---
 

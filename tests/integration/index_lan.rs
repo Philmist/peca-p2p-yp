@@ -704,6 +704,47 @@ fn bind_conflict_degrades_but_keeps_running() {
     );
 }
 
+/// index_bind を http_bind と**同一ポート**(自己競合)にした場合の縮退継続。
+/// spec §Edge Cases「index_bind が既存の管理用受け口と同一 → 競合 → US4 縮退」を検証する。
+///
+/// リスナー起動順が「http bind 先行 → index bind 試行」でなければ、http bind が競合で
+/// 落ちて本体ごと終了し、本テストは status 取得不能で失敗する(この順序不変性の回帰固定)。
+#[test]
+fn self_conflict_with_http_port_degrades_but_keeps_running() {
+    let ports = free_ports(2);
+    let (http_port, pcp_port) = (ports[0], ports[1]);
+    let data_dir = tempfile::tempdir().unwrap();
+    // index_bind = http と同一ポート(loopback なので検証は通る・自己競合を誘発)。
+    let index_bind = format!("127.0.0.1:{http_port}");
+
+    let _node = spawn_node(http_port, pcp_port, Some(&index_bind), data_dir.path());
+    // http bind が先行して成功するため、本体(loopback)は継続稼働する。
+    assert!(
+        wait_for_index_200(http_port),
+        "自己競合でも本体 loopback は稼働継続するべき(http bind が先行して成功する)"
+    );
+
+    let mut lan = None;
+    for _ in 0..50 {
+        if let Some(status) = fetch_status(http_port) {
+            lan = Some(status["index_txt_lan"].clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let lan = lan.expect("status を取得できませんでした(本体が落ちた可能性)");
+    assert_eq!(lan["enabled"], true, "機能は有効(設定あり)");
+    assert_eq!(lan["listening"], false, "自己競合で待受していない");
+    assert_eq!(lan["error"], "addr_in_use", "競合の定型コード");
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        count_index_lan_exposed_events(data_dir.path()),
+        0,
+        "bind 失敗では露出イベントを記録しない"
+    );
+}
+
 /// このホストに割り当てられていない LAN プライベートアドレス(検証は通るが bind 不可)
 /// では、第 2 リスナーが上がらず error が非 null になり、本体は稼働継続する。
 /// 具体的なエラーコードはプラットフォーム差があるため、listening:false・error 非 null を検証する。

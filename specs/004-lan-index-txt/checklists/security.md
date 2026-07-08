@@ -88,6 +88,31 @@
 - 各項目は「要件が正しく書かれているか」を問う。実装の動作確認は quickstart.md / テストの責務
 - 発見事項は項目の下にインラインで追記し、spec/plan/ADR の修正につなげる
 
+## セキュリティレビューチェックリスト適用結果(T023、2026-07-08)
+
+`docs/adr/security-review-checklist.md`(14 項目)を本変更の実装差分
+(Phase 2〜6: config.rs / main.rs / security/mod.rs / web/* / ui/settings.html / tests)
+へ適用した。レビュアは実装エージェントと別(constitution Principle III SHOULD 充足)。
+
+- [x] 1 入力検証(サイズ): LAN リスナーは既存 index_txt ハンドラの URL ≤1KB / ヘッダ ≤8KB を再マウントで継承(`index_txt.rs` 内部実装をレビューで裏取り)。上限漏れなし — 超過 400 を統合テストで検証
+- [x] 2 入力検証(形式・内容): `index_bind` は `Settings::validate()` 唯一ゲートで `require_lan_or_loopback`(パース → `to_canonical()` → 許可リスト)。検証前の値を bind に渡す経路なし
+- [x] 3 信頼境界ごとの強度: 新境界(LAN)は定型エラーのみ(404/405/400/429)。loopback 側と同一の保護で緩和なし(contract §1.2)
+- [x] 4 エラー応答の情報漏洩: `NonLanBind` Display・status の error 定型コード 4 種 + `unknown`・404/405 いずれも内部情報なし
+- [x] 5 最小権限・バインド: 新待受は index.txt ルートのみ物理マウント(API/UI 不在)。既定空 = 無効。`http_bind`/`pcp_bind` の loopback 強制不変(host_guard 不変テストあり)。読み取り専用経路につきトークン不要は contract §1.2 に根拠
+- [x] 6 暗号: 非該当(暗号要素なし — ADR-0012)
+- [x] 7 秘密情報: トークン・鍵の扱い変更なし。SecurityEvent source は利用者自身の設定値(バインドアドレス)のみ
+- [x] 8 セキュリティイベントログ: 新カテゴリ `index_txt_lan_exposed` は data-model §4 を先に定義済み。`ALL` 15 + 網羅テスト更新。起動時 1 件のため集約・ローテーションへの影響なし
+- [x] 9 レート制限・資源上限: `index_txt_rate_limiter` を loopback 側と共有(10 req/秒/IP、合算は安全側)。`IndexLanStatus` は起動時確定の固定サイズ不変値でメモリ成長なし
+- [x] 10 P2P 未検証情報: 非該当(P2P 変更なし)
+- [x] 11 P2P 伝搬の不変条件: 非該当(変更なし)
+- [x] 12 依存クレート: 新規依存ゼロ(Cargo.toml の追加は `[[test]]` 節のみ)
+- [x] 13 テスト対応: ネガティブシナリオ(危険値投入・未定義パス 404・不正メソッド 405・サイズ超過 400・レート超過 429・bind 競合縮退)が spec の Gherkin シナリオと 1:1 対応
+- [x] 14 コメント: 許可リスト判定の意図(config.rs)・物理分離の根拠(web/mod.rs)・監査カテゴリの意味論(security/mod.rs)・縮退写像(main.rs)に doc コメントあり
+
+**レビュー中の指摘と修正**: 監査イベントの loopback 判定が `to_canonical()` を通しておらず、
+v4-mapped loopback(`[::ffff:127.0.0.1]`)で偽の露出イベントを記録しうる不整合を検出 →
+検証器と同一基準(`ip().to_canonical().is_loopback()`)へ修正済み(コミット 2c62926)。
+
 ## 実行結果(2026-07-08)
 
 初回実行: **23/27 PASS、4 件の軽微な発見事項**。同日ユーザー承認のうえ 4 件すべての修正を適用し、**27/27 PASS**。
