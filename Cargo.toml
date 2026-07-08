@@ -113,3 +113,7 @@ path = "tests/integration/scale.rs"
 [[test]]
 name = "persona_lock"
 path = "tests/integration/persona_lock.rs"
+
+[[test]]
+name = "index_lan"
+path = "tests/integration/index_lan.rs"

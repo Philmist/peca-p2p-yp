@@ -267,6 +267,32 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// index.txt 専用の第 2 リスナー(LAN 公開)のルーターを構築する(ADR-0012)。
+///
+/// loopback 側と**同一の** [`crate::yp::index_txt::routes`] を再マウントするだけで、
+/// `/api/v1`(API)や静的アセット(UI)のルートは物理的に持たない。これにより
+/// 「経路フィルタのバグで API が LAN 露出する」という故障モードが構造的に存在しない
+/// (research R2 — Principle II)。
+///
+/// URL 長 ≤ 1KB・ヘッダ ≤ 8KB の上限とレート制限(10 req/秒)は `index_txt` の
+/// ハンドラ内部に実装されており、`routes()` を再マウントするだけで第 2 リスナーにも
+/// そのまま適用される。レート制限器は [`AppState::index_txt_rate_limiter`] を共有する。
+///
+/// index.txt 以外の全パス(`/api/v1/...`・`/`・静的アセット)は fallback の定型 404
+/// `{"error":"not_found"}` を返す(contract §1.1)。`/index.txt` への GET/HEAD 以外は
+/// axum が 405(空ボディ + `Allow`)を自動応答する。
+pub fn build_index_router(state: AppState) -> Router {
+    Router::new()
+        .merge(crate::yp::index_txt::routes())
+        .fallback(index_not_found)
+        .with_state(state)
+}
+
+/// LAN リスナーの未定義パスに対する定型 404(index.txt 以外は API/UI ともに存在しない)。
+async fn index_not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found")
+}
+
 /// `/api/v1` サブルーター。後続タスクはここへルートを追加する。
 pub(crate) fn api_router(state: AppState) -> Router<AppState> {
     Router::new()

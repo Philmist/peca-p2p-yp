@@ -55,12 +55,12 @@
 
 ### Tests for User Story 1(fail-first)⚠️
 
-- [ ] T007 [US1] `Cargo.toml` に `[[test]] name = "index_lan"` を追加し、統合テスト `tests/integration/index_lan.rs` を新規作成する。fail-first シナリオ: (1) LAN リスナーへの `GET /index.txt` が loopback 側と同一内容・同一 `Content-Type`(`index_txt_encoding` 共有)、(2) `HEAD /index.txt` が GET と整合、(3) `index_bind` 空なら第 2 リスナーが存在しない(接続拒否)、(4) 同一送信元 10 req/秒超過で 429 `{"error":"rate_limited"}`(spec US1 受入 1〜4)。**失敗することを確認**する
+- [X] T007 [US1] `Cargo.toml` に `[[test]] name = "index_lan"` を追加し、統合テスト `tests/integration/index_lan.rs` を新規作成する。fail-first シナリオ: (1) LAN リスナーへの `GET /index.txt` が loopback 側と同一内容・同一 `Content-Type`(`index_txt_encoding` 共有)、(2) `HEAD /index.txt` が GET と整合、(3) `index_bind` 空なら第 2 リスナーが存在しない(接続拒否)、(4) 同一送信元 10 req/秒超過で 429 `{"error":"rate_limited"}`(spec US1 受入 1〜4)。**失敗することを確認**する
 
 ### Implementation for User Story 1
 
-- [ ] T008 [US1] `build_index_router(state: AppState) -> Router` を `src/web/mod.rs` に追加する(`Router::new().merge(index_txt::routes()).with_state(state)` — research R2。fallback は US2 で追加)
-- [ ] T009 [US1] `src/main.rs` §15 直後に `index_bind` 非空時の第 2 リスナー起動を追加する(`TcpListener::bind` → `axum::serve` を `into_make_service_with_connect_info::<SocketAddr>()` で起動、`with_graceful_shutdown` + `handles` へ push — 既存 §17 と同パターン)。起動サマリログに LAN 公開の記載を追加する。bind 失敗時は暫定で `tracing::warn!` + リスナー起動スキップとし、panic・即終了させない(縮退の完成形 = 状態反映と定型コード写像は T022)
+- [X] T008 [US1] `build_index_router(state: AppState) -> Router` を `src/web/mod.rs` に追加する(`Router::new().merge(index_txt::routes()).with_state(state)` — research R2。fallback は US2 で追加)
+- [X] T009 [US1] `src/main.rs` §15 直後に `index_bind` 非空時の第 2 リスナー起動を追加する(`TcpListener::bind` → `axum::serve` を `into_make_service_with_connect_info::<SocketAddr>()` で起動、`with_graceful_shutdown` + `handles` へ push — 既存 §17 と同パターン)。起動サマリログに LAN 公開の記載を追加する。bind 失敗時は暫定で `tracing::warn!` + リスナー起動スキップとし、panic・即終了させない(縮退の完成形 = 状態反映と定型コード写像は T022)
 
 **Checkpoint**: `cargo test --test index_lan` の US1 シナリオが green。MVP としてこの時点で spec SC-002 を手動確認可能。
 
@@ -74,11 +74,11 @@
 
 ### Tests for User Story 2(fail-first)⚠️
 
-- [ ] T010 [US2] fail-first ネガティブシナリオを `tests/integration/index_lan.rs` に追加する: (1) LAN リスナーへの `/api/v1/status`・`/api/v1/settings`(PUT 含む)→ 404 `{"error":"not_found"}`、(2) `/`・静的アセットパス → 404 定型 JSON、(3) `POST /index.txt` → 405(空ボディ + `Allow` ヘッダ)、(4) 管理 HTTP・PCP 受け口の loopback 強制が不変、(5) URL 長 >1KB / ヘッダ合計 >8KB → 400 `{"error":"request_too_large"}`(spec US2 受入 1〜4、contract §1.1〜1.2)。**失敗することを確認**する
+- [X] T010 [US2] fail-first ネガティブシナリオを `tests/integration/index_lan.rs` に追加する: (1) LAN リスナーへの `/api/v1/status`・`/api/v1/settings`(PUT 含む)→ 404 `{"error":"not_found"}`、(2) `/`・静的アセットパス → 404 定型 JSON、(3) `POST /index.txt` → 405(空ボディ + `Allow` ヘッダ)、(4) 管理 HTTP・PCP 受け口の loopback 強制が不変、(5) URL 長 >1KB / ヘッダ合計 >8KB → 400 `{"error":"request_too_large"}`(spec US2 受入 1〜4、contract §1.1〜1.2)。**失敗することを確認**する
 
 ### Implementation for User Story 2
 
-- [ ] T011 [US2] `build_index_router` に定型 404 fallback(`{"error":"not_found"}` JSON — contract §1.1)を追加し、URL 長 ≤1KB・ヘッダ ≤8KB の既存上限レイヤーが第 2 リスナーにも適用される構成にする(`src/web/mod.rs`。検証は T010 のテストで行う)
+- [X] T011 [US2] `build_index_router` に定型 404 fallback(`{"error":"not_found"}` JSON — contract §1.1)を追加し、URL 長 ≤1KB・ヘッダ ≤8KB の既存上限レイヤーが第 2 リスナーにも適用される構成にする(`src/web/mod.rs`。検証は T010 のテストで行う)
 
 **Checkpoint**: US1 + US2 で「安全な LAN 公開」が成立(SC-003)。`cargo test --test index_lan` green。
 
