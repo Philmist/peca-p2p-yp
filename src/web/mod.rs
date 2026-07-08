@@ -225,6 +225,12 @@ struct RateWindow {
     count: u32,
 }
 
+/// エントリ数がこれ以上のとき、`check` は過去秒の死んだエントリを回収してから処理する。
+/// 固定 1 秒窓では `window` が現在秒でないエントリは次アクセスで必ずリセットされるため、
+/// 回収してもレート制限の判定は変わらない。メモリはおおよそ
+/// 「しきい値 + 同一秒内の新規送信元数」に有界化される(LAN 公開時の送信元多様化対策)。
+const RATE_LIMITER_SWEEP_THRESHOLD: usize = 1024;
+
 /// 接続元 IP ごとの固定 1 秒窓レート制限器。クロックは注入可能(テスト用)。
 pub struct RateLimiter {
     max_per_sec: u32,
@@ -247,6 +253,12 @@ impl RateLimiter {
         }
     }
 
+    /// 現在保持している接続元エントリ数(テスト用)。
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.state.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
     /// 接続元 `ip` のリクエストを許可するなら `true`、上限超過なら `false`。
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = (self.now)();
@@ -254,6 +266,9 @@ impl RateLimiter {
             // ロック異常時は安全側(拒否)に倒す
             return false;
         };
+        if state.len() >= RATE_LIMITER_SWEEP_THRESHOLD {
+            state.retain(|_, w| w.window == now);
+        }
         let entry = state.entry(ip).or_insert(RateWindow {
             window: now,
             count: 0,
@@ -503,6 +518,32 @@ mod tests {
         assert!(limiter.check(a));
         assert!(limiter.check(b), "別 IP は独立予算");
         assert!(!limiter.check(a));
+    }
+
+    #[test]
+    fn rate_limiter_evicts_stale_entries_when_over_threshold() {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let c2 = Arc::clone(&clock);
+        let limiter = RateLimiter::with_clock(
+            10,
+            Box::new(move || c2.load(std::sync::atomic::Ordering::SeqCst)),
+        );
+        // 秒 1 にしきい値超の多数送信元からアクセス(敵対的な送信元多様化を模す)
+        let total = RATE_LIMITER_SWEEP_THRESHOLD * 2;
+        for i in 0..total {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+            assert!(limiter.check(ip));
+        }
+        assert_eq!(limiter.entry_count(), total, "秒内はエントリが保持される");
+        // 秒 2 の最初のアクセスで、過去秒の死んだエントリが回収される
+        clock.store(2, std::sync::atomic::Ordering::SeqCst);
+        let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert!(limiter.check(ip));
+        assert_eq!(
+            limiter.entry_count(),
+            1,
+            "window が過去のエントリは全て回収され、現在秒の 1 件のみ残る"
+        );
     }
 
     #[test]

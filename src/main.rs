@@ -301,79 +301,82 @@ async fn run() -> Result<(), i32> {
     //      起動時に一度だけ確定する不変状態 IndexLanStatus を組み立て、AppState へ注入する。
     //      検証は Settings::validate() 済み(空=無効、非空=loopback/LAN のみ)。
     //
-    //      listener は state 構築後に serve するため Option で持ち越す。
-    let (index_lan_status, index_listener): (Option<Arc<IndexLanStatus>>, Option<TcpListener>) =
-        if settings.index_bind.is_empty() {
-            (None, None)
-        } else {
-            // validate 済みのため通常はパース成功する。防御的に失敗も縮退継続で扱う。
-            match settings.index_bind.parse::<SocketAddr>() {
-                Ok(index_addr) => match TcpListener::bind(index_addr).await {
-                    Ok(listener) => (
-                        Some(Arc::new(IndexLanStatus {
-                            bind: settings.index_bind.clone(),
-                            listening: true,
-                            error: None,
-                        })),
-                        Some(listener),
-                    ),
-                    Err(e) => {
-                        // 縮退継続: ErrorKind → 定型コードへ写像し状態へ反映(内部情報なし)。
-                        let code = index_bind_error_code(&e);
-                        tracing::warn!(
-                            target: "startup",
-                            index_bind = %settings.index_bind,
-                            error = code,
-                            "index.txt の LAN リスナーにバインドできませんでした(本体は継続します)"
-                        );
-                        (
-                            Some(Arc::new(IndexLanStatus {
-                                bind: settings.index_bind.clone(),
-                                listening: false,
-                                error: Some(code),
-                            })),
-                            None,
-                        )
-                    }
-                },
-                Err(_) => {
+    //      listener は state 構築後に serve するため Option で持ち越す。パース済み
+    //      アドレスは 15b の loopback 判定で再利用する(再パース回避)。
+    let (index_lan_status, index_listener, index_addr): (
+        Option<Arc<IndexLanStatus>>,
+        Option<TcpListener>,
+        Option<SocketAddr>,
+    ) = if settings.index_bind.is_empty() {
+        (None, None, None)
+    } else {
+        // validate 済みのため通常はパース成功する。防御的に失敗も縮退継続で扱う。
+        match settings.index_bind.parse::<SocketAddr>() {
+            Ok(index_addr) => match TcpListener::bind(index_addr).await {
+                Ok(listener) => (
+                    Some(Arc::new(IndexLanStatus {
+                        bind: settings.index_bind.clone(),
+                        listening: true,
+                        error: None,
+                    })),
+                    Some(listener),
+                    Some(index_addr),
+                ),
+                Err(e) => {
+                    // 縮退継続: ErrorKind → 定型コードへ写像し状態へ反映(内部情報なし)。
+                    let code = index_bind_error_code(&e);
                     tracing::warn!(
                         target: "startup",
                         index_bind = %settings.index_bind,
-                        "index_bind の書式を解釈できませんでした(本体は継続します)"
+                        error = code,
+                        "index.txt の LAN リスナーにバインドできませんでした(本体は継続します)"
                     );
                     (
                         Some(Arc::new(IndexLanStatus {
                             bind: settings.index_bind.clone(),
                             listening: false,
-                            error: Some("unknown"),
+                            error: Some(code),
                         })),
                         None,
+                        Some(index_addr),
                     )
                 }
+            },
+            Err(_) => {
+                tracing::warn!(
+                    target: "startup",
+                    index_bind = %settings.index_bind,
+                    "index_bind の書式を解釈できませんでした(本体は継続します)"
+                );
+                (
+                    Some(Arc::new(IndexLanStatus {
+                        bind: settings.index_bind.clone(),
+                        listening: false,
+                        error: Some("unknown"),
+                    })),
+                    None,
+                    None,
+                )
             }
-        };
+        }
+    };
 
     // 15b. LAN 露出の監査イベント(ADR-0012)。**非 loopback かつ bind 成功**のときのみ
     //      起動時に 1 件記録する(loopback 値・bind 失敗・機能無効では記録しない)。
     //      loopback 判定は検証(require_lan_or_loopback)と同じく to_canonical() 後に行い、
     //      v4-mapped loopback([::ffff:127.0.0.1])を誤って露出と記録しない。
-    //      source はバインドアドレス、detail は定型文言。
+    //      source はバインドアドレス、detail は定型文言。アドレスは 15a のパース済みを
+    //      使う(bind 成功時は必ず Some)。
     if let Some(status) = &index_lan_status
         && status.listening
+        && let Some(addr) = index_addr
+        && !addr.ip().to_canonical().is_loopback()
     {
-        let is_loopback = settings
-            .index_bind
-            .parse::<SocketAddr>()
-            .map(|a| a.ip().to_canonical().is_loopback())
-            .unwrap_or(false);
-        if !is_loopback {
-            security.log(
-                peca_p2p_yp::security::SecurityCategory::IndexTxtLanExposed,
-                &settings.index_bind,
-                "index.txt is exposed to LAN",
-            );
-        }
+        security.log(
+            peca_p2p_yp::security::SecurityCategory::IndexTxtLanExposed,
+            &settings.index_bind,
+            "index.txt is exposed to LAN",
+        );
     }
 
     let index_lan_desc = match &index_lan_status {
