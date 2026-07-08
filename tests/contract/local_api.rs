@@ -328,14 +328,191 @@ async fn get_settings_returns_all_keys_with_defaults() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    // 13 キー(data-model §Settings)
-    assert_eq!(json.as_object().unwrap().len(), 13);
+    // 14 キー(data-model §Settings — ADR-0012 で index_bind 追加、13→14)
+    assert_eq!(json.as_object().unwrap().len(), 14);
     assert_eq!(json["pcp_bind"], "127.0.0.1:7146");
     assert_eq!(json["http_bind"], "127.0.0.1:7180");
     assert_eq!(json["p2p_bind"], "0.0.0.0:7147,[::]:7147");
     assert_eq!(json["event_store_max"], 4096);
     assert_eq!(json["pex_enabled"], true);
     assert_eq!(json["index_txt_encoding"], "utf-8");
+    // index_bind の既定は空文字(機能無効)。
+    assert_eq!(json["index_bind"], "");
+}
+
+// ---------------------------------------------------------------------------
+// index_bind 設定契約(T012 — ADR-0012 / contract §2)
+// ---------------------------------------------------------------------------
+
+/// PUT で受理される index_bind 値(loopback / RFC1918 / リンクローカル / ULA)は
+/// 200 + restart_required:true / restart_keys:["index_bind"]。
+#[tokio::test]
+async fn put_settings_index_bind_accepts_lan_values() {
+    for value in [
+        "127.0.0.1:7180",
+        "192.168.1.10:7180",
+        "169.254.10.1:7180",
+        "[fd12:3456::1]:7180",
+    ] {
+        let (security, _p, _d) = temp_security_log();
+        let app = web::build_router(test_state(security));
+        let body = format!(r#"{{"index_bind":"{value}"}}"#);
+        let resp = app
+            .oneshot(build_request(
+                Method::PUT,
+                "/api/v1/settings",
+                Some(GOOD_HOST),
+                Some(TOKEN),
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{value} は受理されるべき");
+        let json = body_json(resp).await;
+        assert_eq!(json["restart_required"], true, "{value}");
+        let keys: Vec<String> = json["restart_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, vec!["index_bind"], "{value}");
+    }
+}
+
+/// unspecified / グローバル / CGNAT は 400 `{"error":"non_lan_bind"}`。
+#[tokio::test]
+async fn put_settings_index_bind_rejects_non_lan_400() {
+    for value in ["0.0.0.0:7180", "203.0.113.5:7180", "100.64.0.1:7180"] {
+        let (security, _p, _d) = temp_security_log();
+        let app = web::build_router(test_state(security));
+        let body = format!(r#"{{"index_bind":"{value}"}}"#);
+        let resp = app
+            .oneshot(build_request(
+                Method::PUT,
+                "/api/v1/settings",
+                Some(GOOD_HOST),
+                Some(TOKEN),
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{value} は拒否");
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "non_lan_bind", "{value}");
+        assert_eq!(json.as_object().unwrap().len(), 1);
+    }
+}
+
+/// ポート欠落・カンマ区切り複数は 400 `{"error":"invalid_bind"}`(既存写像)。
+#[tokio::test]
+async fn put_settings_index_bind_rejects_malformed_400() {
+    for value in ["192.168.1.10", "192.168.1.10:7180,10.0.0.5:7180"] {
+        let (security, _p, _d) = temp_security_log();
+        let app = web::build_router(test_state(security));
+        let body = format!(r#"{{"index_bind":"{value}"}}"#);
+        let resp = app
+            .oneshot(build_request(
+                Method::PUT,
+                "/api/v1/settings",
+                Some(GOOD_HOST),
+                Some(TOKEN),
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{value} は拒否");
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "invalid_bind", "{value}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/status の index_txt_lan(T012 — contract §3)
+// ---------------------------------------------------------------------------
+
+/// 機能無効(index_lan 未注入)時は {enabled:false, bind:null, listening:false, error:null}。
+#[tokio::test]
+async fn status_index_txt_lan_disabled_shape() {
+    let (security, _p, _d) = temp_security_log();
+    let app = web::build_router(test_state(security));
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            "/api/v1/status",
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let lan = &json["index_txt_lan"];
+    assert_eq!(lan["enabled"], false);
+    assert!(lan["bind"].is_null());
+    assert_eq!(lan["listening"], false);
+    assert!(lan["error"].is_null());
+}
+
+/// 露出中(index_lan 注入・listening:true)時は {enabled:true, bind:設定値, listening:true, error:null}。
+#[tokio::test]
+async fn status_index_txt_lan_exposed_shape() {
+    use peca_p2p_yp::web::IndexLanStatus;
+    let (security, _p, _d) = temp_security_log();
+    let mut state = test_state(security);
+    state.index_lan = Some(Arc::new(IndexLanStatus {
+        bind: "192.168.1.10:7180".to_string(),
+        listening: true,
+        error: None,
+    }));
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            "/api/v1/status",
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let lan = &json["index_txt_lan"];
+    assert_eq!(lan["enabled"], true);
+    assert_eq!(lan["bind"], "192.168.1.10:7180");
+    assert_eq!(lan["listening"], true);
+    assert!(lan["error"].is_null());
+}
+
+/// 設定有効だが bind 失敗時は {enabled:true, bind:設定値, listening:false, error:"addr_in_use"}。
+#[tokio::test]
+async fn status_index_txt_lan_failed_shape() {
+    use peca_p2p_yp::web::IndexLanStatus;
+    let (security, _p, _d) = temp_security_log();
+    let mut state = test_state(security);
+    state.index_lan = Some(Arc::new(IndexLanStatus {
+        bind: "192.168.1.10:7180".to_string(),
+        listening: false,
+        error: Some("addr_in_use"),
+    }));
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            "/api/v1/status",
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let lan = &json["index_txt_lan"];
+    assert_eq!(lan["enabled"], true);
+    assert_eq!(lan["bind"], "192.168.1.10:7180");
+    assert_eq!(lan["listening"], false);
+    assert_eq!(lan["error"], "addr_in_use");
 }
 
 #[tokio::test]

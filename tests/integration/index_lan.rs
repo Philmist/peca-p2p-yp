@@ -479,3 +479,268 @@ fn http_raw(port: u16, request: &str) -> Option<HttpResponse> {
     }
     parse_response(&raw)
 }
+
+// ---------------------------------------------------------------------------
+// US3(T014): SecurityEvent index_txt_lan_exposed の記録条件
+// ---------------------------------------------------------------------------
+
+/// data-dir 配下の security.log を読み、`index_txt_lan_exposed` カテゴリの行数を数える。
+/// ログ未生成(イベントなし)は 0。
+fn count_index_lan_exposed_events(data_dir: &std::path::Path) -> usize {
+    let path = data_dir.join("security.log");
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["category"] == "index_txt_lan_exposed")
+        .count()
+}
+
+/// 非 loopback の index_bind + bind 成功時、起動時に index_txt_lan_exposed が 1 件記録され、
+/// source がバインドアドレスであること。
+///
+/// 非 loopback かつ確実に bind 可能なアドレスは、このホストの LAN IP を動的に取得して
+/// 用いる(loopback 帯 127.x は is_loopback=true で記録されないため使えない)。取得
+/// できない環境(CI 等で LAN IP 無し)ではスキップする。
+#[test]
+fn security_event_recorded_for_non_loopback_bind() {
+    let Some(lan_ip) = detect_non_loopback_bindable_ip() else {
+        eprintln!("非 loopback のバインド可能アドレスが無い環境のためスキップ");
+        return;
+    };
+    let ports = free_ports(3);
+    let (http_port, pcp_port, index_port) = (ports[0], ports[1], ports[2]);
+    let data_dir = tempfile::tempdir().unwrap();
+    let index_bind = format!("{lan_ip}:{index_port}");
+
+    let _node = spawn_node(http_port, pcp_port, Some(&index_bind), data_dir.path());
+    // LAN リスナーの起動完了を待つ(bind 成功の確認)。
+    assert!(
+        wait_for_index_200_on(&lan_ip, index_port),
+        "非 loopback LAN リスナーが起動しませんでした({index_bind})"
+    );
+    // 起動直後のイベント書き込みを確実に拾うため少し待つ。
+    std::thread::sleep(Duration::from_millis(300));
+
+    let count = count_index_lan_exposed_events(data_dir.path());
+    assert_eq!(count, 1, "非 loopback + bind 成功で 1 件記録されるべき");
+
+    // source がバインドアドレスであること。
+    let path = data_dir.path().join("security.log");
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let event = content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["category"] == "index_txt_lan_exposed")
+        .expect("index_txt_lan_exposed イベントが存在するべき");
+    assert_eq!(event["source"], index_bind, "source はバインドアドレス");
+}
+
+/// loopback 値(127.0.0.1)では露出ではないため index_txt_lan_exposed は 0 件。
+#[test]
+fn no_security_event_for_loopback_bind() {
+    let ports = free_ports(3);
+    let (http_port, pcp_port, index_port) = (ports[0], ports[1], ports[2]);
+    let data_dir = tempfile::tempdir().unwrap();
+    let index_bind = format!("127.0.0.1:{index_port}");
+
+    let _node = spawn_node(http_port, pcp_port, Some(&index_bind), data_dir.path());
+    assert!(wait_for_index_200(index_port), "LAN リスナー未起動");
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert_eq!(
+        count_index_lan_exposed_events(data_dir.path()),
+        0,
+        "loopback 値では記録しない"
+    );
+}
+
+/// 機能無効(index_bind 空)では index_txt_lan_exposed は 0 件。
+#[test]
+fn no_security_event_when_disabled() {
+    let ports = free_ports(3);
+    let (http_port, pcp_port, _index_port) = (ports[0], ports[1], ports[2]);
+    let data_dir = tempfile::tempdir().unwrap();
+
+    let _node = spawn_node(http_port, pcp_port, None, data_dir.path());
+    assert!(wait_for_index_200(http_port), "loopback リスナー未起動");
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert_eq!(
+        count_index_lan_exposed_events(data_dir.path()),
+        0,
+        "機能無効では記録しない"
+    );
+}
+
+/// 指定アドレス・ポートで GET /index.txt が 200 を返すまで待つ。
+fn wait_for_index_200_on(ip: &str, port: u16) -> bool {
+    for _ in 0..100 {
+        if let Some(r) = http_request_on(ip, port, "GET", "/index.txt", &[], &[])
+            && r.status == 200
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// 任意の接続先ホストへ HTTP/1.0 リクエストを送る(http_request の host 指定版)。
+fn http_request_on(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    extra_headers: &[&str],
+    body: &[u8],
+) -> Option<HttpResponse> {
+    let mut stream = TcpStream::connect((ip, port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
+    let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {ip}:{port}\r\n");
+    for h in extra_headers {
+        req.push_str(h);
+        req.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    if !body.is_empty() {
+        stream.write_all(body).ok()?;
+    }
+    stream.flush().ok()?;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    parse_response(&raw)
+}
+
+/// このホストに割り当てられた、bind 可能で loopback でない IPv4 アドレスを探す。
+/// 見つからなければ `None`(CI 等で LAN IP が無い環境)。
+///
+/// UDP ソケットを外向きに「接続」して OS が選ぶ送信元アドレスを得る(パケットは
+/// 送らない)。得たアドレスが loopback でなければ、それを bind 候補として返す。
+fn detect_non_loopback_bindable_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // 実際には送信しない。ルーティング上の送信元アドレス選択のためだけに connect する。
+    sock.connect("192.0.2.1:9").ok()?; // TEST-NET-1(到達不要)
+    let local = sock.local_addr().ok()?.ip();
+    if local.is_loopback() || local.is_unspecified() {
+        return None;
+    }
+    // 実際に bind できるか確認(bind 可能でなければ候補にしない)。
+    let candidate = format!("{local}:0");
+    TcpListener::bind(&candidate).ok()?;
+    Some(local.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// US4(T021): 第 2 リスナー bind 失敗時の縮退継続
+// ---------------------------------------------------------------------------
+
+/// loopback http ポートから `GET /api/v1/status` を取得して JSON を返す
+/// (Host 検証は http_request が正しい Host を自動付与するため通る)。
+fn fetch_status(http_port: u16) -> Option<serde_json::Value> {
+    let r = http_request(http_port, "GET", "/api/v1/status", &[], &[])?;
+    if r.status != 200 {
+        return None;
+    }
+    serde_json::from_slice(&r.body).ok()
+}
+
+/// index_bind を「テスト側が既に掴んでいるポート」にすると bind 競合(AddrInUse)で
+/// 第 2 リスナーが上がらないが、本体(loopback UI/API)は稼働継続し、status の
+/// index_txt_lan が {enabled:true, listening:false, error:"addr_in_use"} になる。
+/// SecurityEvent は記録されない。
+#[test]
+fn bind_conflict_degrades_but_keeps_running() {
+    let ports = free_ports(3);
+    let (http_port, pcp_port, index_port) = (ports[0], ports[1], ports[2]);
+    let data_dir = tempfile::tempdir().unwrap();
+
+    // index 用ポートをテスト側で占有したままにする(競合を作る)。
+    let _occupier = TcpListener::bind(("127.0.0.1", index_port)).unwrap();
+    let index_bind = format!("127.0.0.1:{index_port}");
+
+    let _node = spawn_node(http_port, pcp_port, Some(&index_bind), data_dir.path());
+    // 本体(loopback)は継続稼働する。
+    assert!(
+        wait_for_index_200(http_port),
+        "bind 競合でも本体 loopback は稼働継続するべき"
+    );
+
+    // status に失敗理由が反映される。
+    let mut lan = None;
+    for _ in 0..50 {
+        if let Some(status) = fetch_status(http_port) {
+            lan = Some(status["index_txt_lan"].clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let lan = lan.expect("status を取得できませんでした");
+    assert_eq!(lan["enabled"], true, "機能は有効(設定あり)");
+    assert_eq!(lan["listening"], false, "bind 競合で待受していない");
+    assert_eq!(lan["error"], "addr_in_use", "競合の定型コード");
+
+    // 露出は発生していないため SecurityEvent は 0 件。
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        count_index_lan_exposed_events(data_dir.path()),
+        0,
+        "bind 失敗では露出イベントを記録しない"
+    );
+}
+
+/// このホストに割り当てられていない LAN プライベートアドレス(検証は通るが bind 不可)
+/// では、第 2 リスナーが上がらず error が非 null になり、本体は稼働継続する。
+/// 具体的なエラーコードはプラットフォーム差があるため、listening:false・error 非 null を検証する。
+#[test]
+fn unavailable_address_degrades_but_keeps_running() {
+    let ports = free_ports(3);
+    let (http_port, pcp_port, index_port) = (ports[0], ports[1], ports[2]);
+    let data_dir = tempfile::tempdir().unwrap();
+
+    // 10.255.255.254 は RFC1918(検証通過)だが通常このホストに割り当てられていない
+    // → bind は AddrNotAvailable 相当で失敗する。
+    let index_bind = format!("10.255.255.254:{index_port}");
+
+    let _node = spawn_node(http_port, pcp_port, Some(&index_bind), data_dir.path());
+    assert!(
+        wait_for_index_200(http_port),
+        "存在しないアドレスでも本体 loopback は稼働継続するべき"
+    );
+
+    let mut lan = None;
+    for _ in 0..50 {
+        if let Some(status) = fetch_status(http_port) {
+            lan = Some(status["index_txt_lan"].clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let lan = lan.expect("status を取得できませんでした");
+    assert_eq!(lan["enabled"], true);
+    assert_eq!(lan["listening"], false, "bind 失敗で待受していない");
+    assert!(
+        lan["error"].is_string(),
+        "失敗理由の定型コードが入る(プラットフォーム差のため値は非 null のみ検証)"
+    );
+    assert_eq!(
+        count_index_lan_exposed_events(data_dir.path()),
+        0,
+        "bind 失敗では露出イベントを記録しない"
+    );
+}

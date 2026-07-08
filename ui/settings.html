@@ -16,20 +16,34 @@
     #msg.ok { background: #e6f4ea; display: block; }
     #msg.err { background: #fce8e6; display: block; }
     #restart { background: #fff4d6; padding: .6rem; border-radius: 4px; margin: .75rem 0; display: none; }
+    #index-warning { background: #fce8e6; border: 1px solid #d93025; padding: .6rem; border-radius: 4px; margin: .75rem 0; display: none; }
+    #index-warning .ack { display: flex; align-items: flex-start; gap: .5rem; margin-top: .5rem; }
+    #index-warning .ack input { margin-top: .2rem; }
     button { padding: .4rem 1rem; }
   </style>
 </head>
 <body>
   <h1>設定</h1>
   <p class="note"><a href="/">← 一覧へ戻る</a> — data-model §Settings の全キーを閲覧・変更できます。</p>
-  <p class="note bind">IPアドレス系の設定(pcp_bind / http_bind / p2p_bind)の変更は再起動後に反映されます。
+  <p class="note bind">IPアドレス系の設定(pcp_bind / http_bind / p2p_bind / index_bind)の変更は再起動後に反映されます。
   pcp_bind / http_bind は loopback アドレス(127.0.0.1 等)のみ指定できます。
   p2p_bind はカンマ区切りで複数アドレスを指定でき、IPv4/IPv6 を同時に待ち受けられます
   (例: <code>0.0.0.0:7147,[::]:7147</code>)。空文字にすると待受無効(外向き接続のみ)になります。
-  複数指定時、他ピアへ申告されるポートは先頭アドレスのポートのみのため、全アドレスで同一ポートの使用を推奨します。</p>
+  複数指定時、他ピアへ申告されるポートは先頭アドレスのポートのみのため、全アドレスで同一ポートの使用を推奨します。
+  index_bind は index.txt を LAN へ公開する場合のみ設定します(空文字=無効)。loopback または LAN 内の
+  プライベートアドレスのみ指定でき、非 loopback 値の保存時にはリスク確認を求めます。</p>
 
   <div id="msg"></div>
   <div id="restart"></div>
+  <div id="index-warning">
+    <strong>index.txt を LAN へ公開しようとしています。</strong>
+    <p>掲載一覧(index.txt)が LAN 内で<strong>平文</strong>・<strong>無認証</strong>のまま配信され、
+    同じ LAN 上の第三者に<strong>取得・改ざんされうる</strong>ことを理解した上で有効化してください。</p>
+    <label class="ack">
+      <input type="checkbox" id="index-ack">
+      <span>上記のリスク(平文・無認証で取得・改ざんされうること)を理解しました。</span>
+    </label>
+  </div>
 
   <form id="form"></form>
   <div class="row">
@@ -38,8 +52,18 @@
 
   <script>
     // バインド系(変更で再起動が必要)。
-    const BIND_KEYS = ["pcp_bind", "http_bind", "p2p_bind"];
+    const BIND_KEYS = ["pcp_bind", "http_bind", "p2p_bind", "index_bind"];
     let token = null;
+
+    // index_bind が非空かつ非 loopback か(警告ゲートの発動判定)。
+    // バックエンドの正規判定(loopback/LAN 許可リスト)に対する安全側の近似:
+    // loopback 接頭辞(127. / [::1])以外はすべて警告する(過剰警告は許容、過小警告は不可)。
+    function indexBindNeedsWarning(value) {
+      const v = (value || "").trim();
+      if (v === "") return false;
+      if (v.startsWith("127.") || v.startsWith("[::1]")) return false;
+      return true;
+    }
 
     // 同一オリジンでセッショントークンを取得する(Host 検証下)。
     async function fetchToken() {
@@ -107,10 +131,24 @@
     }
 
     async function save() {
+      const body = collect();
+      const warning = document.getElementById("index-warning");
+      const ack = document.getElementById("index-ack");
+      // index_bind が非空かつ非 loopback なら、明示確認(チェック)まで送信をブロックする。
+      if (indexBindNeedsWarning(body.index_bind)) {
+        warning.style.display = "block";
+        if (!ack.checked) {
+          showMsg("LAN 公開のリスクを確認し、チェックを入れてから保存してください。", false);
+          return;
+        }
+      } else {
+        warning.style.display = "none";
+        ack.checked = false;
+      }
       const r = await fetch("/api/v1/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json", "X-Api-Token": token },
-        body: JSON.stringify(collect()),
+        body: JSON.stringify(body),
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) {

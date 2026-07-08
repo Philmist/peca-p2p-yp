@@ -92,18 +92,18 @@
 
 ### Tests for User Story 3(fail-first)⚠️
 
-- [ ] T012 [US3] fail-first 契約テストを `tests/contract/local_api.rs` に追加する: (1) `GET /api/v1/settings` 応答に `index_bind`(既定 `""`、14 キー)、(2) `PUT` で受理値(private/loopback/リンクローカル/ULA)→ 200 + `restart_required: true` / `restart_keys: ["index_bind"]`、(3) `0.0.0.0` / グローバル / CGNAT → 400 `{"error":"non_lan_bind"}`、(4) ポート欠落・カンマ区切り複数 → 400 `{"error":"invalid_bind"}`、(5) `GET /api/v1/status` の `index_txt_lan` が無効時 `{enabled:false, bind:null, listening:false, error:null}` / 露出中 `{enabled:true, listening:true}`(contract §2〜3)。**失敗することを確認**する
-- [ ] T013 [P] [US3] fail-first 契約テストを `tests/contract/cli_config.rs` に追加する: `--index-bind 192.168.1.10:7180` / `--index-bind=...` の受理、危険値(`0.0.0.0:7180` 等)の設定エラーによる起動拒否(検証エラーは fail-fast — contract §2.3)。**失敗することを確認**する
-- [ ] T014 [P] [US3] fail-first 統合テストを `tests/integration/index_lan.rs` に追加する: (1) 非 loopback `index_bind` + bind 成功時に SecurityEvent `index_txt_lan_exposed` が 1 件(source = バインドアドレス)、(2) loopback 値では 0 件、(3) 機能無効(`index_bind` 空)でも 0 件(spec US3 受入 3・5、SC-001、contract §4)。**失敗することを確認**する
+- [X] T012 [US3] fail-first 契約テストを `tests/contract/local_api.rs` に追加する: (1) `GET /api/v1/settings` 応答に `index_bind`(既定 `""`、14 キー)、(2) `PUT` で受理値(private/loopback/リンクローカル/ULA)→ 200 + `restart_required: true` / `restart_keys: ["index_bind"]`、(3) `0.0.0.0` / グローバル / CGNAT → 400 `{"error":"non_lan_bind"}`、(4) ポート欠落・カンマ区切り複数 → 400 `{"error":"invalid_bind"}`、(5) `GET /api/v1/status` の `index_txt_lan` が無効時 `{enabled:false, bind:null, listening:false, error:null}` / 露出中 `{enabled:true, listening:true}`(contract §2〜3)。**失敗することを確認**する
+- [X] T013 [P] [US3] fail-first 契約テストを `tests/contract/cli_config.rs` に追加する: `--index-bind 192.168.1.10:7180` / `--index-bind=...` の受理、危険値(`0.0.0.0:7180` 等)の設定エラーによる起動拒否(検証エラーは fail-fast — contract §2.3)。**失敗することを確認**する
+- [X] T014 [P] [US3] fail-first 統合テストを `tests/integration/index_lan.rs` に追加する: (1) 非 loopback `index_bind` + bind 成功時に SecurityEvent `index_txt_lan_exposed` が 1 件(source = バインドアドレス)、(2) loopback 値では 0 件、(3) 機能無効(`index_bind` 空)でも 0 件(spec US3 受入 3・5、SC-001、contract §4)。**失敗することを確認**する
 
 ### Implementation for User Story 3
 
-- [ ] T015 [P] [US3] `SecurityCategory::IndexTxtLanExposed`(`"index_txt_lan_exposed"`)を `src/security/mod.rs` に追加する(`ALL` 14→15、`as_str()`、網羅テスト更新。「違反の拒否でなく利用者が選んだ露出状態の監査」を doc コメントに明記 — research R4)
-- [ ] T016 [P] [US3] `IndexLanStatus { bind: String, listening: bool, error: Option<&'static str> }` と `AppState.index_lan: Option<Arc<IndexLanStatus>>` を `src/web/mod.rs` に追加する(data-model §3)
-- [ ] T017 [P] [US3] `web/settings.rs` の `BIND_KEYS` を 3→4(`index_bind` 追加)し、検証エラー写像に `NonLanBind` → 400 `"non_lan_bind"` を追加する
-- [ ] T018 [US3] `src/main.rs` で `IndexLanStatus` を構築して `AppState` に注入し、**非 loopback かつ bind 成功**時のみ SecurityEvent `IndexTxtLanExposed` を 1 件記録する(loopback 値・機能無効では記録しない — T015/T016 に依存)
-- [ ] T019 [US3] `web/announced.rs` の `GET /api/v1/status` 応答に `index_txt_lan` オブジェクト(`enabled` / `bind` / `listening` / `error` — contract §3)を追加する(T016 に依存)
-- [ ] T020 [P] [US3] `ui/settings.html` に `index_bind` 入力欄を追加し、JS 側 `BIND_KEYS` へ追加(再起動要求の注記対象)。保存時に非空かつ非 loopback(`127.` / `[::1]` 接頭辞判定 — バックエンド正規判定の**安全側近似**: 過剰警告は許容、過小警告は不可)なら警告 1 項目(「平文」「無認証」「取得・改ざんされうる」の 3 要素必須 — contract §5)とチェックボックスを表示し、チェックされるまで PUT 送信をブロックする(research R6)。UI ゲートの自動 DOM テストは課さず手動検証とする(ADR-0012「Principle IV の適用範囲」・quickstart §6 = T024)
+- [X] T015 [P] [US3] `SecurityCategory::IndexTxtLanExposed`(`"index_txt_lan_exposed"`)を `src/security/mod.rs` に追加する(`ALL` 14→15、`as_str()`、網羅テスト更新。「違反の拒否でなく利用者が選んだ露出状態の監査」を doc コメントに明記 — research R4)
+- [X] T016 [P] [US3] `IndexLanStatus { bind: String, listening: bool, error: Option<&'static str> }` と `AppState.index_lan: Option<Arc<IndexLanStatus>>` を `src/web/mod.rs` に追加する(data-model §3)
+- [X] T017 [P] [US3] `web/settings.rs` の `BIND_KEYS` を 3→4(`index_bind` 追加)し、検証エラー写像に `NonLanBind` → 400 `"non_lan_bind"` を追加する
+- [X] T018 [US3] `src/main.rs` で `IndexLanStatus` を構築して `AppState` に注入し、**非 loopback かつ bind 成功**時のみ SecurityEvent `IndexTxtLanExposed` を 1 件記録する(loopback 値・機能無効では記録しない — T015/T016 に依存)
+- [X] T019 [US3] `web/announced.rs` の `GET /api/v1/status` 応答に `index_txt_lan` オブジェクト(`enabled` / `bind` / `listening` / `error` — contract §3)を追加する(T016 に依存)
+- [X] T020 [P] [US3] `ui/settings.html` に `index_bind` 入力欄を追加し、JS 側 `BIND_KEYS` へ追加(再起動要求の注記対象)。保存時に非空かつ非 loopback(`127.` / `[::1]` 接頭辞判定 — バックエンド正規判定の**安全側近似**: 過剰警告は許容、過小警告は不可)なら警告 1 項目(「平文」「無認証」「取得・改ざんされうる」の 3 要素必須 — contract §5)とチェックボックスを表示し、チェックされるまで PUT 送信をブロックする(research R6)。UI ゲートの自動 DOM テストは課さず手動検証とする(ADR-0012「Principle IV の適用範囲」・quickstart §6 = T024)
 
 **Checkpoint**: `cargo test --test local_api --test cli_config --test index_lan` green。SC-004・SC-006 が検証可能。
 
@@ -117,11 +117,11 @@
 
 ### Tests for User Story 4(fail-first)⚠️
 
-- [ ] T021 [US4] fail-first 統合テストを `tests/integration/index_lan.rs` に追加する: (1) `index_bind` を管理ポートと同一(bind 競合)にして起動 → 本体(loopback UI/API)は稼働継続、`index_txt_lan` が `{enabled:true, listening:false, error:"addr_in_use"}`、警告ログ記録、SecurityEvent は 0 件、(2) 存在しないアドレス → `error:"addr_not_available"` で同様に継続(spec US4 受入 1〜3、Edge Cases)。**失敗することを確認**する
+- [X] T021 [US4] fail-first 統合テストを `tests/integration/index_lan.rs` に追加する: (1) `index_bind` を管理ポートと同一(bind 競合)にして起動 → 本体(loopback UI/API)は稼働継続、`index_txt_lan` が `{enabled:true, listening:false, error:"addr_in_use"}`、警告ログ記録、SecurityEvent は 0 件、(2) 存在しないアドレス → `error:"addr_not_available"` で同様に継続(spec US4 受入 1〜3、Edge Cases)。**失敗することを確認**する
 
 ### Implementation for User Story 4
 
-- [ ] T022 [US4] `src/main.rs` の第 2 リスナー bind 失敗時の縮退継続を実装する: `bind_error()`(即終了)を使わず `tracing::warn!` + `IndexLanStatus { listening: false, error: Some(code) }` を注入して起動続行。`ErrorKind` → 定型コード写像(`addr_in_use` / `permission_denied` / `addr_not_available` / `unknown` — research R3)。既存 3 受け口の fail-fast は不変(FR-007)
+- [X] T022 [US4] `src/main.rs` の第 2 リスナー bind 失敗時の縮退継続を実装する: `bind_error()`(即終了)を使わず `tracing::warn!` + `IndexLanStatus { listening: false, error: Some(code) }` を注入して起動続行。`ErrorKind` → 定型コード写像(`addr_in_use` / `permission_denied` / `addr_not_available` / `unknown` — research R3)。既存 3 受け口の fail-fast は不変(FR-007)
 
 **Checkpoint**: 全ストーリー完了。SC-005 が検証可能。
 

@@ -33,7 +33,7 @@ use peca_p2p_yp::store::Store;
 use peca_p2p_yp::web::announced::{
     AnnouncedProvider, AnnouncedSummary, ClockSkewStatus, NodeStatusProvider, clock_skew_status,
 };
-use peca_p2p_yp::web::{AppState, build_index_router, build_router};
+use peca_p2p_yp::web::{AppState, IndexLanStatus, build_index_router, build_router};
 
 /// 鮮度切れ・期限切れイベントの物理回収(sweep)周期。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -285,8 +285,96 @@ async fn run() -> Result<(), i32> {
     // 14d. 鮮度切れ・期限切れイベントの物理回収。
     handles.push(spawn_sweep_loop(Arc::clone(&hub), shutdown_rx.clone()));
 
-    // 15. Web 起動(一覧・ペルソナ・掲載状態の供給元を注入)。
-    let state = AppState::new(Arc::clone(&store), Arc::clone(&security), http_addr.port())
+    // 15. index.txt の LAN 公開(オプトイン — ADR-0012)の bind 試行(AppState 注入前)。
+    //     index_bind 非空時のみ index.txt 専用の第 2 リスナーを bind する。既存 3 受け口
+    //     (HTTP/PCP/P2P)と違い bind 失敗は致命エラーとせず(bind_error を使わず)、
+    //     WARN + 状態への失敗理由反映のみで本体は継続稼働する(FR-007)。
+    //     起動時に一度だけ確定する不変状態 IndexLanStatus を組み立て、AppState へ注入する。
+    //     検証は Settings::validate() 済み(空=無効、非空=loopback/LAN のみ)。
+    //
+    //     listener は state 構築後に serve するため Option で持ち越す。
+    let (index_lan_status, index_listener): (Option<Arc<IndexLanStatus>>, Option<TcpListener>) =
+        if settings.index_bind.is_empty() {
+            (None, None)
+        } else {
+            // validate 済みのため通常はパース成功する。防御的に失敗も縮退継続で扱う。
+            match settings.index_bind.parse::<SocketAddr>() {
+                Ok(index_addr) => match TcpListener::bind(index_addr).await {
+                    Ok(listener) => (
+                        Some(Arc::new(IndexLanStatus {
+                            bind: settings.index_bind.clone(),
+                            listening: true,
+                            error: None,
+                        })),
+                        Some(listener),
+                    ),
+                    Err(e) => {
+                        // 縮退継続: ErrorKind → 定型コードへ写像し状態へ反映(内部情報なし)。
+                        let code = index_bind_error_code(&e);
+                        tracing::warn!(
+                            target: "startup",
+                            index_bind = %settings.index_bind,
+                            error = code,
+                            "index.txt の LAN リスナーにバインドできませんでした(本体は継続します)"
+                        );
+                        (
+                            Some(Arc::new(IndexLanStatus {
+                                bind: settings.index_bind.clone(),
+                                listening: false,
+                                error: Some(code),
+                            })),
+                            None,
+                        )
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        target: "startup",
+                        index_bind = %settings.index_bind,
+                        "index_bind の書式を解釈できませんでした(本体は継続します)"
+                    );
+                    (
+                        Some(Arc::new(IndexLanStatus {
+                            bind: settings.index_bind.clone(),
+                            listening: false,
+                            error: Some("unknown"),
+                        })),
+                        None,
+                    )
+                }
+            }
+        };
+
+    // 15a. LAN 露出の監査イベント(ADR-0012)。**非 loopback かつ bind 成功**のときのみ
+    //      起動時に 1 件記録する(loopback 値・bind 失敗・機能無効では記録しない)。
+    //      loopback 判定は検証(require_lan_or_loopback)と同じく to_canonical() 後に行い、
+    //      v4-mapped loopback([::ffff:127.0.0.1])を誤って露出と記録しない。
+    //      source はバインドアドレス、detail は定型文言。
+    if let Some(status) = &index_lan_status
+        && status.listening
+    {
+        let is_loopback = settings
+            .index_bind
+            .parse::<SocketAddr>()
+            .map(|a| a.ip().to_canonical().is_loopback())
+            .unwrap_or(false);
+        if !is_loopback {
+            security.log(
+                peca_p2p_yp::security::SecurityCategory::IndexTxtLanExposed,
+                &settings.index_bind,
+                "index.txt is exposed to LAN",
+            );
+        }
+    }
+
+    let index_lan_desc = match &index_lan_status {
+        None => "無効".to_string(),
+        Some(s) if s.listening => format!("{}(LAN 公開)", s.bind),
+        Some(s) => format!("バインド失敗:{}(継続)", s.error.unwrap_or("unknown")),
+    };
+
+    // 15b. Web 起動(一覧・ペルソナ・掲載状態・LAN 露出状態の供給元を注入)。
+    let mut state = AppState::new(Arc::clone(&store), Arc::clone(&security), http_addr.port())
         .with_directory(Arc::clone(&hub) as Arc<_>)
         .with_identity(Arc::clone(&identity))
         .with_announced(Arc::new(AnnouncedAdapter {
@@ -301,59 +389,31 @@ async fn run() -> Result<(), i32> {
             max_clock_skew_sec: settings.max_clock_skew_sec as i64,
         }))
         .with_broadcast(Arc::clone(&broadcast));
+    if let Some(status) = index_lan_status {
+        state = state.with_index_lan(status);
+    }
     let app = build_router(state.clone());
     let http_listener = TcpListener::bind(http_addr)
         .await
         .map_err(|e| bind_error("HTTP", &e))?;
 
-    // 15.5. index.txt の LAN 公開(オプトイン — ADR-0012)。index_bind 非空時のみ
-    //       index.txt 専用の第 2 リスナーを起動する。既存 3 受け口(HTTP/PCP/P2P)と違い
-    //       bind 失敗は致命エラーとせず WARN + スキップに留める(本体は継続稼働 —
-    //       FR-007。縮退の完成形=状態反映と定型コード写像は T022)。
-    //       検証は Settings::validate() 済み(空=無効、非空=loopback/LAN のみ)。
-    let index_lan_desc = if settings.index_bind.is_empty() {
-        "無効".to_string()
-    } else {
-        match settings.index_bind.parse::<SocketAddr>() {
-            Ok(index_addr) => match TcpListener::bind(index_addr).await {
-                Ok(index_listener) => {
-                    let index_app = build_index_router(state.clone());
-                    let sd = shutdown_rx.clone();
-                    handles.push(tokio::spawn(async move {
-                        let _ = axum::serve(
-                            index_listener,
-                            index_app.into_make_service_with_connect_info::<SocketAddr>(),
-                        )
-                        .with_graceful_shutdown(async move {
-                            let mut sd = sd;
-                            let _ = sd.changed().await;
-                        })
-                        .await;
-                    }));
-                    format!("{index_addr}(LAN 公開)")
-                }
-                Err(e) => {
-                    // 縮退継続: 本体は止めない(暫定。状態反映は T022)。
-                    tracing::warn!(
-                        target: "startup",
-                        index_bind = %settings.index_bind,
-                        error = %e,
-                        "index.txt の LAN リスナーにバインドできませんでした(本体は継続します)"
-                    );
-                    "バインド失敗(継続)".to_string()
-                }
-            },
-            // validate 済みのため通常到達しないが、防御的に縮退継続する。
-            Err(_) => {
-                tracing::warn!(
-                    target: "startup",
-                    index_bind = %settings.index_bind,
-                    "index_bind の書式を解釈できませんでした(本体は継続します)"
-                );
-                "設定不正(継続)".to_string()
-            }
-        }
-    };
+    // 15c. bind に成功していれば index.txt 専用の第 2 リスナーを serve する(既存
+    //      サブシステムと同じ shutdown_rx watch 経路 + handles へ push)。
+    if let Some(listener) = index_listener {
+        let index_app = build_index_router(state.clone());
+        let sd = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                index_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let mut sd = sd;
+                let _ = sd.changed().await;
+            })
+            .await;
+        }));
+    }
 
     // 16. 起動サマリ(バインドアドレス・既知ピア数のみ。内部情報なし)。
     let known_peers = store.count_peers().unwrap_or(0);
@@ -626,6 +686,21 @@ fn bind_error(listener: &str, err: &std::io::Error) -> i32 {
     };
     eprintln!("{msg}");
     1
+}
+
+/// index.txt LAN リスナーの bind 失敗を `IndexLanStatus.error` の定型コードへ写像する
+/// (ADR-0012 / research R3 — `GET /api/v1/status` で返す。内部情報を含めない)。
+///
+/// 本体を止める [`bind_error`] と違い、これは縮退継続用の状態コード写像であり終了しない
+/// (既存 3 受け口の fail-fast は不変 — FR-007)。
+fn index_bind_error_code(err: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::AddrInUse => "addr_in_use",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::AddrNotAvailable => "addr_not_available",
+        _ => "unknown",
+    }
 }
 
 fn print_usage() {

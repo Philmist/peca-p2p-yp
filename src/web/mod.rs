@@ -81,6 +81,25 @@ pub struct AppState {
     /// 配信中ロックの共有状態(T025 — `GET /status` の `broadcasting`)。
     /// 未配線時は `None`(= `broadcasting: false`。contracts §3)。
     pub broadcast: Option<Arc<BroadcastState>>,
+    /// index.txt の LAN 公開状態(ADR-0012)。`None` = 機能無効(`index_bind` 空)。
+    /// 起動時に一度だけ確定する不変値のため `Mutex` を持たない(research R3)。
+    pub index_lan: Option<Arc<IndexLanStatus>>,
+}
+
+/// index.txt LAN 公開の実行時状態(data-model §3)。起動時に一度だけ確定する不変値。
+///
+/// `GET /api/v1/status` の `index_txt_lan` オブジェクトの供給元となる。3 状態
+/// (無効 = `AppState.index_lan` が `None` / 露出中 = `listening: true` /
+/// 設定有効だが bind 失敗 = `listening: false` + `error`)を表す。
+#[derive(Debug, Clone)]
+pub struct IndexLanStatus {
+    /// 設定されたバインド先(検証済み値の文字列表現)。
+    pub bind: String,
+    /// bind に成功して待受中か。
+    pub listening: bool,
+    /// 失敗理由の定型コード(`addr_in_use` / `permission_denied` /
+    /// `addr_not_available` / `unknown`)。`listening: true` なら `None`。
+    pub error: Option<&'static str>,
 }
 
 impl AppState {
@@ -99,6 +118,7 @@ impl AppState {
             announced: None,
             node_status: None,
             broadcast: None,
+            index_lan: None,
         }
     }
 
@@ -122,6 +142,7 @@ impl AppState {
             announced: None,
             node_status: None,
             broadcast: None,
+            index_lan: None,
         }
     }
 
@@ -152,6 +173,12 @@ impl AppState {
     /// 配信中ロックの共有状態を配線する(T025 — `GET /status` の `broadcasting`)。
     pub fn with_broadcast(mut self, broadcast: Arc<BroadcastState>) -> Self {
         self.broadcast = Some(broadcast);
+        self
+    }
+
+    /// index.txt の LAN 公開状態を配線する(ADR-0012 — `GET /status` の `index_txt_lan`)。
+    pub fn with_index_lan(mut self, index_lan: Arc<IndexLanStatus>) -> Self {
+        self.index_lan = Some(index_lan);
         self
     }
 

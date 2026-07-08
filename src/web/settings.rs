@@ -24,7 +24,7 @@ use crate::config::{ConfigError, Settings};
 use super::{AppState, error_response};
 
 /// バインド系キー(変更時に再起動が必要)。
-const BIND_KEYS: [&str; 3] = ["pcp_bind", "http_bind", "p2p_bind"];
+const BIND_KEYS: [&str; 4] = ["pcp_bind", "http_bind", "p2p_bind", "index_bind"];
 
 /// `GET /api/v1/settings` — 全設定キーを JSON で返す。
 pub async fn get_settings(State(state): State<AppState>) -> Response {
@@ -96,6 +96,9 @@ fn changed_bind_keys(current: &Settings, next: &Settings) -> Vec<&'static str> {
     if current.p2p_bind != next.p2p_bind {
         keys.push(BIND_KEYS[2]);
     }
+    if current.index_bind != next.index_bind {
+        keys.push(BIND_KEYS[3]);
+    }
     keys
 }
 
@@ -115,6 +118,7 @@ fn settings_to_json(s: &Settings) -> serde_json::Value {
         "min_pow_bits": s.min_pow_bits,
         "event_store_max": s.event_store_max,
         "index_txt_encoding": s.index_txt_encoding,
+        "index_bind": s.index_bind,
     })
 }
 
@@ -135,6 +139,7 @@ struct SettingsUpdate {
     min_pow_bits: Option<u32>,
     event_store_max: Option<u64>,
     index_txt_encoding: Option<String>,
+    index_bind: Option<String>,
 }
 
 impl SettingsUpdate {
@@ -178,6 +183,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = self.index_txt_encoding {
             base.index_txt_encoding = v;
+        }
+        if let Some(v) = self.index_bind {
+            base.index_bind = v;
         }
         base
     }
