@@ -31,8 +31,8 @@ contracts / research)、設計判断は `docs/adr/` を正とする。
 | `web/` | axum ルーター・ローカル JSON API・UI 静的配信・保護層(Host/トークン/レート/ボディ上限) | contracts/local-api.md |
 | `identity/` | ペルソナ鍵管理(DPAPI 保管・nsec エクスポート・破棄) | ADR-0003 |
 | `store/` | SQLite 永続化(personas / peers / mutes / settings) | data-model.md |
-| `security/` | 入力検証ヘルパ・SecurityEvent 12 カテゴリ・ローテーション付きログ | data-model §SecurityEvent |
-| `config.rs` | Settings 既定値と検証(バインド系は loopback 強制 — ADR-0006 決定 4) | data-model §Settings |
+| `security/` | 入力検証ヘルパ・SecurityEvent 15 カテゴリ・ローテーション付きログ | data-model §SecurityEvent |
+| `config.rs` | Settings 既定値と検証(バインド系は loopback 強制 — ADR-0006 決定 4。例外: `index_bind` のみ loopback / LAN 許可 — ADR-0012) | data-model §Settings |
 | `main.rs` | 起動配線と graceful shutdown | — |
 
 `ui/` は Web UI 静的アセット(ビルド時埋め込み)。`event/`(スキーマ)と `p2p/`(伝送)の
@@ -63,6 +63,8 @@ HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015
 - ADR-0008: P2P 待受のデュアルスタック化(`p2p_bind` カンマ区切り複数バインド)
 - ADR-0009: Linux 鍵保護(keystore 抽象・エンベロープ・マスター鍵)
 - ADR-0010: DNS 解決ピアの限定サポート(manual 限定・名前空間分離・resolved_ip 射影)
+- ADR-0011: 配信中ペルソナロック(掲載前選択とリンク推定の構造的防止)+ Principle V 判定
+- ADR-0012: read-only index.txt の LAN 公開オプトイン(ADR-0006 決定 4 の部分 supersede)
 - security-review-checklist.md: セキュリティ PR のレビュー観点(実装中ゲート 6)
 - release-gate-check-2026-07-04.md: リリース前ゲート 8〜10 の適用記録
 
