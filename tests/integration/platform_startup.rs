@@ -12,6 +12,7 @@
 
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -33,20 +34,36 @@ impl Drop for KillOnDrop {
 // 補助: ポート確保
 // ---------------------------------------------------------------------------
 
-/// n 個の空きポートを同時バインドで重複なく確保する。
+/// n 個の空きポートを重複なく確保する。
 ///
-/// バインド → ポート取得 → drop(一括)の順で行うため、n 個のポートが互いに重複しない。
-/// drop 後に他プロセスが同ポートを確保する可能性はテスト環境で許容する。
+/// プロセス単位の単調増加カウンタで固定レンジ `[BASE, BASE + SPAN)` から払い出す。
+/// 同一プロセス内では 2 つの割当が同じ番号を返さないため番号の一意性が保たれ、
+/// 旧実装(`:0` bind → 解放 → 番号返却)の TOCTOU レースを解消する。レンジは Linux の
+/// エフェメラルレンジ(32768–60999)の外側に置き、OS 自動割当ソケットとの衝突を避ける。
+///
+/// 前提: 1 バイナリの全テストが 1 プロセスを共有する libtest(`cargo test`)。
+/// `cargo nextest` のようにテストごとに別プロセスで実行するランナーでは、各プロセスで
+/// カウンタが 0 から始まり並行テストが同番号を奪い合うため、この一意性保証は失われる
+/// (将来 nextest を導入する場合は要見直し)。
 fn free_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports = listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect();
-    // listeners ここで drop → ポート一括解放
-    ports
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // 別テストバイナリと並列実行されてもレンジが重ならないよう、ファイルごとに BASE を変える。
+    const BASE: u16 = 22000;
+    const SPAN: u16 = 1000;
+
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let off = (NEXT.fetch_add(1, Ordering::Relaxed) % SPAN as u32) as u16;
+        let p = BASE + off;
+        // ワイルドカード 0.0.0.0 で空きを確認する(他テストバイナリと同一実装を保つため)。
+        // このファイルは 127.0.0.1 への specific bind のみだが、0.0.0.0:p はそれを包含する。
+        if let Ok(l) = TcpListener::bind(("0.0.0.0", p)) {
+            drop(l);
+            out.push(p);
+        }
+        // bind 失敗(実サービス/前 run 残留で使用中)は次候補へスキップ。
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
