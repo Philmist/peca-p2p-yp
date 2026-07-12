@@ -62,19 +62,19 @@
 
 ### Tests for User Story 1
 
-- [ ] T017 [P] [US1] 契約テスト(31311): announce の正常系・置換規則・expiration 鮮度・タグ形式を tests/contract/thread_events.rs(新規)に作成し失敗を確認
-- [ ] T018 [P] [US1] 契約テスト(配送ハンドシェイク): JOIN → WELCOME(チャレンジ署名検証)/ REJECT 定型(full/frozen/closed/unknown_thread/rate)をモックピアで tests/contract/thread_delivery.rs(新規)に作成し失敗を確認
+- [X] T017 [P] [US1] 契約テスト(31311): announce の正常系・置換規則・expiration 鮮度・タグ形式を tests/contract/thread_events.rs(新規)に作成し失敗を確認
+- [X] T018 [P] [US1] 契約テスト(配送ハンドシェイク): JOIN → WELCOME(チャレンジ署名検証)/ REJECT 定型(full/frozen/closed/unknown_thread/rate)をモックピアで tests/contract/thread_delivery.rs(新規)に作成し失敗を確認
 
 ### Implementation for User Story 1
 
-- [ ] T019 [US1] スレ開設の配信者操作とスレ announce 発行を実装: 掲載中チャンネルに対するスレ開設(スレ主 = 掲載ペルソナ限定 — FR-001)・kind 31311 の発行・60 秒再発行・expiration 600 秒(FR-002)を src/livechat/host.rs + src/event/publish.rs 連携で実装
-- [ ] T020 [US1] gossip 受信検証を拡張: 許可 kind を {30311, 31311} に拡張、検査 #7 ペルソナ一致(不一致は不可視 + `livechat_announce_invalid` — FR-003)、#8 対象実在の緩和(30311 未着でも破棄しない)、kind 1311/21311 の gossip 混入は破棄 + `event_invalid_format`、`livechat_enabled=false` 時は検証のみで不可視 — src/event/schema.rs / src/p2p/ingest.rs(contracts/thread-events.md §受信検証)
-- [ ] T021 [US1] ホスト側の接続受理を実装: THREAD_JOIN 受信 → 参加上限(`thread_max_participants`)・スレ状態を確認 → THREAD_WELCOME(スレ主ペルソナ鍵による `challenge || board_id || gen` への Schnorr 署名 + board_settings + res_count)または定型 THREAD_REJECT(内部情報非開示 — FR-006)— src/livechat/host.rs
-- [ ] T022 [US1] 参加者セッションを実装: スレを開く明示操作を起点に接続(announce 受信のみでは接続しない — FR-004/SC-005)、WELCOME の sig を announce 記載のスレ主公開鍵で検証、失敗時は切断 + `livechat_challenge_failed` + 指数バックオフ(初期 5 秒・係数 2・上限 300 秒 — FR-005)— src/livechat/session.rs
-- [ ] T023 [US1] 接続時同期を実装: joined 直後に `since_seq` 以降の全確定レス(RES)と順序確定情報(ORDER)を seq 順に送出(ホスト側)/ 受信順に表示(参加者側・seq 連続性維持)。閲覧に板鍵を要求しない(FR-010/FR-016)— src/livechat/host.rs / src/livechat/session.rs
-- [ ] T024 [US1] Web UI / ローカル API を実装: announce 由来のスレ一覧表示・スレを開く操作・確定レスの閲覧・板タイトル/名無しのデフォルト名/ローカルルールの参照を src/web/livechat.rs(新規)に実装し src/web/mod.rs へ配線
-- [ ] T025 [US1] ローカルルール Markdown の安全サブセット描画を実装: pulldown-cmark で raw HTML(インライン・ブロック)を破棄、http/https 以外のリンク無効化(FR-025 / research R7)— src/web/livechat.rs
-- [ ] T026 [US1] US1 の cucumber ステップを tests/steps/livechat.rs に実装し、多ノード統合テスト(配信者 1 + 視聴者 2: announce 伝搬 → 一覧表示 → 明示操作で接続 → 全レス閲覧、announce 受信のみで外向き接続 0 件 = SC-005)を tests/integration/livechat.rs(新規)に実装して全パス
+- [X] T019 [US1] スレ開設の配信者操作とスレ announce 発行を実装: 掲載中チャンネルに対するスレ開設(スレ主 = 掲載ペルソナ限定 — FR-001)・kind 31311 の発行・60 秒再発行・expiration 600 秒(FR-002)を src/livechat/host.rs + src/event/publish.rs 連携で実装
+- [X] T020 [US1] gossip 受信検証を拡張: 許可 kind を {30311, 31311} に拡張、検査 #7 ペルソナ一致(不一致は不可視 + `livechat_announce_invalid` — FR-003)、#8 対象実在の緩和(30311 未着でも破棄しない)、kind 1311/21311 の gossip 混入は破棄 + `event_invalid_format`、`livechat_enabled=false` 時は検証のみで不可視 — src/event/schema.rs / src/p2p/ingest.rs(contracts/thread-events.md §受信検証)
+- [X] T021 [US1] ホスト側の接続受理を実装: THREAD_JOIN 受信 → 参加上限(`thread_max_participants`)・スレ状態を確認 → THREAD_WELCOME(スレ主ペルソナ鍵による `challenge || board_id || gen` への Schnorr 署名 + board_settings + res_count)または定型 THREAD_REJECT(内部情報非開示 — FR-006)— src/livechat/host.rs
+- [X] T022 [US1] 参加者セッションを実装: スレを開く明示操作を起点に接続(announce 受信のみでは接続しない — FR-004/SC-005)、WELCOME の sig を announce 記載のスレ主公開鍵で検証、失敗時は切断 + `livechat_challenge_failed` + 指数バックオフ(初期 5 秒・係数 2・上限 300 秒 — FR-005)— src/livechat/session.rs
+- [X] T023 [US1] 接続時同期を実装: joined 直後に `since_seq` 以降の全確定レス(RES)と順序確定情報(ORDER)を seq 順に送出(ホスト側)/ 受信順に表示(参加者側・seq 連続性維持)。閲覧に板鍵を要求しない(FR-010/FR-016)— src/livechat/host.rs / src/livechat/session.rs
+- [X] T024 [US1] Web UI / ローカル API を実装: announce 由来のスレ一覧表示・スレを開く操作・確定レスの閲覧・板タイトル/名無しのデフォルト名/ローカルルールの参照を src/web/livechat.rs(新規)に実装し src/web/mod.rs へ配線
+- [X] T025 [US1] ローカルルール Markdown の安全サブセット描画を実装: pulldown-cmark で raw HTML(インライン・ブロック)を破棄、http/https 以外のリンク無効化(FR-025 / research R7)— src/web/livechat.rs
+- [X] T026 [US1] US1 の cucumber ステップを tests/steps/livechat.rs に実装し、多ノード統合テスト(配信者 1 + 視聴者 2: announce 伝搬 → 一覧表示 → 明示操作で接続 → 全レス閲覧、announce 受信のみで外向き接続 0 件 = SC-005)を tests/integration/livechat.rs(新規)に実装して全パス
 
 **Checkpoint**: US1 単独で機能。閲覧専用の掲示板として成立
 
