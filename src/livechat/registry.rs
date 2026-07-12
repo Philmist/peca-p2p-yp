@@ -35,7 +35,7 @@ use crate::event::livechat::{
 use crate::p2p::frame::Message as WireMessage;
 
 use super::host::{HostThread, JoinDecision, SyncItem, board_settings_json};
-use super::thread::{BoardSettings, Res, Thread, ThreadError};
+use super::thread::{BoardSettings, BoardSettingsError, Res, Thread, ThreadError};
 
 /// ポイズン時も内部値を回収してロックを返す(パニックしない)。
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -79,6 +79,8 @@ pub enum RegistryError {
     Confirm(ThreadError),
     /// イベント署名・構築の失敗。
     Build(LivechatBuildError),
+    /// 板設定の値域違反(FR-025 — title/res_limit/noname_name/local_rules/pow の範囲外)。
+    InvalidSettings(BoardSettingsError),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -90,6 +92,7 @@ impl std::fmt::Display for RegistryError {
             }
             RegistryError::Confirm(_) => write!(f, "レスを確定できません"),
             RegistryError::Build(_) => write!(f, "イベントの構築に失敗しました"),
+            RegistryError::InvalidSettings(_) => write!(f, "板設定の値が不正です"),
         }
     }
 }
@@ -561,6 +564,48 @@ impl LivechatRegistry {
             res_no,
             seq: order.seq,
         })
+    }
+
+    /// 板主が板設定を変更し、全接続参加者へ即時配布する(T032 — FR-022/FR-023/FR-025)。
+    ///
+    /// - **値域検証(FR-025)**: [`BoardSettings::validate`] 違反は [`RegistryError::InvalidSettings`]
+    ///   で拒否する(変更を適用せず配布もしない)。制御文字は [`BoardSettings::sanitized`] で除去。
+    /// - **即時反映(FR-022)**: title・noname_name・local_rules・first_post_pow_bits は即時に
+    ///   ホスト設定へ反映する(以後の WELCOME・PoW 判定・確定レス表示に効く)。
+    /// - **res_limit は次スレから(FR-023)**: 設定値は保持するが**進行中スレの
+    ///   [`Thread::res_limit`] は作成時スナップショットのまま変えない**(dat 追記不変性の基盤)。
+    ///   次スレ作成(US5/T047)が新しい res_limit を採用する。
+    /// - **配布(FR-023 — SETTINGS 即時配布)**: 全 outbox へ `Message::Settings{board_settings}` を
+    ///   送る(registry → outbox。切断済み outbox への送信失敗は無視する)。
+    ///
+    /// 配布した板設定 JSON を返す(呼び出し側の確認・ログ用)。未知 board は
+    /// [`RegistryError::UnknownBoard`]。
+    pub fn update_settings(
+        &self,
+        board_id: &str,
+        new: BoardSettings,
+    ) -> Result<serde_json::Value, RegistryError> {
+        // 制御文字除去 → 値域検証(FR-025)。違反は適用せず拒否する。
+        let sanitized = new.sanitized();
+        sanitized
+            .validate()
+            .map_err(RegistryError::InvalidSettings)?;
+
+        let mut hosts = lock(&self.hosts);
+        let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
+
+        // 即時反映(res_limit も settings には入るが、進行中 Thread.res_limit は不変 — 次スレから)。
+        entry.host.settings = sanitized;
+        let board_settings = board_settings_json(&entry.host.settings);
+
+        // 全接続参加者へ SETTINGS を即時配布(FR-023)。
+        let msg = WireMessage::Settings {
+            board_settings: board_settings.clone(),
+        };
+        for tx in entry.outboxes.values() {
+            let _ = tx.send(msg.clone());
+        }
+        Ok(board_settings)
     }
 
     /// 参加者を登録する(WELCOME 送出成功後に配線側が呼ぶ)。
@@ -1233,5 +1278,78 @@ mod tests {
             reg.accept_write(&board_id, &after, 1_700_000_050).unwrap(),
             AcceptOutcome::Numbered { .. }
         ));
+    }
+
+    // --- T032: 板設定の変更と配布(FR-022/FR-023/FR-025)---------------------
+
+    #[test]
+    fn update_settings_distributes_to_all_participants() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx1);
+        reg.register_participant(&board_id, "peer-2", tx2);
+
+        let new = BoardSettings {
+            title: "新タイトル".into(),
+            noname_name: "新名無し".into(),
+            local_rules: "新ルール".into(),
+            first_post_pow_bits: 12,
+            ..Default::default()
+        };
+        let json = reg.update_settings(&board_id, new).unwrap();
+        assert_eq!(json["title"], "新タイトル");
+        assert_eq!(json["noname_name"], "新名無し");
+        assert_eq!(json["first_post_pow_bits"], 12);
+
+        // 全参加者へ SETTINGS が配布される(FR-023)。
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv() {
+                Ok(WireMessage::Settings { board_settings }) => {
+                    assert_eq!(board_settings["title"], "新タイトル");
+                }
+                other => panic!("SETTINGS を期待: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn update_settings_rejects_invalid_values() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        // res_limit=50(範囲外・100 未満)は値域違反で拒否(FR-025)。
+        let bad = BoardSettings {
+            res_limit: 50,
+            ..Default::default()
+        };
+        assert!(matches!(
+            reg.update_settings(&board_id, bad),
+            Err(RegistryError::InvalidSettings(_))
+        ));
+    }
+
+    #[test]
+    fn update_settings_res_limit_does_not_shrink_active_thread() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        // 進行中スレの res_limit は既定 1000。設定を res_limit=200 に変えても、
+        // Active スレの res_limit は作成時スナップショット(1000)のまま(FR-023 — 次スレから)。
+        let new = BoardSettings {
+            res_limit: 200,
+            ..Default::default()
+        };
+        reg.update_settings(&board_id, new).unwrap();
+        let hosts = lock(&reg.hosts);
+        let entry = hosts.get(&board_id).unwrap();
+        assert_eq!(
+            entry.host.thread.res_limit, 1000,
+            "進行中スレの res_limit は変わらない(次スレから適用)"
+        );
+        // ただし settings 側は新値を保持(次スレ作成が採用する)。
+        assert_eq!(entry.host.settings.res_limit, 200);
     }
 }

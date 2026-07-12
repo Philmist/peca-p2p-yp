@@ -21,7 +21,7 @@ use crate::event::livechat::{LivechatBuildError, OrderInfo as OrderEnvelope, Res
 use crate::p2p::frame::Message as WireMessage;
 use crate::security::{SecurityCategory, is_lower_hex};
 
-use super::thread::{Res, Thread, ThreadError};
+use super::thread::{BoardSettings, Res, Thread, ThreadError};
 
 // ---------------------------------------------------------------------------
 // 指数バックオフ(FR-005 — gossip 再接続と同一パラメータ)
@@ -477,6 +477,62 @@ pub fn res_from_event(env: &ResEnvelope, event: &Event) -> Res {
         &event.pubkey.to_hex(),
         event.created_at.as_secs() as i64,
     )
+}
+
+/// 受信した `SETTINGS`(`board_settings` JSON)を検証して [`BoardSettings`] へ復元する
+/// (T032 — FR-025 受信側検証)。
+///
+/// `board_settings` は [`crate::livechat::host::board_settings_json`] と対の JSON オブジェクト
+/// (title/res_limit/noname_name/local_rules/first_post_pow_bits)。制御文字を除去
+/// ([`BoardSettings::sanitized`])した上で値域を検証([`BoardSettings::validate`])し、違反は
+/// **破棄**して記録すべきカテゴリ [`SecurityCategory::LivechatSettingsInvalid`] を返す(FR-025)。
+/// 参加者はこの検証を通った設定のみ表示へ反映する(不正な設定で表示を汚さない)。
+pub fn parse_and_validate_settings(
+    board_settings: &serde_json::Value,
+) -> Result<BoardSettings, SecurityCategory> {
+    let parse_u16 = |key: &str, default: u16| -> u16 {
+        board_settings
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u16::try_from(n).ok())
+            .unwrap_or(default)
+    };
+    let parse_u8 = |key: &str, default: u8| -> u8 {
+        board_settings
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u8::try_from(n).ok())
+            .unwrap_or(default)
+    };
+    let parse_str = |key: &str| -> String {
+        board_settings
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let defaults = BoardSettings::default();
+    let candidate = BoardSettings {
+        title: parse_str("title"),
+        res_limit: parse_u16("res_limit", defaults.res_limit),
+        noname_name: {
+            // 名無し名は空文字を許さない(1〜64 文字)。欠落・空は既定値へ寄せず、
+            // validate で NonameNameOutOfRange として弾く(受信側規範を厳格に保つ)。
+            let n = parse_str("noname_name");
+            if board_settings.get("noname_name").is_some() {
+                n
+            } else {
+                defaults.noname_name.clone()
+            }
+        },
+        local_rules: parse_str("local_rules"),
+        first_post_pow_bits: parse_u8("first_post_pow_bits", defaults.first_post_pow_bits),
+    };
+    let sanitized = candidate.sanitized();
+    sanitized
+        .validate()
+        .map(|_| sanitized.clone())
+        .map_err(|_| SecurityCategory::LivechatSettingsInvalid)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,5 +1083,54 @@ mod tests {
         assert_eq!(resolved[0].1.event_id, id1);
         assert_eq!(resolved[1].0, 2);
         assert_eq!(resolved[1].1.event_id, id2);
+    }
+
+    // --- T032: SETTINGS 受信側検証(FR-025)---------------------------------
+
+    #[test]
+    fn parse_and_validate_settings_accepts_valid() {
+        let json = serde_json::json!({
+            "title": "板タイトル",
+            "res_limit": 500,
+            "noname_name": "名無しさん",
+            "local_rules": "ルール",
+            "first_post_pow_bits": 16,
+        });
+        let settings = parse_and_validate_settings(&json).unwrap();
+        assert_eq!(settings.title, "板タイトル");
+        assert_eq!(settings.res_limit, 500);
+        assert_eq!(settings.noname_name, "名無しさん");
+        assert_eq!(settings.first_post_pow_bits, 16);
+    }
+
+    #[test]
+    fn parse_and_validate_settings_rejects_out_of_range() {
+        // res_limit=50(100 未満)は値域違反で破棄(FR-025)。
+        let json = serde_json::json!({ "res_limit": 50, "noname_name": "名無し" });
+        assert_eq!(
+            parse_and_validate_settings(&json),
+            Err(SecurityCategory::LivechatSettingsInvalid)
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_settings_rejects_empty_noname() {
+        // 明示的な空 noname_name(1〜64 文字違反)は破棄。
+        let json = serde_json::json!({ "noname_name": "" });
+        assert_eq!(
+            parse_and_validate_settings(&json),
+            Err(SecurityCategory::LivechatSettingsInvalid)
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_settings_strips_control_chars() {
+        // 制御文字は sanitized で除去され、除去後の値で検証を通る。
+        let json = serde_json::json!({
+            "title": "タイトル\u{7}制御",
+            "noname_name": "名無し",
+        });
+        let settings = parse_and_validate_settings(&json).unwrap();
+        assert_eq!(settings.title, "タイトル制御", "制御文字が除去される");
     }
 }
