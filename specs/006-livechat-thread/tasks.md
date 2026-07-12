@@ -90,16 +90,16 @@
 
 ### Tests for User Story 2
 
-- [ ] T027 [P] [US2] 契約テスト(1311 ホスト側検証): 検証順序 1〜7(サイズ → 署名 → 形式 → スレ状態 → BAN → PoW → レート)の正常系・name の `#` 残存時のホスト側除去を tests/contract/thread_events.rs に追加し失敗を確認
-- [ ] T028 [P] [US2] 契約テスト(採番・配布): RES 受理 → ORDER 発行 → 全参加者配布、seq 欠落 → RESEND_REQ → 再送をモックピアで tests/contract/thread_delivery.rs に追加し失敗を確認
+- [X] T027 [P] [US2] 契約テスト(1311 ホスト側検証): 検証順序 1〜7(サイズ → 署名 → 形式 → スレ状態 → BAN → PoW → レート)の正常系・name の `#` 残存時のホスト側除去を tests/contract/thread_events.rs に追加し失敗を確認
+- [X] T028 [P] [US2] 契約テスト(採番・配布): RES 受理 → ORDER 発行 → 全参加者配布、seq 欠落 → RESEND_REQ → 再送をモックピアで tests/contract/thread_delivery.rs に追加し失敗を確認
 
 ### Implementation for User Story 2
 
-- [ ] T029 [US2] 書き込みクライアント経路を実装: 板鍵での自動署名(未生成なら T012 で生成)・名前欄の `#` 以降除去(送信前 — FR-024)・mail 属性の保持(機能的意味なし — FR-029)・自分の未確定投稿の「送信中」区別表示(FR-008)— src/livechat/session.rs
-- [ ] T030 [US2] ホストシーケンサを実装: thread-events.md の受信検証 1〜7 を通過したレスに一意採番し、kind 21311 の ORDER(seq 連番・entries 欠番なし)を発行して RES + ORDER を全接続参加者(送信者含む)へ配布(FR-007・不変条件 T3/O1 — PlusCal モデルと対応するコードに意図コメント必須)— src/livechat/host.rs
-- [ ] T031 [US2] 参加者側 ORDER 検証と表示を実装: サイズ → 署名 → スレ主一致 → seq 連続性 → res_no 連続性の順で検証、欠落検出時は表示を進めず RESEND_REQ(不変条件 O2)、確定済みレスのみ表示、アンカー `>>n` の全端末一致解決(FR-008/FR-009/FR-011)— src/livechat/thread.rs / src/livechat/session.rs
-- [ ] T032 [US2] 板設定の変更と配布を実装: 板主の設定変更 API(4 項目 + first_post_pow_bits — FR-022)・SETTINGS メッセージでの即時配布(FR-023)・受信側検証(制約違反は破棄 + `livechat_settings_invalid` — FR-025)・名無しのデフォルト名はレス確定時点で固定し遡及しない(FR-023/FR-024 — dat 追記不変性の基盤)・res_limit は次スレから適用 — src/livechat/board.rs / src/livechat/host.rs / src/livechat/thread.rs
-- [ ] T033 [US2] US2 の cucumber ステップを tests/steps/livechat.rs に実装し、統合テスト(3 ノード同時書き込みで不一致 0 = SC-002、「送信中」→ 確定遷移、`#` 除去、名無し名適用)+ 負荷プロファイル(バースト 30 レス/分・100 接続で p99 ≤ 5 秒 = SC-001、`--ignored`)を tests/integration/livechat.rs に実装して全パス
+- [X] T029 [US2] 書き込みクライアント経路を実装: 板鍵での自動署名(未生成なら T012 で生成)・名前欄の `#` 以降除去(送信前 — FR-024)・mail 属性の保持(機能的意味なし — FR-029)・自分の未確定投稿の「送信中」区別表示(FR-008)— src/livechat/session.rs
+- [X] T030 [US2] ホストシーケンサを実装: thread-events.md の受信検証 1〜7 を通過したレスに一意採番し、kind 21311 の ORDER(seq 連番・entries 欠番なし)を発行して RES + ORDER を全接続参加者(送信者含む)へ配布(FR-007・不変条件 T3/O1 — PlusCal モデルと対応するコードに意図コメント必須)— src/livechat/host.rs
+- [X] T031 [US2] 参加者側 ORDER 検証と表示を実装: サイズ → 署名 → スレ主一致 → seq 連続性 → res_no 連続性の順で検証、欠落検出時は表示を進めず RESEND_REQ(不変条件 O2)、確定済みレスのみ表示、アンカー `>>n` の全端末一致解決(FR-008/FR-009/FR-011)— src/livechat/thread.rs / src/livechat/session.rs
+- [X] T032 [US2] 板設定の変更と配布を実装: 板主の設定変更 API(4 項目 + first_post_pow_bits — FR-022)・SETTINGS メッセージでの即時配布(FR-023)・受信側検証(制約違反は破棄 + `livechat_settings_invalid` — FR-025)・名無しのデフォルト名はレス確定時点で固定し遡及しない(FR-023/FR-024 — dat 追記不変性の基盤)・res_limit は次スレから適用 — src/livechat/board.rs / src/livechat/host.rs / src/livechat/thread.rs
+- [X] T033 [US2] US2 の cucumber ステップを tests/steps/livechat.rs に実装し、統合テスト(3 ノード同時書き込みで不一致 0 = SC-002、「送信中」→ 確定遷移、`#` 除去、名無し名適用)+ 負荷プロファイル(バースト 30 レス/分・100 接続で p99 ≤ 5 秒 = SC-001、`--ignored`)を tests/integration/livechat.rs に実装して全パス
 
 **Checkpoint**: US1 + US2 で読み書き可能な掲示板として成立
 
