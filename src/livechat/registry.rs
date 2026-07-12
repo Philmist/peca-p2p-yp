@@ -61,6 +61,11 @@ struct HostEntry {
     /// 接続中参加者の送信口(peer_id → outbox)。採番した RES + ORDER をここへ配布する
     /// (registry → outbox。PlusCal の `chan[p]` への Append に対応)。
     outboxes: HashMap<String, UnboundedSender<WireMessage>>,
+    /// 採番実績のある板鍵集合(pubkey hex)。**初見板鍵の PoW 判定**に使う(FR-021 / research R6 —
+    /// 初見は `first_post_pow_bits`、既知は通常しきい値)。採番成功で当該板鍵を既知にする。
+    known_board_keys: HashSet<String>,
+    /// 板鍵ごとの書き込みレート窓(FR-021 — `thread_write_rate`)。30 秒窓内のレス数を数える。
+    write_windows: HashMap<String, WriteRateWindow>,
 }
 
 /// スレ seed(確定レス投入)・接続受理の失敗理由。`Display` は内部情報を漏らさない。
@@ -111,20 +116,47 @@ pub enum AcceptOutcome {
     Rejected,
 }
 
+/// 板鍵単位の書き込みレート窓(FR-021 — `thread_write_rate`)。
+///
+/// 固定 30 秒窓(data-model §Settings で窓長は 30 秒固定)。窓を跨ぐと計数をリセットする。
+/// `now`(unix 秒)を採番判定と同じ時刻源から注入する(テスト可能)。
+#[derive(Debug, Clone)]
+struct WriteRateWindow {
+    window_start: u64,
+    count: u32,
+}
+
+/// `thread_write_rate` の窓長(秒)。data-model §Settings で 30 秒固定。
+const WRITE_RATE_WINDOW_SECS: u64 = 30;
+
+/// `thread_write_rate` の既定値(板鍵あたり 30 秒で 4 レス — data-model §Settings)。
+pub const DEFAULT_THREAD_WRITE_RATE: u32 = 4;
+
 /// ホストレジストリ(板ごとの [`HostThread`] を共有保持する)。
 pub struct LivechatRegistry {
     /// board_id(スレ主ペルソナ pubkey hex)→ ホスト状態。
     hosts: Mutex<HashMap<String, HostEntry>>,
     /// ホストの受入接続上限(Settings.thread_max_participants)。
     max_participants: usize,
+    /// 板鍵あたりの書き込みレート上限(Settings.thread_write_rate — 30 秒窓内のレス数上限)。
+    thread_write_rate: u32,
 }
 
 impl LivechatRegistry {
     /// レジストリを作る(`max_participants` は Settings.thread_max_participants)。
+    ///
+    /// `thread_write_rate` は既定値([`DEFAULT_THREAD_WRITE_RATE`])。設定値を反映する場合は
+    /// [`new_with_rate`](Self::new_with_rate)を使う。
     pub fn new(max_participants: usize) -> Arc<Self> {
+        Self::new_with_rate(max_participants, DEFAULT_THREAD_WRITE_RATE)
+    }
+
+    /// 書き込みレート上限を指定してレジストリを作る(Settings.thread_write_rate — FR-021)。
+    pub fn new_with_rate(max_participants: usize, thread_write_rate: u32) -> Arc<Self> {
         Arc::new(Self {
             hosts: Mutex::new(HashMap::new()),
             max_participants,
+            thread_write_rate,
         })
     }
 
@@ -166,6 +198,8 @@ impl LivechatRegistry {
                 order_events: HashMap::new(),
                 assigned_ids: HashSet::new(),
                 outboxes: HashMap::new(),
+                known_board_keys: HashSet::new(),
+                write_windows: HashMap::new(),
             },
         );
         Ok(())
@@ -254,6 +288,8 @@ impl LivechatRegistry {
             .sign(&entry.persona, created_at)
             .map_err(RegistryError::Build)?;
         entry.assigned_ids.insert(event_id.clone());
+        // seed したレスの板鍵も既知扱い(以後の PoW は通常しきい値)。
+        entry.known_board_keys.insert(res_event.pubkey.to_hex());
         entry.res_events.insert(event_id, res_event.clone());
         entry.order_events.insert(order.seq, order_event);
         Ok(res_no)
@@ -397,14 +433,18 @@ impl LivechatRegistry {
     ///    採番せず [`AcceptOutcome::Duplicate`](再送 × 切断で二重採番が起きるのを防ぐ — O1)。
     /// 3. **上限(NoOverLimit / T3 — `RoomInActive`)**: 次 res_no が res_limit を超えるなら
     ///    採番せず [`AcceptOutcome::Rejected`](次スレ移行は US5/T047)。
-    /// 4. **採番(単点性 — Principle V)**: [`Thread::confirm`] で res_no を 1 つ割り当てる
+    /// 4. **PoW(thread-events.md 検証 6 — FR-021)**: 初見板鍵は `first_post_pow_bits` を満たす
+    ///    こと(既知は通常しきい値)。不足は [`AcceptOutcome::Rejected`]。
+    /// 5. **レート(thread-events.md 検証 7 — FR-021)**: 板鍵単位 `thread_write_rate` / 30 秒窓。
+    ///    超過は [`AcceptOutcome::Rejected`](接続単位 `thread_msg_rate` は配線側 runtime)。
+    /// 6. **採番(単点性 — Principle V)**: [`Thread::confirm`] で res_no を 1 つ割り当てる
     ///    (T3 を強制)。ORDER(kind 21311・seq 連番)をスレ主鍵で署名する。
-    /// 5. **配布(`chan[p]` への Append)**: RES + ORDER を **全接続参加者(送信者含む)** の
+    /// 7. **配布(`chan[p]` への Append)**: RES + ORDER を **全接続参加者(送信者含む)** の
     ///    outbox へ seq 順に送る。切断済み outbox への送信失敗は無視する(unregister は配線側)。
     ///
-    /// 署名検証・形式・BAN・PoW・レートの受信検証(1〜7)は呼び出し前に
-    /// [`Self::verify_incoming_res`] 等で済ませてある前提(モデル境界 — ADR-0014 §2)。
-    /// 本メソッドは検証通過後の**採番判定のみ**をモデル化する。
+    /// 署名検証・形式は呼び出し前に [`Self::verify_incoming_res`] 等で済ませてある前提
+    /// (モデル境界 — ADR-0014 §2)。BAN(採番拒否)は US4/T042。本メソッドは検証通過後の
+    /// **採番判定 + PoW/レート**をモデル化する。`created_at` はレート窓・ORDER 署名の時刻源。
     pub fn accept_write(
         &self,
         board_id: &str,
@@ -432,6 +472,37 @@ impl LivechatRegistry {
         // 3. 上限(NoOverLimit / T3 — RoomInActive)。
         if entry.host.thread.next_res_no() > entry.host.thread.res_limit {
             return Ok(AcceptOutcome::Rejected);
+        }
+
+        let board_key = res_event.pubkey.to_hex();
+        // 3.5 PoW(thread-events.md 検証 6 — FR-021 / research R6)。**初見板鍵**(採番実績なし)は
+        //     `first_post_pow_bits` を満たすこと。既知板鍵は通常しきい値(0)。初回書き込みへ
+        //     計算コストを課し、使い捨て板鍵の大量生成による荒らしを抑止する。
+        let is_first_post = !entry.known_board_keys.contains(&board_key);
+        if is_first_post {
+            let required = entry.host.settings.first_post_pow_bits;
+            if required > 0 && !res_event.check_pow(required) {
+                return Ok(AcceptOutcome::Rejected);
+            }
+        }
+        // 3.6 レート(thread-events.md 検証 7 — FR-021)。**板鍵単位**の書き込みレート
+        //     (`thread_write_rate` / 30 秒窓)。窓を跨いだらリセットし、窓内で上限に達していれば
+        //     採番せず破棄する(接続単位の `thread_msg_rate` は配線側 runtime が担う)。
+        {
+            let window = entry
+                .write_windows
+                .entry(board_key.clone())
+                .or_insert(WriteRateWindow {
+                    window_start: created_at,
+                    count: 0,
+                });
+            if created_at.saturating_sub(window.window_start) >= WRITE_RATE_WINDOW_SECS {
+                window.window_start = created_at;
+                window.count = 0;
+            }
+            if window.count >= self.thread_write_rate {
+                return Ok(AcceptOutcome::Rejected);
+            }
         }
 
         // 4. 採番(単点性)。confirm が T3(res_no 欠番なし単調増加・上限)を強制する。
@@ -471,6 +542,11 @@ impl LivechatRegistry {
         entry.assigned_ids.insert(event_id.clone());
         entry.res_events.insert(event_id, res_event.clone());
         entry.order_events.insert(order.seq, order_event.clone());
+        // 板鍵を既知にし(以後は通常 PoW しきい値)、レート窓の計数を進める(FR-021)。
+        entry.known_board_keys.insert(board_key.clone());
+        if let Some(window) = entry.write_windows.get_mut(&board_key) {
+            window.count += 1;
+        }
 
         // 5. 配布: RES + ORDER を全接続参加者(送信者含む)の outbox へ seq 順に送る。
         let res_msg = res_event_to_message(res_event);
@@ -581,13 +657,19 @@ mod tests {
     fn registry_with_thread(persona: &Keys, max: usize) -> Arc<LivechatRegistry> {
         let reg = LivechatRegistry::new(max);
         let board_id = persona.public_key().to_hex();
+        // 採番・配布のテストは PoW を対象にしないため first_post_pow_bits=0 で開設する
+        // (PoW/レートは専用テストで検証する)。
+        let settings = BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        };
         reg.open_thread(
             persona.clone(),
             channel_of(&board_id),
             1,
             1_700_000_000,
             "実況スレ",
-            BoardSettings::default(),
+            settings,
             "198.51.100.1:7147",
         )
         .unwrap();
@@ -920,10 +1002,12 @@ mod tests {
         let p = persona();
         let board_id = p.public_key().to_hex();
         // res_limit=100 の下限で開設(BoardSettings 既定は 1000 だが、確実に上限へ到達させる
-        // ため小さいスレを直接組む)。
-        let reg = LivechatRegistry::new(128);
+        // ため小さいスレを直接組む)。PoW/レートは本テストの対象外なので回避する
+        // (first_post_pow_bits=0・レート上限を大きく取る)。
+        let reg = LivechatRegistry::new_with_rate(128, 10_000);
         let settings = BoardSettings {
             res_limit: 100,
+            first_post_pow_bits: 0,
             ..Default::default()
         };
         reg.open_thread(
@@ -1025,5 +1109,129 @@ mod tests {
         reg.accept_write(&board_id, &res, 1_700_000_010).unwrap();
         // 登録解除済みなので何も届かない。
         assert!(rx.try_recv().is_err());
+    }
+
+    // --- T030: PoW(初見板鍵)・レート(板鍵単位)— FR-021 -------------------
+
+    /// PoW 付きで kind 1311 を署名する(初見板鍵テスト用)。
+    fn sign_res_pow(
+        board_key: &Keys,
+        board_id: &str,
+        channel: &str,
+        body: &str,
+        created_at: u64,
+        pow_bits: u8,
+    ) -> Event {
+        crate::event::livechat::Res {
+            channel: channel.to_string(),
+            board_id: board_id.to_string(),
+            generation: 1,
+            name: None,
+            mail: None,
+            body: body.to_string(),
+        }
+        .sign(board_key, created_at, pow_bits)
+        .unwrap()
+    }
+
+    #[test]
+    fn accept_write_requires_pow_for_first_post() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        // first_post_pow_bits=8(初見板鍵に 8 ビット PoW を要求)。
+        let reg = LivechatRegistry::new_with_rate(128, 10_000);
+        let settings = BoardSettings {
+            first_post_pow_bits: 8,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let ch = channel_of(&board_id);
+        let board_key = Keys::generate();
+
+        // PoW なしの初見板鍵は Rejected(FR-021)。
+        let no_pow = sign_res(&board_key, &board_id, &ch, 1, "初回", 1_700_000_010).unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &no_pow, 1_700_000_010).unwrap(),
+            AcceptOutcome::Rejected
+        );
+
+        // PoW 8 付きの初回書き込みは Numbered。以後は既知板鍵になり PoW 不要。
+        let pow = sign_res_pow(&board_key, &board_id, &ch, "初回", 1_700_000_011, 8);
+        assert!(matches!(
+            reg.accept_write(&board_id, &pow, 1_700_000_011).unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+        // 2 回目(既知板鍵)は PoW なしでも Numbered(通常しきい値 0)。
+        let second = sign_res(&board_key, &board_id, &ch, 1, "二回目", 1_700_000_012).unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &second, 1_700_000_012).unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+    }
+
+    #[test]
+    fn accept_write_enforces_board_key_rate() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        // thread_write_rate=4(30 秒窓内 4 レス)・PoW なし。
+        let reg = LivechatRegistry::new_with_rate(128, 4);
+        let settings = BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let ch = channel_of(&board_id);
+        let board_key = Keys::generate();
+
+        // 同一秒内に 4 レスは採番(窓内上限まで)。
+        for i in 0..4u64 {
+            let res = sign_res(
+                &board_key,
+                &board_id,
+                &ch,
+                1,
+                &format!("r{i}"),
+                1_700_000_010 + i,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+                    AcceptOutcome::Numbered { .. }
+                ),
+                "窓内 {i} 件目は採番される"
+            );
+        }
+        // 5 件目(同一窓)はレート超過で Rejected。
+        let over = sign_res(&board_key, &board_id, &ch, 1, "5件目", 1_700_000_014).unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &over, 1_700_000_010).unwrap(),
+            AcceptOutcome::Rejected
+        );
+
+        // 30 秒窓を跨ぐとリセットされ、再び採番できる。
+        let after = sign_res(&board_key, &board_id, &ch, 1, "窓明け", 1_700_000_014).unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &after, 1_700_000_050).unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
     }
 }
