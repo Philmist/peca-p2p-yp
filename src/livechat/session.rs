@@ -15,9 +15,9 @@
 
 use nostr::hashes::{Hash, sha256};
 use nostr::secp256k1::{Message, Secp256k1, schnorr};
-use nostr::{Event, PublicKey};
+use nostr::{Event, Keys, PublicKey};
 
-use crate::event::livechat::{OrderInfo as OrderEnvelope, Res as ResEnvelope};
+use crate::event::livechat::{LivechatBuildError, OrderInfo as OrderEnvelope, Res as ResEnvelope};
 use crate::p2p::frame::Message as WireMessage;
 use crate::security::{SecurityCategory, is_lower_hex};
 
@@ -188,6 +188,9 @@ pub struct ParticipantSession {
     state: SessionState,
     /// 受信・確定を反映するスレ(閲覧に板鍵は不要 — 検証は署名のみ)。
     thread: Thread,
+    /// 自分の未確定投稿(「送信中」表示 — FR-008)。event_id → 送信中 Res(`pending = true`)。
+    /// ホストの ORDER で当該 event_id が確定したら確定列へ移り、ここから除去される。
+    pending: Vec<Res>,
 }
 
 impl ParticipantSession {
@@ -206,6 +209,7 @@ impl ParticipantSession {
             attempt: 0,
             state: SessionState::Joining,
             thread,
+            pending: Vec::new(),
         }
     }
 
@@ -326,9 +330,78 @@ impl ParticipantSession {
             self.thread
                 .confirm(res, entry.res_no)
                 .map_err(SyncError::Confirm)?;
+            // 自分の未確定投稿がこの ORDER で確定したら「送信中」から除去する(FR-008)。
+            // 確定実体は確定列(thread.res)へ入るため、pending 側の重複を消す。
+            self.pending.retain(|p| p.event_id != entry.event_id);
         }
         self.last_seq = order.seq;
         Ok(())
+    }
+
+    // --- T029: 書き込みクライアント経路(FR-008/FR-024/FR-029)---------------
+
+    /// 板鍵でレスを自動署名して書き込み `RES` を生成する(T029 — 参→ホ)。
+    ///
+    /// - **板鍵署名(FR-016)**: `board_keys`(板単位の書き込み鍵。未生成なら呼び出し側が
+    ///   [`crate::livechat::board::BoardKeyManager`] で生成して渡す)で kind 1311 を署名する。
+    /// - **名前欄の `#` 以降除去(FR-024)**: 送信前に除去する(トリップ入力の秘匿)。
+    /// - **mail 保持(FR-029)**: 表示互換のためそのまま載せる(機能的意味なし)。
+    /// - 本文の制御文字除去・長さ/行数検査は封筒([`ResEnvelope::sign`])が行う。
+    ///
+    /// 署名済みイベントを**自分の未確定投稿**として `pending`(送信中)へ加え、送出すべき
+    /// `RES` メッセージを返す(FR-008 — 送信中表示)。ホストの ORDER で確定すると
+    /// [`Self::apply_order`] が pending から除去し確定列へ移す。`created_at` は署名時刻、
+    /// `pow_bits` は初見板鍵の PoW(通常は 0。初回書き込み PoW は US4/T044)。
+    ///
+    /// 形式違反(本文長・行数・名前長・チャンネル/board_id 不正)は
+    /// [`LivechatBuildError`] を返し、pending へは加えない。
+    #[allow(clippy::too_many_arguments)]
+    pub fn compose_write(
+        &mut self,
+        board_keys: &Keys,
+        channel: &str,
+        name: Option<String>,
+        mail: Option<String>,
+        body: &str,
+        created_at: u64,
+        pow_bits: u8,
+    ) -> Result<WireMessage, LivechatBuildError> {
+        // 封筒を組んで板鍵で署名する(# 除去・mail 保持・本文検査は sign が担う — FR-024/FR-029)。
+        let envelope = ResEnvelope {
+            channel: channel.to_string(),
+            board_id: self.board_id.clone(),
+            generation: self.generation,
+            name,
+            mail,
+            body: body.to_string(),
+        };
+        let event = envelope.sign(board_keys, created_at, pow_bits)?;
+
+        // 署名済みイベントから復元した表示ビュー(# 除去後の name・制御文字除去後の body)を
+        // 「送信中」Res として保持する(FR-008)。復元は封筒の形式検証を兼ねる。
+        let view = ResEnvelope::from_event(&event)
+            .map_err(|_| LivechatBuildError::Invalid("composed res failed self-verify"))?;
+        let mut res = res_from_event(&view, &event);
+        res.pending = true; // 自分の未確定投稿(送信中表示)。
+        self.pending.push(res);
+
+        Ok(WireMessage::Res {
+            event: serde_json::to_value(&event)
+                .map_err(|e| LivechatBuildError::Nostr(e.to_string()))?,
+        })
+    }
+
+    /// 自分の未確定投稿(「送信中」表示 — FR-008)。ホスト採番前のレスのみを含む。
+    pub fn pending(&self) -> &[Res] {
+        &self.pending
+    }
+
+    /// 表示用の全レス列(確定列 + 自分の送信中投稿)。確定分を res_no 順に並べ、末尾へ
+    /// 自分の送信中投稿(res_no なし)を付す(FR-008 — 送信中を区別して表示できる形)。
+    pub fn display_res(&self) -> Vec<Res> {
+        let mut rows: Vec<Res> = self.thread.res.clone();
+        rows.extend(self.pending.iter().cloned());
+        rows
     }
 }
 
@@ -387,7 +460,7 @@ mod tests {
     use crate::event::livechat::OrderEntry;
     use crate::livechat::host;
     use crate::p2p::frame::thread_reject_reason;
-    use nostr::Keys;
+    use nostr::{JsonUtil, Keys};
 
     const GUID: &str = "0123456789abcdef0123456789abcdef";
 
@@ -678,5 +751,183 @@ mod tests {
         }
         assert_eq!(session.since_seq(), 2);
         assert_eq!(session.confirmed().len(), 2);
+    }
+
+    // --- T029: 書き込みクライアント経路(FR-008/FR-024/FR-029)---------------
+
+    fn channel_of(board_id: &str) -> String {
+        format!("30311:{board_id}:{GUID}")
+    }
+
+    #[test]
+    fn compose_write_signs_with_board_key_and_marks_pending() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let board_key = Keys::generate();
+
+        let msg = session
+            .compose_write(
+                &board_key,
+                &channel_of(&board_id),
+                Some("名無し".into()),
+                Some("sage".into()),
+                "本文テスト",
+                1_700_000_010,
+                0,
+            )
+            .unwrap();
+
+        // 生成 RES は板鍵で署名され、封筒検証を通る。
+        let WireMessage::Res { event } = msg else {
+            panic!("RES を期待");
+        };
+        let raw = event.to_string();
+        let signed = Event::from_json(&raw).unwrap();
+        assert!(signed.verify().is_ok(), "板鍵署名が検証を通る");
+        assert_eq!(signed.pubkey, board_key.public_key(), "署名鍵は板鍵");
+        assert_eq!(signed.kind.as_u16(), crate::event::livechat::RES_KIND);
+
+        // 自分の未確定投稿が「送信中」として保持される(FR-008)。
+        assert_eq!(session.pending().len(), 1);
+        assert!(session.pending()[0].pending, "pending フラグが立つ");
+        assert_eq!(session.pending()[0].res_no, None, "未確定は res_no なし");
+        assert_eq!(
+            session.pending()[0].mail.as_deref(),
+            Some("sage"),
+            "mail 保持(FR-029)"
+        );
+    }
+
+    #[test]
+    fn compose_write_strips_trip_after_hash() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let board_key = Keys::generate();
+
+        // 名前欄に `#トリップ` を含めて送信 → 送信前に `#` 以降が除去される(FR-024)。
+        let msg = session
+            .compose_write(
+                &board_key,
+                &channel_of(&board_id),
+                Some("コテハン#ひみつ".into()),
+                None,
+                "本文",
+                1_700_000_010,
+                0,
+            )
+            .unwrap();
+        let WireMessage::Res { event } = msg else {
+            panic!("RES を期待");
+        };
+        let signed = Event::from_json(event.to_string()).unwrap();
+        let restored = ResEnvelope::from_event(&signed).unwrap();
+        assert_eq!(
+            restored.name.as_deref(),
+            Some("コテハン"),
+            "# 以降は除去済み"
+        );
+        // pending 側の表示ビューも除去後の名前。
+        assert_eq!(session.pending()[0].name.as_deref(), Some("コテハン"));
+    }
+
+    #[test]
+    fn pending_becomes_confirmed_on_matching_order() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let board_key = Keys::generate();
+
+        // 自分の書き込みを送信中にする。
+        let msg = session
+            .compose_write(
+                &board_key,
+                &channel_of(&board_id),
+                None,
+                None,
+                "自分の投稿",
+                1_700_000_010,
+                0,
+            )
+            .unwrap();
+        let WireMessage::Res { event } = msg else {
+            panic!("RES を期待");
+        };
+        let signed = Event::from_json(event.to_string()).unwrap();
+        let event_id = signed.id.to_hex();
+        assert_eq!(session.pending().len(), 1);
+        assert!(session.confirmed().is_empty());
+
+        // ホストがこの event_id を res_no=1 で確定する ORDER を送る。
+        let order = OrderEnvelope {
+            board_id: board_id.clone(),
+            generation: 1,
+            seq: 1,
+            entries: vec![OrderEntry {
+                res_no: 1,
+                event_id: event_id.clone(),
+            }],
+        };
+        // 保留プールは自分の署名済みイベントから復元する(配線側の役割を模す)。
+        let view = ResEnvelope::from_event(&signed).unwrap();
+        let confirmed_res = res_from_event(&view, &signed);
+        session
+            .apply_order(&order, |eid| {
+                if eid == event_id {
+                    Some(confirmed_res.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        // 確定列へ移り、送信中から除去される(FR-008 の送信中 → 確定遷移)。
+        assert_eq!(session.confirmed().len(), 1);
+        assert_eq!(session.confirmed()[0].res_no, Some(1));
+        assert_eq!(session.confirmed()[0].body, "自分の投稿");
+        assert!(session.pending().is_empty(), "確定後は送信中から消える");
+    }
+
+    #[test]
+    fn display_res_lists_confirmed_then_pending() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let board_key = Keys::generate();
+
+        // 他者の確定レス 1 件を先に反映。
+        let other_id = "11".repeat(32);
+        let order = OrderEnvelope {
+            board_id: board_id.clone(),
+            generation: 1,
+            seq: 1,
+            entries: vec![OrderEntry {
+                res_no: 1,
+                event_id: other_id.clone(),
+            }],
+        };
+        session
+            .apply_order(&order, |_| Some(sample_res(&other_id)))
+            .unwrap();
+        // 自分の未確定投稿 1 件を送信中にする。
+        session
+            .compose_write(
+                &board_key,
+                &channel_of(&board_id),
+                None,
+                None,
+                "送信中の投稿",
+                1_700_000_020,
+                0,
+            )
+            .unwrap();
+
+        let rows = session.display_res();
+        assert_eq!(rows.len(), 2, "確定 1 + 送信中 1");
+        assert_eq!(rows[0].res_no, Some(1), "確定分が先");
+        assert!(!rows[0].pending);
+        assert_eq!(rows[1].res_no, None, "送信中は末尾・res_no なし");
+        assert!(rows[1].pending, "送信中フラグ");
     }
 }
