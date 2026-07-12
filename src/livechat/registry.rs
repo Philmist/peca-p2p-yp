@@ -40,8 +40,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// 1 板分のホスト状態(HostThread + スレ主鍵 + 署名済みイベントキャッシュ)。
 struct HostEntry {
     host: HostThread,
-    /// スレ主ペルソナ鍵(WELCOME 署名・ORDER 署名に使う)。
+    /// スレ主ペルソナ鍵(WELCOME 署名・ORDER 署名・announce 署名に使う)。
     persona: Keys,
+    /// ホスト接続先 `ip:port`(announce の `tip`)。スレ開設時に確定する(FR-004)。
+    tip: String,
     /// 確定レスの署名済みイベント(event_id → kind 1311)。同期再送で RES フレームへ写す。
     res_events: HashMap<String, Event>,
     /// 発行済み ORDER の署名済みイベント(seq → kind 21311)。同期再送で ORDER フレームへ写す。
@@ -106,6 +108,9 @@ impl LivechatRegistry {
     /// `persona` はスレ主ペルソナ鍵。`board_id`(= `persona` の公開鍵)以外での開設は
     /// [`RegistryError::BoardIdMismatch`] で拒否する(FR-003 の発行側不変条件)。既存の
     /// 同 board_id は置換する(板あたりアクティブ 1 本 — 不変条件 T2)。
+    /// `tip` はホスト接続先 `ip:port`(announce の `tip` — 他ノードが接続する自ノードの
+    /// 到達アドレス。受信のみでは接続しない FR-004)。
+    #[allow(clippy::too_many_arguments)]
     pub fn open_thread(
         &self,
         persona: Keys,
@@ -114,6 +119,7 @@ impl LivechatRegistry {
         key: u64,
         title: impl Into<String>,
         settings: BoardSettings,
+        tip: impl Into<String>,
     ) -> Result<(), RegistryError> {
         let board_id = persona.public_key().to_hex();
         let thread = Thread::new(
@@ -130,6 +136,7 @@ impl LivechatRegistry {
             HostEntry {
                 host,
                 persona,
+                tip: tip.into(),
                 res_events: HashMap::new(),
                 order_events: HashMap::new(),
             },
@@ -140,6 +147,32 @@ impl LivechatRegistry {
     /// 開設中の board_id 一覧(status・診断用)。
     pub fn board_ids(&self) -> Vec<String> {
         lock(&self.hosts).keys().cloned().collect()
+    }
+
+    /// 開設中の全スレの announce(kind 31311)を署名して返す(T019 — 60 秒間隔の定期発行)。
+    ///
+    /// 各 board のスレ主ペルソナ鍵で署名し、`tip` は開設時に保持した自ノードの到達アドレスを
+    /// 使う。`expiration = created_at + 600` は封筒側([`ThreadAnnounce::sign`])が付与する。
+    /// 実際の gossip 発行([`crate::p2p::hub::GossipHub::publish_local`])は配線側(main の
+    /// 定期タスク)が行う — 本メソッドは「発行すべき Event を作る」ところまで(署名失敗の
+    /// board は黙って飛ばす)。
+    pub fn build_announce_events(&self, created_at: u64, pow_bits: u8) -> Vec<Event> {
+        let hosts = lock(&self.hosts);
+        let mut events = Vec::new();
+        for entry in hosts.values() {
+            let announce = livechat::ThreadAnnounce {
+                channel: entry.host.thread.channel.clone(),
+                title: entry.host.thread.title.clone(),
+                generation: entry.host.thread.generation,
+                key: entry.host.thread.key,
+                res_count: Some(entry.host.res_count() as u64),
+                tip: entry.tip.clone(),
+            };
+            if let Ok(ev) = announce.sign(&entry.persona, created_at, pow_bits) {
+                events.push(ev);
+            }
+        }
+        events
     }
 
     /// 確定済みレスを 1 件投入する(テスト・互換 seed 用 — US2 の採番前に既存レスを積む)。
@@ -285,6 +318,44 @@ impl LivechatRegistry {
         frames
     }
 
+    /// 参加者からの RES(書き込み)を受信検証する(FR-007/FR-011 の配線層強制 — 採番前)。
+    ///
+    /// US1 は**読み取り/同期のみ**のため採番はしない(採番・配布は US2 の T030)。ただし
+    /// ホストが受信した RES の**封筒署名・形式・対象スレ一致**は本段で検証し、不正な書き込みを
+    /// 検出できるようにする(検出結果は配線側が `livechat_write_rejected` として記録する)。
+    ///
+    /// 検証内容(thread-events.md §ホスト側受信検証の 1〜4 相当。BAN/PoW/レートは US2/US4):
+    ///
+    /// 1. **署名**: nostr の id・sig 検証(封筒が本物であること)。
+    /// 2. **形式**: kind=1311・必須タグ・本文制約([`ResEnvelope::from_event`])。
+    /// 3. **対象スレ一致**: 封筒の board_id・世代が本ホストの Active スレと一致すること
+    ///    (別スレ・別世代・未知板への書き込みは受理しない — 不変条件 T1/T2)。
+    /// 4. **状態**: 対象スレが Active であること(Frozen/Closed は受理しない — T1)。
+    ///
+    /// 妥当な書き込みなら `true`(US1 では採番せず破棄)、不正なら `false`(記録は配線側 —
+    /// 応答で理由を開示しない)。
+    pub fn verify_incoming_res(&self, board_id: &str, res_event: &Event) -> bool {
+        // 1. 署名(id・sig)。
+        if res_event.verify().is_err() {
+            return false;
+        }
+        // 2. 形式(kind 1311・タグ・本文)。
+        let Ok(envelope) = ResEnvelope::from_event(res_event) else {
+            return false;
+        };
+        // 3. 対象スレ一致 + 4. 状態(Active)。
+        let hosts = lock(&self.hosts);
+        let Some(entry) = hosts.get(board_id) else {
+            return false;
+        };
+        if envelope.board_id != entry.host.thread.board_id
+            || envelope.generation != entry.host.thread.generation
+        {
+            return false;
+        }
+        entry.host.thread.check_writable().is_ok()
+    }
+
     /// 参加者を登録する(WELCOME 送出成功後に配線側が呼ぶ)。
     pub fn register_participant(&self, board_id: &str, peer_id: &str) {
         if let Some(entry) = lock(&self.hosts).get_mut(board_id) {
@@ -351,32 +422,6 @@ pub fn sign_res(
     envelope.sign(board_key, created_at, 0)
 }
 
-/// announce 発行イベントを組み立てる薄いラッパ(定期再発行 — 実発行は hub 側)。
-///
-/// [`crate::livechat::host::build_announce_for`] と同義だが、レジストリが保持する
-/// スレ主鍵を使うため board_id で引いて署名する。未知 board は `None`。
-pub fn build_announce(
-    registry: &LivechatRegistry,
-    board_id: &str,
-    tip: &str,
-    created_at: u64,
-    pow_bits: u8,
-) -> Option<Result<Event, LivechatBuildError>> {
-    let hosts = lock(&registry.hosts);
-    let entry = hosts.get(board_id)?;
-    Some(
-        livechat::ThreadAnnounce {
-            channel: entry.host.thread.channel.clone(),
-            title: entry.host.thread.title.clone(),
-            generation: entry.host.thread.generation,
-            key: entry.host.thread.key,
-            res_count: Some(entry.host.res_count() as u64),
-            tip: tip.to_string(),
-        }
-        .sign(&entry.persona, created_at, pow_bits),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +447,7 @@ mod tests {
             1_700_000_000,
             "実況スレ",
             BoardSettings::default(),
+            "198.51.100.1:7147",
         )
         .unwrap();
         reg
@@ -521,5 +567,114 @@ mod tests {
             .filter(|m| matches!(m, WireMessage::Order { .. }))
             .count();
         assert_eq!(orders, 2, "seq 2 と 3 の ORDER が再送される");
+    }
+
+    // --- RES 受信検証(FR-007/FR-011 の配線層強制)---------------------------
+
+    #[test]
+    fn verify_incoming_res_accepts_valid_write() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let ch = channel_of(&board_id);
+        // 正当な板鍵署名・対象スレ一致の RES は妥当(Active スレへの書き込み)。
+        let res = sign_res(&board_key, &board_id, &ch, 1, "書き込み", 1_700_000_005).unwrap();
+        assert!(reg.verify_incoming_res(&board_id, &res));
+    }
+
+    #[test]
+    fn verify_incoming_res_rejects_wrong_generation() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let ch = channel_of(&board_id);
+        // 別世代(gen=2)の RES は対象スレ不一致で拒否(不変条件 T1/T2)。
+        let res = sign_res(&board_key, &board_id, &ch, 2, "別世代", 1_700_000_005).unwrap();
+        assert!(!reg.verify_incoming_res(&board_id, &res));
+    }
+
+    #[test]
+    fn verify_incoming_res_rejects_unknown_board() {
+        let reg = LivechatRegistry::new(128);
+        let board_key = Keys::generate();
+        let board_id = "ab".repeat(32);
+        let ch = channel_of(&board_id);
+        let res = sign_res(&board_key, &board_id, &ch, 1, "未知板", 1_700_000_005).unwrap();
+        // 開設されていない板への書き込みは拒否。
+        assert!(!reg.verify_incoming_res(&board_id, &res));
+    }
+
+    #[test]
+    fn verify_incoming_res_rejects_tampered_signature() {
+        use nostr::JsonUtil;
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let ch = channel_of(&board_id);
+        let res = sign_res(&board_key, &board_id, &ch, 1, "本文", 1_700_000_005).unwrap();
+        // content を改竄すると id 再計算が合わず署名検証に失敗する。
+        let raw = res
+            .as_json()
+            .replace("\"content\":\"本文\"", "\"content\":\"改竄\"");
+        let tampered = Event::from_json(&raw).unwrap();
+        assert!(!reg.verify_incoming_res(&board_id, &tampered));
+    }
+
+    #[test]
+    fn verify_incoming_res_rejects_when_frozen() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        // スレを Frozen にすると書き込みは受理されない(T1)。
+        {
+            let mut hosts = lock(&reg.hosts);
+            hosts
+                .get_mut(&board_id)
+                .unwrap()
+                .host
+                .thread
+                .freeze()
+                .unwrap();
+        }
+        let board_key = Keys::generate();
+        let ch = channel_of(&board_id);
+        let res = sign_res(&board_key, &board_id, &ch, 1, "凍結後", 1_700_000_005).unwrap();
+        assert!(!reg.verify_incoming_res(&board_id, &res));
+    }
+
+    // --- announce 発行(T019 — 60 秒間隔の定期発行)-------------------------
+
+    #[test]
+    fn build_announce_events_signs_all_boards() {
+        use nostr::JsonUtil;
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let events = reg.build_announce_events(1_700_000_000, 0);
+        assert_eq!(events.len(), 1, "開設中の 1 板分の announce を発行する");
+        let ev = &events[0];
+        assert_eq!(ev.kind.as_u16(), crate::event::livechat::ANNOUNCE_KIND);
+        // 署名者 = スレ主ペルソナ(a タグの pubkey と一致 — FR-003)。
+        assert_eq!(ev.pubkey, p.public_key());
+        assert!(ev.verify().is_ok());
+        // gossip 受信検証(検査 1〜7)を通る = 可視な announce。
+        let cfg = crate::event::schema::VerifyConfig::default();
+        let verified =
+            crate::event::schema::verify_incoming_announce(&ev.as_json(), &cfg, 1_700_000_000);
+        assert!(verified.is_ok(), "自ノード発行 announce は受信側検証を通る");
+        let restored = verified.unwrap();
+        assert_eq!(restored.announce.tip, "198.51.100.1:7147");
+        assert_eq!(restored.announce.generation, 1);
+        // board_id 先頭。
+        assert!(board_id.starts_with(&restored.event.pubkey.to_hex()[..8]));
+    }
+
+    #[test]
+    fn build_announce_events_empty_without_threads() {
+        let reg = LivechatRegistry::new(128);
+        assert!(reg.build_announce_events(1_700_000_000, 0).is_empty());
     }
 }

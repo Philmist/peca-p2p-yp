@@ -39,6 +39,7 @@ use crate::security::{SecurityCategory, SecurityLog};
 use crate::store::PeerSource;
 
 use crate::livechat::registry::LivechatRegistry;
+use nostr::JsonUtil;
 
 /// 外向き接続維持ループの周期。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -849,8 +850,28 @@ impl P2pRuntime {
                 }
                 true
             }
-            // RES(書き込み)は US2 の採番で処理する。US1 では受理のみ(前方互換で切断しない)。
-            Message::Res { .. } => true,
+            Message::Res { event } => {
+                // 参→ホ 書き込み。join 済みでなければ joined 前のスレメッセージ = 不正フレーム。
+                let Some(board_id) = thread_board.clone() else {
+                    return false;
+                };
+                // FR-007/FR-011 の配線層強制: 封筒署名・形式・対象スレ一致を検証する
+                // (採番・配布は US2 の T030)。不正は livechat_write_rejected を記録して破棄
+                // (応答で理由を開示しない — FR-006。前方互換のため切断はしない)。
+                let raw = event.to_string();
+                let verified = nostr::Event::from_json(&raw)
+                    .ok()
+                    .filter(|ev| registry.verify_incoming_res(&board_id, ev));
+                if verified.is_none() {
+                    self.security.log(
+                        SecurityCategory::LivechatWriteRejected,
+                        addr,
+                        "res failed signature or format verification",
+                    );
+                }
+                // US1 は読み取りのみ: 妥当でも採番せず破棄する(採番は US2)。
+                true
+            }
             // その他のスレメッセージ(ホスト→参 の種別が参→ホ 方向に来た等)は無視する
             // (前方互換 — 未知/方向違いは切断しない。厳格な方向検査は US2 で扱う)。
             _ => true,

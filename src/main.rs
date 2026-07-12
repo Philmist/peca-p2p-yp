@@ -208,6 +208,35 @@ async fn run() -> Result<(), i32> {
     let reachability = runtime.reachability();
     let mut handles = Arc::clone(&runtime).spawn(p2p_listeners, shutdown_rx.clone());
 
+    // 12z. スレ announce の定期発行(T019 — FR-002)。開設中の全スレの kind 31311 を
+    //      republish_interval_sec 間隔でハブへローカル発行する(expiration=created_at+600
+    //      は封筒側が付与)。開設スレが無ければ何もしない(スレ開設は T024 の明示操作)。
+    if let Some(livechat) = runtime.livechat().cloned() {
+        let hub = Arc::clone(&hub);
+        let interval = settings.republish_interval_sec.max(1);
+        let mut sd = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+            loop {
+                tokio::select! {
+                    _ = sd.changed() => break,
+                    _ = ticker.tick() => {
+                        if *sd.borrow() {
+                            break;
+                        }
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        for event in livechat.build_announce_events(now, 0) {
+                            hub.publish_local(event);
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 12a. 着信可否の共有状態(UPnP — T053 / FR-016)。待受なしは常に到達不能、
     //      待受あり + UPnP 無効は直接待受として到達可能、待受あり + UPnP 有効は
     //      マッピング成功まで到達不能(タスクが更新する)。UPnP は IPv4 NAT のみを
