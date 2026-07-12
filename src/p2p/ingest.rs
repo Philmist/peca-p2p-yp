@@ -22,7 +22,10 @@ use std::collections::HashMap;
 
 use nostr::Event;
 
-use crate::event::schema::{EventSummary, VerifyConfig, VerifyReject, verify_incoming};
+use crate::event::livechat::{ANNOUNCE_KIND, ORDER_KIND, RES_KIND};
+use crate::event::schema::{
+    EventSummary, VerifyConfig, VerifyReject, verify_incoming, verify_incoming_announce,
+};
 use crate::event::store::{DedupCache, EventStore, InsertOutcome, StoreConfig};
 use crate::event::view::{self, DiscoveredChannel, MuteSet, SourceMap};
 use crate::store::MuteEntry;
@@ -37,6 +40,9 @@ pub struct IngestState {
     sources: SourceMap,
     verify: VerifyConfig,
     store_config: StoreConfig,
+    /// スレ機能の有効/無効(Settings.livechat_enabled)。false のとき announce は検証のみ
+    /// 行い不可視(格納・伝搬しない — 006 data-model §Settings)。
+    livechat_enabled: bool,
 }
 
 impl IngestState {
@@ -48,6 +54,7 @@ impl IngestState {
             sources: SourceMap::new(),
             verify,
             store_config,
+            livechat_enabled: true,
         }
     }
 
@@ -64,7 +71,13 @@ impl IngestState {
             sources: SourceMap::new(),
             verify,
             store_config,
+            livechat_enabled: true,
         }
+    }
+
+    /// スレ機能の有効/無効を設定する(Settings.livechat_enabled — 起動時に配線側が反映)。
+    pub fn set_livechat_enabled(&mut self, enabled: bool) {
+        self.livechat_enabled = enabled;
     }
 
     /// 受信 EVENT を検証・重複判定・格納する(伝搬規則 1〜3)。
@@ -75,6 +88,29 @@ impl IngestState {
     ///
     /// `source` は受信元ピアの正規アドレス(source_peers 記録用)。
     pub fn ingest(
+        &mut self,
+        raw_json: &str,
+        source: &str,
+        now: u64,
+    ) -> Result<Option<Event>, VerifyReject> {
+        // gossip の許可 kind は {30311, 31311}(thread-events.md)。受信検証の前に
+        // 種別を軽く覗いて分岐する。kind 1311/21311 は gossip に流してはならないため
+        // 破棄し event_invalid_format として扱う(受信側規範)。未知/欠落 kind は
+        // 30311 の通常検証へ委ね、そこで形式違反として拒否させる。
+        match peek_kind(raw_json) {
+            Some(ANNOUNCE_KIND) => self.ingest_announce(raw_json, source, now),
+            Some(RES_KIND) | Some(ORDER_KIND) => {
+                // スレ配送専用の kind が gossip に載っていた → 破棄(格納・再伝搬しない)。
+                Err(VerifyReject::InvalidFormat(
+                    "livechat delivery kind not allowed on gossip",
+                ))
+            }
+            _ => self.ingest_channel(raw_json, source, now),
+        }
+    }
+
+    /// kind 30311(チャンネル掲載)の受信処理(従来経路)。
+    fn ingest_channel(
         &mut self,
         raw_json: &str,
         source: &str,
@@ -91,6 +127,44 @@ impl IngestState {
         }
 
         // 3. 格納(置換規則 + 第二の防壁)
+        let outcome = self.store.insert(event.clone());
+        if outcome.should_propagate() {
+            self.record_source(&event, source);
+            Ok(Some(event))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// kind 31311(スレ announce)の受信処理(T020 — FR-003)。
+    ///
+    /// 検証(検査 1〜7)を通した上で 30311 と同じ重複判定・置換格納・再伝搬に載せる。announce
+    /// の置換キーは `(31311, pubkey, "livechat")`(EventStore の d タグ置換で自然に処理される)。
+    ///
+    /// `livechat_enabled=false` のときは**検証だけ行い不可視**にする(格納・伝搬しない)。
+    /// この場合でも検証失敗は `Err` として返し(記録は配線側)、成功時のみ `Ok(None)` で
+    /// 不可視化する(仕様: 「announce は検証のみ・不可視」)。
+    fn ingest_announce(
+        &mut self,
+        raw_json: &str,
+        source: &str,
+        now: u64,
+    ) -> Result<Option<Event>, VerifyReject> {
+        // 1〜7. announce 受信検証(ペルソナ一致まで)。
+        let verified = verify_incoming_announce(raw_json, &self.verify, now)?;
+        let event = verified.event;
+
+        // 機能無効時は検証のみで不可視(格納・重複記録・伝搬をしない)。
+        if !self.livechat_enabled {
+            return Ok(None);
+        }
+
+        let id = event.id.to_hex();
+        // 2. 重複判定。
+        if self.dedup.check_and_insert(&id) {
+            return Ok(None);
+        }
+        // 3. 格納(置換 + 第二の防壁)。
         let outcome = self.store.insert(event.clone());
         if outcome.should_propagate() {
             self.record_source(&event, source);
@@ -190,11 +264,23 @@ impl IngestState {
     }
 }
 
+/// 直列化イベント JSON から `kind` フィールドだけを軽く覗く(署名検証前の種別分岐用)。
+///
+/// 本判定は「どの検証パイプラインへ振り分けるか」の入口にすぎず、値の真正性(署名・形式)は
+/// 各パイプラインが改めて検証する。パース不能・kind 欠落・範囲外は `None`(呼び出し側は
+/// 通常検証へ委ね、そこで形式違反として拒否させる)。
+fn peek_kind(raw_json: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+    let kind = value.get("kind")?.as_u64()?;
+    u16::try_from(kind).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::schema::{ChannelListing, ChannelStatus};
     use crate::event::store::{DedupCache, EventStore, RejectReason, StoreConfig};
+    use crate::security::SecurityCategory;
     use nostr::{JsonUtil, Keys};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -347,6 +433,115 @@ mod tests {
         assert!(st.ingest(&ended.as_json(), "p", now).unwrap().is_some());
         assert!(st.snapshot(&[]).is_empty());
         assert!(st.sync_events(0, now).is_empty());
+    }
+
+    // --- T020: gossip announce 受信検証 ------------------------------------
+
+    fn announce_channel(pubkey: &str) -> String {
+        format!("30311:{pubkey}:0123456789abcdef0123456789abcdef")
+    }
+
+    fn mk_announce(keys: &Keys, created: u64, pubkey_in_a: &str) -> Event {
+        crate::event::livechat::ThreadAnnounce {
+            channel: announce_channel(pubkey_in_a),
+            title: "実況スレ".into(),
+            generation: 1,
+            key: created,
+            res_count: Some(0),
+            tip: "198.51.100.1:7147".into(),
+        }
+        .sign(keys, created, 0)
+        .unwrap()
+    }
+
+    #[test]
+    fn announce_signer_match_stored_and_propagated() {
+        let now = 1_700_000_050;
+        let clock = Arc::new(AtomicU64::new(now));
+        let mut st = state_at(Arc::clone(&clock));
+        let keys = Keys::generate();
+        let pk = keys.public_key().to_hex();
+        let ev = mk_announce(&keys, now, &pk);
+        let out = st.ingest(&ev.as_json(), "peer:1", now).unwrap();
+        assert!(out.is_some(), "署名者一致の announce は格納・再伝搬される");
+        assert_eq!(st.store_len(), 1);
+    }
+
+    #[test]
+    fn announce_signer_mismatch_rejected_with_livechat_category() {
+        let now = 1_700_000_050;
+        let clock = Arc::new(AtomicU64::new(now));
+        let mut st = state_at(Arc::clone(&clock));
+        let keys = Keys::generate();
+        let other = Keys::generate();
+        // a タグは other、署名は keys(不一致 → 不可視)。
+        let ev = mk_announce(&keys, now, &other.public_key().to_hex());
+        let err = st.ingest(&ev.as_json(), "peer:1", now).unwrap_err();
+        assert_eq!(err.category(), SecurityCategory::LivechatAnnounceInvalid);
+        assert_eq!(st.store_len(), 0);
+    }
+
+    #[test]
+    fn livechat_res_kind_on_gossip_is_dropped() {
+        let now = 1_700_000_050;
+        let clock = Arc::new(AtomicU64::new(now));
+        let mut st = state_at(Arc::clone(&clock));
+        let keys = Keys::generate();
+        let board_id = "ab".repeat(32);
+        // kind 1311(レス)を gossip へ流す → 破棄 + event_invalid_format。
+        let res = crate::event::livechat::Res {
+            channel: announce_channel(&board_id),
+            board_id: board_id.clone(),
+            generation: 1,
+            name: None,
+            mail: None,
+            body: "本文".into(),
+        }
+        .sign(&keys, now, 0)
+        .unwrap();
+        let err = st.ingest(&res.as_json(), "peer:1", now).unwrap_err();
+        assert_eq!(err.category(), SecurityCategory::EventInvalidFormat);
+        assert_eq!(st.store_len(), 0);
+    }
+
+    #[test]
+    fn announce_invisible_when_livechat_disabled() {
+        let now = 1_700_000_050;
+        let clock = Arc::new(AtomicU64::new(now));
+        let mut st = state_at(Arc::clone(&clock));
+        st.set_livechat_enabled(false);
+        let keys = Keys::generate();
+        let pk = keys.public_key().to_hex();
+        let ev = mk_announce(&keys, now, &pk);
+        // 検証は通るが不可視(格納・伝搬しない)。
+        assert!(st.ingest(&ev.as_json(), "peer:1", now).unwrap().is_none());
+        assert_eq!(st.store_len(), 0);
+    }
+
+    #[test]
+    fn announce_disabled_still_rejects_invalid() {
+        let now = 1_700_000_050;
+        let clock = Arc::new(AtomicU64::new(now));
+        let mut st = state_at(Arc::clone(&clock));
+        st.set_livechat_enabled(false);
+        let keys = Keys::generate();
+        let other = Keys::generate();
+        // 無効時でも不正 announce は Err(記録できるように)。
+        let ev = mk_announce(&keys, now, &other.public_key().to_hex());
+        let err = st.ingest(&ev.as_json(), "peer:1", now).unwrap_err();
+        assert_eq!(err.category(), SecurityCategory::LivechatAnnounceInvalid);
+    }
+
+    #[test]
+    fn existing_channel_ingest_unaffected() {
+        // 30311 の従来経路が壊れていないこと(回帰)。
+        let now = 1_700_000_050;
+        let clock = Arc::new(AtomicU64::new(now));
+        let mut st = state_at(Arc::clone(&clock));
+        let keys = Keys::generate();
+        let e = mk(&keys, D1, now, ChannelStatus::Live, "x");
+        assert!(st.ingest(&e.as_json(), "peer:1", now).unwrap().is_some());
+        assert_eq!(st.store_len(), 1);
     }
 
     #[test]

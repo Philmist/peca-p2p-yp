@@ -341,6 +341,9 @@ pub enum VerifyReject {
     TimeSkew,
     /// 受信検証 6: PoW 難易度不足。
     PowInsufficient,
+    /// 検査 #7(announce のみ): `a` タグの `<pubkey>` が署名者と不一致(不可視 — FR-003)。
+    /// 30311 の共通検査ではなく kind 31311 の追加分岐(thread-events.md)。
+    AnnouncePersonaMismatch,
 }
 
 impl VerifyReject {
@@ -352,6 +355,8 @@ impl VerifyReject {
             VerifyReject::InvalidFormat(_) => SecurityCategory::EventInvalidFormat,
             VerifyReject::TimeSkew => SecurityCategory::EventTimeSkew,
             VerifyReject::PowInsufficient => SecurityCategory::EventPowInsufficient,
+            // ペルソナ不一致は本機能固有の意味を持つため専用カテゴリ(FR-003)。
+            VerifyReject::AnnouncePersonaMismatch => SecurityCategory::LivechatAnnounceInvalid,
         }
     }
 
@@ -363,6 +368,9 @@ impl VerifyReject {
             VerifyReject::InvalidFormat(d) => d,
             VerifyReject::TimeSkew => "created_at too far in the future",
             VerifyReject::PowInsufficient => "proof-of-work below minimum",
+            VerifyReject::AnnouncePersonaMismatch => {
+                "announce signer does not match channel persona"
+            }
         }
     }
 }
@@ -429,6 +437,95 @@ pub fn verify_incoming(
         return Err(VerifyReject::PowInsufficient);
     }
     Ok(VerifiedListing { event, listing })
+}
+
+// ---------------------------------------------------------------------------
+// kind 31311 announce の gossip 受信検証(T020 — thread-events.md 検査 #7/#8)
+// ---------------------------------------------------------------------------
+
+/// 受信検証を通過した announce イベントと復元済み写像(kind 31311)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedAnnounce {
+    /// 検証済みイベント(格納・再伝搬に使う)。
+    pub event: Event,
+    /// 復元した announce 写像(一覧表示用)。
+    pub announce: crate::event::livechat::ThreadAnnounce,
+}
+
+/// gossip 経由で受信した announce(kind 31311)を検証する(T020 — FR-003)。
+///
+/// 001 の共通検査 1〜6(サイズ→署名→形式→時刻→内容→PoW)を通した上で、announce 固有の
+/// 検査 #7 を行う:
+///
+/// - **#1 サイズ / #2 署名 / #4 時刻 / #6 PoW**: 30311 と共通(既存 [`VerifyReject`] を返し、
+///   呼び出し側で既存 `event_*` カテゴリへ写像する)。
+/// - **#3・#5 形式・内容**: [`ThreadAnnounce::from_event`] が kind=31311・`d="livechat"`・
+///   `a` 形式・`title`・`gen`/`key`・`tip` を検査する。違反は [`VerifyReject::InvalidFormat`]。
+/// - **#7 ペルソナ一致(FR-003)**: `a` タグの `<pubkey>` が署名者(`event.pubkey`)と一致
+///   しなければ [`VerifyReject::AnnouncePersonaMismatch`](不可視 — 保持・再伝搬しない)。
+/// - **#8 対象実在の緩和**: 参照先 30311 が未着でも破棄しない(到着順は保証されない)ため、
+///   本関数は 30311 の存在を要求しない(一覧表示側で live チャンネルの有無を判断する)。
+///
+/// 形式違反・ペルソナ不一致はいずれも呼び出し側で `livechat_announce_invalid` として記録する
+/// (共通検査の違反は既存 `event_*` カテゴリ — data-model §SecurityEvent の注記)。
+pub fn verify_incoming_announce(
+    raw_json: &str,
+    config: &VerifyConfig,
+    now: u64,
+) -> Result<VerifiedAnnounce, VerifyReject> {
+    use crate::event::livechat::ThreadAnnounce;
+
+    // 1. サイズ(直列化イベント全体 ≤ 16KB — 30311 と共通上限)
+    if raw_json.len() > MAX_EVENT_BYTES {
+        return Err(VerifyReject::Oversize);
+    }
+    let event = Event::from_json(raw_json)
+        .map_err(|_| VerifyReject::InvalidFormat("malformed event json"))?;
+    // 2. 署名(id・sig 検証)
+    if event.verify().is_err() {
+        return Err(VerifyReject::InvalidSig);
+    }
+    // タグ数・タグ要素長は 30311 と共通の上限で守る(過大タグの拒否)。
+    if event.tags.len() > MAX_TAGS {
+        return Err(VerifyReject::InvalidFormat("too many tags"));
+    }
+    for tag in event.tags.iter() {
+        for element in tag.as_slice() {
+            if security::exceeds_bytes(element, MAX_TAG_ELEMENT_BYTES) {
+                return Err(VerifyReject::InvalidFormat("tag element too long"));
+            }
+        }
+    }
+    // 3・5. 形式・内容(kind=31311・d・a・title・gen・key・tip)。LivechatReject を
+    //       共通の VerifyReject へ写す(内部詳細は detail 文字列のみ)。
+    let announce = ThreadAnnounce::from_event(&event).map_err(announce_reject_to_verify)?;
+    // 4. 時刻(未来方向のみ拒否 — 30311 と共通)
+    if event.created_at.as_secs() > now.saturating_add(config.max_clock_skew_sec) {
+        return Err(VerifyReject::TimeSkew);
+    }
+    // 7. ペルソナ一致(FR-003): a タグの pubkey = 署名者。
+    let channel_pubkey = announce
+        .channel
+        .strip_prefix(&format!("{CHANNEL_KIND}:"))
+        .and_then(|rest| rest.split_once(':').map(|(pk, _)| pk));
+    match channel_pubkey {
+        Some(pk) if pk == event.pubkey.to_hex() => {}
+        _ => return Err(VerifyReject::AnnouncePersonaMismatch),
+    }
+    // 6. PoW(任意 — 30311 と共通しきい値)
+    if config.min_pow_bits > 0 && !event.check_pow(config.min_pow_bits) {
+        return Err(VerifyReject::PowInsufficient);
+    }
+    Ok(VerifiedAnnounce { event, announce })
+}
+
+/// livechat 封筒の形式拒否を共通 [`VerifyReject`] へ写す(内部詳細は detail のみ)。
+fn announce_reject_to_verify(reject: crate::event::livechat::LivechatReject) -> VerifyReject {
+    use crate::event::livechat::LivechatReject;
+    match reject {
+        LivechatReject::InvalidSig => VerifyReject::InvalidSig,
+        LivechatReject::InvalidFormat(d) => VerifyReject::InvalidFormat(d),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -832,5 +929,77 @@ mod tests {
         let event = listing.sign(&keys, 1_700_000_000, 0).unwrap();
         let err = verify_incoming(&event.as_json(), &cfg(), 1_700_000_000).unwrap_err();
         assert_eq!(err.category(), SecurityCategory::EventInvalidFormat);
+    }
+
+    // --- kind 31311 announce の gossip 受信検証(T020)-----------------------
+
+    fn announce_channel(pubkey: &str) -> String {
+        format!("{CHANNEL_KIND}:{pubkey}:0123456789abcdef0123456789abcdef")
+    }
+
+    fn sample_announce(pubkey: &str) -> crate::event::livechat::ThreadAnnounce {
+        crate::event::livechat::ThreadAnnounce {
+            channel: announce_channel(pubkey),
+            title: "実況スレ".into(),
+            generation: 1,
+            key: 1_700_000_000,
+            res_count: Some(0),
+            tip: "198.51.100.1:7147".into(),
+        }
+    }
+
+    #[test]
+    fn announce_signer_match_is_visible() {
+        use nostr::JsonUtil;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let created = 1_700_000_000;
+        let event = sample_announce(&pubkey).sign(&keys, created, 0).unwrap();
+        let verified = verify_incoming_announce(&event.as_json(), &cfg(), created).unwrap();
+        assert_eq!(verified.announce.generation, 1);
+        assert_eq!(verified.event.pubkey, keys.public_key());
+    }
+
+    #[test]
+    fn announce_signer_mismatch_is_invisible() {
+        use nostr::JsonUtil;
+        // a タグの pubkey を別ペルソナにして署名者と不一致にする(FR-003)。
+        let keys = Keys::generate();
+        let other = Keys::generate();
+        let created = 1_700_000_000;
+        // channel は other の pubkey、署名は keys(不一致)。
+        let announce = sample_announce(&other.public_key().to_hex());
+        let event = announce.sign(&keys, created, 0).unwrap();
+        let err = verify_incoming_announce(&event.as_json(), &cfg(), created).unwrap_err();
+        assert_eq!(err, VerifyReject::AnnouncePersonaMismatch);
+        assert_eq!(err.category(), SecurityCategory::LivechatAnnounceInvalid);
+    }
+
+    #[test]
+    fn announce_rejects_wrong_kind() {
+        use nostr::JsonUtil;
+        // kind 30311 を announce 検証に流すと形式違反(unexpected kind)。
+        let keys = Keys::generate();
+        let event = sample_listing().sign(&keys, 1_700_000_000, 0).unwrap();
+        let err = verify_incoming_announce(&event.as_json(), &cfg(), 1_700_000_000).unwrap_err();
+        assert_eq!(err, VerifyReject::InvalidFormat("unexpected kind"));
+    }
+
+    #[test]
+    fn announce_rejects_tampered_signature() {
+        use nostr::JsonUtil;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let event = sample_announce(&pubkey)
+            .sign(&keys, 1_700_000_000, 0)
+            .unwrap();
+        // content(空)を改竄すると id 再計算が合わず署名検証に失敗する。
+        let raw = event
+            .as_json()
+            .replace("\"content\":\"\"", "\"content\":\"x\"");
+        assert_eq!(
+            verify_incoming_announce(&raw, &cfg(), 1_700_000_000),
+            Err(VerifyReject::InvalidSig)
+        );
     }
 }
