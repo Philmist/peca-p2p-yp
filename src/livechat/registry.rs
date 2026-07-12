@@ -11,18 +11,23 @@
 //!   (FR-015)であり本レジストリのメモリ内にのみ存在する。
 //! - **判定**: THREAD_JOIN の受理可否([`HostThread::decide_join`])と、WELCOME 後に送出すべき
 //!   同期フレーム列([`crate::p2p::frame::Message`])の生成。
-//! - **非責務**: トランスポート I/O・ブロードキャストの実送信は配線側(runtime/hub)。採番
-//!   (シーケンサ)は US2(T030)であり本レジストリは**確定済みレスの seed** のみ提供する。
+//! - **採番(シーケンサ — T030)**: 参加者からの RES を受信検証後に一意採番し
+//!   ([`LivechatRegistry::accept_write`])、ORDER(kind 21311)を発行して RES + ORDER を
+//!   全接続参加者の outbox へ配布する(FR-007・不変条件 T3/O1 — PlusCal モデル対応)。
+//! - **非責務**: トランスポート I/O(TCP)は配線側(runtime)。本レジストリは参加者の outbox
+//!   ([`tokio::sync::mpsc::UnboundedSender`])を保持し、そこへメッセージを流すところまで。
 //!
-//! ## US1 スコープ
+//! ## 採番の単点性(Principle V / PlusCal 検査対象)
 //!
-//! 読み取り/同期に限定する。参加者からの RES(書き込み)受理・採番・ORDER 発行は US2 で
-//! 本レジストリの上に構築する(受け口メモは runtime 側へ引き継ぐ)。
+//! [`accept_write`](LivechatRegistry::accept_write) は docs/formal/livechat_sequencer.tla の
+//! HostProcess「採番」遷移に対応し、重複排除(D1)・上限(T3)・状態(T1)ガードを TLC で
+//! 検査済みの不変条件どおりに実装する(各メソッドの意図コメント参照)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use nostr::{Event, Keys};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::event::livechat::{
     self, LivechatBuildError, OrderEntry, OrderInfo as OrderEnvelope, Res as ResEnvelope,
@@ -48,6 +53,14 @@ struct HostEntry {
     res_events: HashMap<String, Event>,
     /// 発行済み ORDER の署名済みイベント(seq → kind 21311)。同期再送で ORDER フレームへ写す。
     order_events: HashMap<u32, Event>,
+    /// **採番済みイベント id の集合(板単位・世代跨ぎ)**。設計制約 D1(PlusCal
+    /// `AssignedIds` / `w.id \notin AssignedIds` ガード)の実装。参加者は確定通知(ORDER)を
+    /// 受け取る前に切断されると同一イベントを再送しうるため、これで重複採番を排除しないと
+    /// 同一イベントが二つの res_no を得て AssignedOnce(不変条件 O1)が破れる。
+    assigned_ids: HashSet<String>,
+    /// 接続中参加者の送信口(peer_id → outbox)。採番した RES + ORDER をここへ配布する
+    /// (registry → outbox。PlusCal の `chan[p]` への Append に対応)。
+    outboxes: HashMap<String, UnboundedSender<WireMessage>>,
 }
 
 /// スレ seed(確定レス投入)・接続受理の失敗理由。`Display` は内部情報を漏らさない。
@@ -84,6 +97,18 @@ pub struct JoinOutcome {
     pub frames: Vec<WireMessage>,
     /// 受理されたか(true なら配線側が participant を登録し接続を維持する)。
     pub accepted: bool,
+}
+
+/// 参加者からの RES 採番([`LivechatRegistry::accept_write`])の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// 採番して RES + ORDER を配布した。`res_no` は割り当てたレス番号、`seq` は ORDER の連番。
+    Numbered { res_no: u16, seq: u32 },
+    /// 既採番の event_id(再送)。採番も配布もしない(設計制約 D1 — O1 を保つ)。
+    Duplicate,
+    /// 採番せず定型拒否(非 Active・対象スレ不一致・res_limit 到達)。配線側は
+    /// `livechat_write_rejected` を記録しうるが応答で理由を開示しない(FR-006)。
+    Rejected,
 }
 
 /// ホストレジストリ(板ごとの [`HostThread`] を共有保持する)。
@@ -139,6 +164,8 @@ impl LivechatRegistry {
                 tip: tip.into(),
                 res_events: HashMap::new(),
                 order_events: HashMap::new(),
+                assigned_ids: HashSet::new(),
+                outboxes: HashMap::new(),
             },
         );
         Ok(())
@@ -226,6 +253,7 @@ impl LivechatRegistry {
         let order_event = envelope
             .sign(&entry.persona, created_at)
             .map_err(RegistryError::Build)?;
+        entry.assigned_ids.insert(event_id.clone());
         entry.res_events.insert(event_id, res_event.clone());
         entry.order_events.insert(order.seq, order_event);
         Ok(res_no)
@@ -356,17 +384,130 @@ impl LivechatRegistry {
         entry.host.thread.check_writable().is_ok()
     }
 
+    /// 参加者からの RES を採番し、RES + ORDER を全接続参加者へ配布する(T030 — シーケンサ)。
+    ///
+    /// **PlusCal モデル(docs/formal/livechat_sequencer.tla)の HostProcess「採番」遷移に対応**。
+    /// TLC で検査済みの不変条件 AssignedOnce(O1)・NoOverLimit・DisplayPrefix(T3)を保つよう、
+    /// 以下の順序・ガードを厳守する(モデルの `await` 節と 1:1):
+    ///
+    /// 1. **対象スレ一致 + 状態(T1)**: 封筒の board_id・世代が本ホストの Active スレと一致し、
+    ///    スレが Active であること(モデル `phase = "active"`)。不一致・非 Active は
+    ///    [`AcceptOutcome::Rejected`]。
+    /// 2. **重複排除(設計制約 D1 — `w.id \notin AssignedIds`)**: event_id が板単位で既採番なら
+    ///    採番せず [`AcceptOutcome::Duplicate`](再送 × 切断で二重採番が起きるのを防ぐ — O1)。
+    /// 3. **上限(NoOverLimit / T3 — `RoomInActive`)**: 次 res_no が res_limit を超えるなら
+    ///    採番せず [`AcceptOutcome::Rejected`](次スレ移行は US5/T047)。
+    /// 4. **採番(単点性 — Principle V)**: [`Thread::confirm`] で res_no を 1 つ割り当てる
+    ///    (T3 を強制)。ORDER(kind 21311・seq 連番)をスレ主鍵で署名する。
+    /// 5. **配布(`chan[p]` への Append)**: RES + ORDER を **全接続参加者(送信者含む)** の
+    ///    outbox へ seq 順に送る。切断済み outbox への送信失敗は無視する(unregister は配線側)。
+    ///
+    /// 署名検証・形式・BAN・PoW・レートの受信検証(1〜7)は呼び出し前に
+    /// [`Self::verify_incoming_res`] 等で済ませてある前提(モデル境界 — ADR-0014 §2)。
+    /// 本メソッドは検証通過後の**採番判定のみ**をモデル化する。
+    pub fn accept_write(
+        &self,
+        board_id: &str,
+        res_event: &Event,
+        created_at: u64,
+    ) -> Result<AcceptOutcome, RegistryError> {
+        let envelope =
+            ResEnvelope::from_event(res_event).map_err(|_| RegistryError::UnknownBoard)?;
+        let mut hosts = lock(&self.hosts);
+        let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
+
+        // 1. 対象スレ一致 + 状態(T1 — phase = active)。
+        if envelope.board_id != entry.host.thread.board_id
+            || envelope.generation != entry.host.thread.generation
+            || entry.host.thread.check_writable().is_err()
+        {
+            return Ok(AcceptOutcome::Rejected);
+        }
+
+        let event_id = res_event.id.to_hex();
+        // 2. 重複排除(D1 — w.id \notin AssignedIds)。既採番は No-op(採番も配布もしない)。
+        if entry.assigned_ids.contains(&event_id) {
+            return Ok(AcceptOutcome::Duplicate);
+        }
+        // 3. 上限(NoOverLimit / T3 — RoomInActive)。
+        if entry.host.thread.next_res_no() > entry.host.thread.res_limit {
+            return Ok(AcceptOutcome::Rejected);
+        }
+
+        // 4. 採番(単点性)。confirm が T3(res_no 欠番なし単調増加・上限)を強制する。
+        let res_no = entry.host.thread.next_res_no();
+        let domain = Res {
+            event_id: event_id.clone(),
+            board_key: res_event.pubkey.to_hex(),
+            name: envelope.name.clone(),
+            mail: envelope.mail.clone(),
+            body: envelope.body.clone(),
+            created_at: res_event.created_at.as_secs() as i64,
+            res_no: None,
+            pending: false,
+        };
+        entry
+            .host
+            .thread
+            .confirm(domain, res_no)
+            .map_err(RegistryError::Confirm)?;
+
+        // ORDER(seq 連番)をスレ主ペルソナ鍵で署名する(1 採番 = 1 ORDER entry)。
+        let order = entry.host.record_order(vec![(res_no, event_id.clone())]);
+        let order_env = OrderEnvelope {
+            board_id: board_id.to_string(),
+            generation: entry.host.thread.generation,
+            seq: order.seq,
+            entries: vec![OrderEntry {
+                res_no,
+                event_id: event_id.clone(),
+            }],
+        };
+        let order_event = order_env
+            .sign(&entry.persona, created_at)
+            .map_err(RegistryError::Build)?;
+
+        // キャッシュ + 採番済み集合へ記録(D1・再送同期の再生に使う)。
+        entry.assigned_ids.insert(event_id.clone());
+        entry.res_events.insert(event_id, res_event.clone());
+        entry.order_events.insert(order.seq, order_event.clone());
+
+        // 5. 配布: RES + ORDER を全接続参加者(送信者含む)の outbox へ seq 順に送る。
+        let res_msg = res_event_to_message(res_event);
+        let order_msg = order_event_to_message(&order_event);
+        for tx in entry.outboxes.values() {
+            // 送信失敗(受信側キュー破棄 = 切断途上)は無視する。unregister は配線側(pump)。
+            let _ = tx.send(res_msg.clone());
+            let _ = tx.send(order_msg.clone());
+        }
+
+        Ok(AcceptOutcome::Numbered {
+            res_no,
+            seq: order.seq,
+        })
+    }
+
     /// 参加者を登録する(WELCOME 送出成功後に配線側が呼ぶ)。
-    pub fn register_participant(&self, board_id: &str, peer_id: &str) {
+    ///
+    /// `outbox` は当該接続への送信口。採番した RES + ORDER のブロードキャスト先になる
+    /// (registry → outbox — T030 の配布配線)。
+    pub fn register_participant(
+        &self,
+        board_id: &str,
+        peer_id: &str,
+        outbox: UnboundedSender<WireMessage>,
+    ) {
         if let Some(entry) = lock(&self.hosts).get_mut(board_id) {
             entry.host.register_participant(peer_id);
+            entry.outboxes.insert(peer_id.to_string(), outbox);
         }
     }
 
-    /// 参加者の登録を解除する(切断時)。
+    /// 参加者の登録を解除する(切断時)。outbox も除去する。
     pub fn unregister_participant(&self, board_id: &str, peer_id: &str) {
         if let Some(entry) = lock(&self.hosts).get_mut(board_id) {
             entry.host.unregister_participant(peer_id);
+            entry.outboxes.remove(peer_id);
         }
     }
 
@@ -538,7 +679,8 @@ mod tests {
         let p = persona();
         let board_id = p.public_key().to_hex();
         let reg = registry_with_thread(&p, 1);
-        reg.register_participant(&board_id, "peer-a");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-a", tx);
         let challenge = crate::livechat::session::generate_challenge();
         let outcome = reg.handle_join(&format!("{board_id}:1"), &challenge, 0);
         assert!(!outcome.accepted);
@@ -676,5 +818,212 @@ mod tests {
     fn build_announce_events_empty_without_threads() {
         let reg = LivechatRegistry::new(128);
         assert!(reg.build_announce_events(1_700_000_000, 0).is_empty());
+    }
+
+    // --- T030: ホストシーケンサ(採番・配布)-------------------------------
+
+    #[test]
+    fn accept_write_numbers_and_broadcasts_to_all_participants() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        // 2 名の参加者を outbox 付きで登録(送信者含む全員へ配布されることを確認)。
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx1);
+        reg.register_participant(&board_id, "peer-2", tx2);
+
+        let board_key = Keys::generate();
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "書き込み",
+            1_700_000_010,
+        )
+        .unwrap();
+        let outcome = reg.accept_write(&board_id, &res, 1_700_000_010).unwrap();
+        assert_eq!(outcome, AcceptOutcome::Numbered { res_no: 1, seq: 1 });
+
+        // 両参加者へ RES + ORDER が seq 順に配布される。
+        for rx in [&mut rx1, &mut rx2] {
+            assert!(
+                matches!(rx.try_recv(), Ok(WireMessage::Res { .. })),
+                "RES 配布"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(WireMessage::Order { .. })),
+                "ORDER 配布"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_write_dedups_resent_event() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "本文",
+            1_700_000_010,
+        )
+        .unwrap();
+        // 初回は採番、同一 event_id の再送は Duplicate(D1 — O1 を保つ)。
+        assert_eq!(
+            reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+            AcceptOutcome::Numbered { res_no: 1, seq: 1 }
+        );
+        assert_eq!(
+            reg.accept_write(&board_id, &res, 1_700_000_011).unwrap(),
+            AcceptOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn accept_write_assigns_consecutive_res_no() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        for (i, expected) in [(1u64, 1u16), (2, 2), (3, 3)] {
+            let res = sign_res(
+                &board_key,
+                &board_id,
+                &channel_of(&board_id),
+                1,
+                &format!("本文{i}"),
+                1_700_000_010 + i,
+            )
+            .unwrap();
+            let outcome = reg
+                .accept_write(&board_id, &res, 1_700_000_010 + i)
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AcceptOutcome::Numbered {
+                    res_no: expected,
+                    seq: expected as u32
+                },
+                "res_no・seq は欠番なく連番(T3/O2)"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_write_rejects_when_over_res_limit() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        // res_limit=100 の下限で開設(BoardSettings 既定は 1000 だが、確実に上限へ到達させる
+        // ため小さいスレを直接組む)。
+        let reg = LivechatRegistry::new(128);
+        let settings = BoardSettings {
+            res_limit: 100,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        // 上限まで採番を埋める。
+        let board_key = Keys::generate();
+        for i in 0..100u64 {
+            let res = sign_res(
+                &board_key,
+                &board_id,
+                &channel_of(&board_id),
+                1,
+                &format!("r{i}"),
+                1_700_000_010 + i,
+            )
+            .unwrap();
+            assert!(matches!(
+                reg.accept_write(&board_id, &res, 1_700_000_010 + i)
+                    .unwrap(),
+                AcceptOutcome::Numbered { .. }
+            ));
+        }
+        // 101 件目は上限超過で Rejected(NoOverLimit / T3)。
+        let over = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "溢れ",
+            1_700_000_200,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &over, 1_700_000_200).unwrap(),
+            AcceptOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn accept_write_rejects_when_frozen() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        {
+            let mut hosts = lock(&reg.hosts);
+            hosts
+                .get_mut(&board_id)
+                .unwrap()
+                .host
+                .thread
+                .freeze()
+                .unwrap();
+        }
+        let board_key = Keys::generate();
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "凍結後",
+            1_700_000_010,
+        )
+        .unwrap();
+        // 非 Active(Frozen)への書き込みは採番されない(T1）。
+        assert_eq!(
+            reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+            AcceptOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn accept_write_unregistered_participant_not_broadcast() {
+        // 切断で unregister した参加者へは配布されない(outbox 除去)。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx);
+        reg.unregister_participant(&board_id, "peer-1");
+
+        let board_key = Keys::generate();
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "本文",
+            1_700_000_010,
+        )
+        .unwrap();
+        reg.accept_write(&board_id, &res, 1_700_000_010).unwrap();
+        // 登録解除済みなので何も届かない。
+        assert!(rx.try_recv().is_err());
     }
 }

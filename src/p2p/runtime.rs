@@ -871,8 +871,10 @@ impl P2pRuntime {
                 }
                 if outcome.accepted {
                     // board_id は `<board_id>:<gen>` の先頭。参加者として登録し接続維持。
+                    // outbox を渡すことで、以後の採番 RES + ORDER が本接続へ配布される
+                    // (registry → outbox — T030 のブロードキャスト配線)。
                     let board_id = thread.split_once(':').map(|(b, _)| b).unwrap_or("");
-                    registry.register_participant(board_id, addr);
+                    registry.register_participant(board_id, addr, outbox_tx.clone());
                     *thread_board = Some(board_id.to_string());
                     true
                 } else {
@@ -897,21 +899,37 @@ impl P2pRuntime {
                 let Some(board_id) = thread_board.clone() else {
                     return false;
                 };
-                // FR-007/FR-011 の配線層強制: 封筒署名・形式・対象スレ一致を検証する
-                // (採番・配布は US2 の T030)。不正は livechat_write_rejected を記録して破棄
-                // (応答で理由を開示しない — FR-006。前方互換のため切断はしない)。
+                // FR-007/FR-011 の配線層強制: 封筒署名・形式・対象スレ一致を検証する。
+                // 検証通過分は accept_write(T030 シーケンサ)で採番し RES + ORDER を全参加者へ
+                // 配布する。不正・採番拒否は livechat_write_rejected を記録して破棄(応答で理由を
+                // 開示しない — FR-006。前方互換のため切断はしない)。
                 let raw = event.to_string();
-                let verified = nostr::Event::from_json(&raw)
+                let parsed = nostr::Event::from_json(&raw)
                     .ok()
                     .filter(|ev| registry.verify_incoming_res(&board_id, ev));
-                if verified.is_none() {
-                    self.security.log(
-                        SecurityCategory::LivechatWriteRejected,
-                        addr,
-                        "res failed signature or format verification",
-                    );
+                match parsed {
+                    Some(ev) => {
+                        // 採番・配布(重複は No-op、非 Active/満杯は Rejected)。
+                        match registry.accept_write(&board_id, &ev, unix_now_u64()) {
+                            Ok(crate::livechat::registry::AcceptOutcome::Numbered { .. })
+                            | Ok(crate::livechat::registry::AcceptOutcome::Duplicate) => {}
+                            Ok(crate::livechat::registry::AcceptOutcome::Rejected) | Err(_) => {
+                                self.security.log(
+                                    SecurityCategory::LivechatWriteRejected,
+                                    addr,
+                                    "res rejected: not active or over limit",
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        self.security.log(
+                            SecurityCategory::LivechatWriteRejected,
+                            addr,
+                            "res failed signature or format verification",
+                        );
+                    }
                 }
-                // US1 は読み取りのみ: 妥当でも採番せず破棄する(採番は US2)。
                 true
             }
             // その他のスレメッセージ(ホスト→参 の種別が参→ホ 方向に来た等)は無視する
