@@ -77,6 +77,15 @@ pub enum ThreadResponse {
         board_settings: Value,
         res_count: u32,
     },
+    /// 受理(動的署名 WELCOME)。受信した challenge にスレ主鍵で正しく署名した WELCOME を
+    /// 返す(参加者ドライバの実チャレンジ検証 — T018 契約テスト)。`board_id` は
+    /// `persona.public_key()`、`generation` は署名対象の一部。
+    DynamicWelcome {
+        persona: nostr::Keys,
+        generation: u32,
+        board_settings: Value,
+        res_count: u32,
+    },
     /// 定型拒否(THREAD_REJECT を返す。reason は `thread_reject_reason` の定数)。
     Reject { reason: String },
 }
@@ -303,9 +312,12 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
                     shared.received_thread.lock().unwrap().push(frame.message.clone());
                 }
                 match frame.message {
-                    Message::ThreadJoin { .. } => {
+                    Message::ThreadJoin { ref challenge, .. } => {
                         // 設定された応答(WELCOME/REJECT)を返す。WELCOME 後は served を初期同期。
-                        if !respond_thread_join(&mut writer, &shared).await {
+                        // host_key が設定されていれば、受信 challenge にスレ主鍵で動的署名した
+                        // WELCOME を返す(参加者ドライバの実チャレンジ検証の契約テスト用)。
+                        let challenge = challenge.clone();
+                        if !respond_thread_join(&mut writer, &shared, &challenge).await {
                             break;
                         }
                     }
@@ -358,11 +370,15 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
 async fn respond_thread_join(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     shared: &Shared,
+    challenge: &str,
 ) -> bool {
     let Some(response) = shared.thread_response.lock().unwrap().clone() else {
         return true;
     };
-    let is_welcome = matches!(response, ThreadResponse::Welcome { .. });
+    let is_welcome = matches!(
+        response,
+        ThreadResponse::Welcome { .. } | ThreadResponse::DynamicWelcome { .. }
+    );
     let reply = match response {
         ThreadResponse::Welcome {
             thread,
@@ -375,6 +391,25 @@ async fn respond_thread_join(
             board_settings,
             res_count,
         },
+        ThreadResponse::DynamicWelcome {
+            persona,
+            generation,
+            board_settings,
+            res_count,
+        } => {
+            // 受信 challenge にスレ主鍵で動的署名する(参加者側の実検証を通す)。
+            let board_id = persona.public_key().to_hex();
+            let sig = peca_p2p_yp::livechat::host::sign_welcome(
+                &persona, challenge, &board_id, generation,
+            )
+            .expect("動的 WELCOME 署名");
+            Message::ThreadWelcome {
+                thread: format!("{board_id}:{generation}"),
+                sig,
+                board_settings,
+                res_count,
+            }
+        }
         ThreadResponse::Reject { reason } => Message::ThreadReject { reason },
     };
     if write_frame(writer, &reply).await.is_err() {

@@ -131,6 +131,8 @@ async fn run() -> Result<(), i32> {
         store_config,
         verify,
     );
+    // スレ機能無効時は gossip 受信の announce(kind 31311)を不可視化する(006 data-model)。
+    hub.set_livechat_enabled(settings.livechat_enabled);
 
     // 9. 起動時 nonce(自己接続検出用)。
     let nonce: u64 = rand::random();
@@ -185,14 +187,22 @@ async fn run() -> Result<(), i32> {
     };
 
     // 12. P2P ランタイム起動(ハブへ受信処理・SYNC・再伝搬を委譲)。
+    // スレ配送(006-livechat-thread): livechat_enabled のときホストレジストリを配線する。
+    // 無効時は None を渡し、THREAD_JOIN を定型 unknown_thread で拒否する(FR-006)。
     let has_listener = !p2p_listeners.is_empty();
-    let runtime = Arc::new(P2pRuntime::new(
+    let livechat = settings.livechat_enabled.then(|| {
+        peca_p2p_yp::livechat::registry::LivechatRegistry::new(
+            settings.thread_max_participants as usize,
+        )
+    });
+    let runtime = Arc::new(P2pRuntime::new_with_livechat(
         Arc::clone(&peers),
         Arc::clone(&security),
         Arc::clone(&hub),
         nonce,
         listen_port,
         settings.pex_enabled,
+        livechat,
     ));
     // 全ピア到達不能状態と回復通知の共有ハンドル(status API・回復再発行と共有 — T047/T048)。
     let reachability = runtime.reachability();

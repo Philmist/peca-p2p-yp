@@ -64,6 +64,10 @@ name = "event_30311"
 path = "tests/contract/event_30311.rs"
 
 [[test]]
+name = "thread_delivery"
+path = "tests/contract/thread_delivery.rs"
+
+[[test]]
 name = "key_envelope"
 path = "tests/contract/key_envelope.rs"
 

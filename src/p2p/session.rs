@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::p2p::frame::{Hello, Message, close_reason, thread_reject_reason};
+use crate::p2p::frame::{Hello, Message, close_reason};
 use crate::security::{SecurityCategory, SecurityLog};
 
 /// プロトコルバージョン(v1)。互換判定は完全一致。
@@ -137,8 +137,10 @@ enum SessionKind {
     Gossip,
     /// スレセッション(THREAD_JOIN で開始)。
     ///
-    /// スレセッション本体(採番・配布)は未実装(T021/T022 以降)のため、
-    /// v1 では [`Session`] が定型 THREAD_REJECT を返して切断するスタブに留まる。
+    /// スレメッセージ(THREAD_JOIN/RES/RESEND_REQ 等)は上位([`crate::p2p::runtime`] +
+    /// [`crate::livechat::registry`])へ [`SessionAction::Deliver`] で委譲する。受理判定・
+    /// 同期・配布の実体は配線側が担い、本セッションは 1 用途原則(スレ接続に gossip 専用
+    /// メッセージが混在したら不正フレーム切断)のみ強制する。
     Thread,
 }
 
@@ -520,12 +522,13 @@ impl Session {
         }
     }
 
-    /// スレセッションの受け口(T014 スタブ)。
+    /// スレセッションの受け口(T021/T022/T023 配線)。
     ///
-    /// スレセッション本体(採番・配布 — T021/T022 以降)は未実装のため、v1 では
-    /// `THREAD_JOIN` に対し定型 `THREAD_REJECT(unknown_thread)` を返して `CLOSE(going_away)`
-    /// で切断する安全なスタブとする。以後の gossip 専用メッセージ(EVENT/SYNC_REQ 等)が
-    /// スレ接続に混在した場合も不正フレームとして切断する(1 用途原則)。
+    /// スレメッセージ(THREAD_JOIN/RES/RESEND_REQ/THREAD_* 等)は上位
+    /// ([`crate::p2p::runtime`] が [`crate::livechat::registry`] と連携)へ
+    /// [`SessionAction::Deliver`] で委譲する。受理判定(WELCOME/REJECT)・接続時同期・
+    /// 配布の実体は配線側が担う。本セッションは 1 用途原則のみ強制する: スレ接続に
+    /// gossip 専用メッセージ(EVENT/SYNC_REQ 等)が混在したら不正フレームとして切断する。
     fn handle_thread_session(
         &mut self,
         message: Message,
@@ -533,23 +536,7 @@ impl Session {
         if !is_thread_message(&message) {
             return self.fail_invalid_frame();
         }
-        match message {
-            Message::ThreadJoin { .. } => {
-                self.state = SessionState::Closed;
-                Ok(vec![
-                    SessionAction::Send(Message::ThreadReject {
-                        reason: thread_reject_reason::UNKNOWN_THREAD.into(),
-                    }),
-                    SessionAction::Send(Message::Close {
-                        reason: close_reason::GOING_AWAY.into(),
-                    }),
-                ])
-            }
-            // THREAD_JOIN 以外のスレメッセージが最初に届くことはない(Unclassified からの
-            // 分岐は THREAD_JOIN のみで Thread へ遷移するため)。以後の同一接続上の
-            // 追加メッセージも本スタブでは受け付けない。
-            _ => self.fail_invalid_frame(),
-        }
+        Ok(vec![SessionAction::Deliver(message)])
     }
 
     fn fail_invalid_frame(&mut self) -> Result<Vec<SessionAction>, Disconnect> {
@@ -722,30 +709,51 @@ mod tests {
 
     #[test]
     fn established_first_message_thread_join_routes_to_thread_session() {
-        // established 後の最初のメッセージが THREAD_JOIN ならスレセッションへ分岐する
-        // (contracts/thread-delivery.md §トランスポート)。本スタブは定型
-        // THREAD_REJECT(unknown_thread) + CLOSE(going_away) を返す。
+        // established 後の最初のメッセージが THREAD_JOIN ならスレセッションへ分岐し、
+        // 上位(runtime + registry)へ委譲する(contracts/thread-delivery.md §トランスポート)。
         let mut s = Session::new_inbound(cfg(1), "p:20".into(), None);
         s.on_frame(64, hello(1, 3)).unwrap();
-        let actions = s
-            .on_frame(
-                32,
-                Message::ThreadJoin {
-                    thread: "board:1".into(),
-                    challenge: "deadbeef".into(),
-                    since_seq: 0,
-                },
-            )
-            .unwrap();
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            SessionAction::Send(Message::ThreadReject { reason })
-                if reason == thread_reject_reason::UNKNOWN_THREAD
-        )));
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            SessionAction::Send(Message::Close { reason }) if reason == close_reason::GOING_AWAY
-        )));
+        let join = Message::ThreadJoin {
+            thread: "board:1".into(),
+            challenge: "deadbeef".into(),
+            since_seq: 0,
+        };
+        let actions = s.on_frame(32, join.clone()).unwrap();
+        // THREAD_JOIN は Deliver で上位へ委譲される(受理判定は配線側の責務)。
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::Deliver(m) if *m == join)),
+            "THREAD_JOIN は Deliver される: {actions:?}"
+        );
+        // セッションは維持される(スレメッセージの継続受信のため)。
+        assert_eq!(s.state(), SessionState::Established);
+    }
+
+    #[test]
+    fn thread_session_delivers_subsequent_thread_messages() {
+        // スレ確定後、続く RES/RESEND_REQ 等のスレメッセージも Deliver で委譲する。
+        let mut s = Session::new_inbound(cfg(1), "p:25".into(), None);
+        s.on_frame(64, hello(1, 3)).unwrap();
+        s.on_frame(
+            32,
+            Message::ThreadJoin {
+                thread: "board:1".into(),
+                challenge: "deadbeef".into(),
+                since_seq: 0,
+            },
+        )
+        .unwrap();
+        let resend = Message::ResendReq {
+            from_seq: 1,
+            to_seq: 2,
+        };
+        let actions = s.on_frame(16, resend.clone()).unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::Deliver(m) if *m == resend))
+        );
     }
 
     #[test]
@@ -782,9 +790,9 @@ mod tests {
 
     #[test]
     fn gossip_message_mixed_into_thread_session_disconnects() {
-        // スレセッション確定後に gossip 専用メッセージが混在したら不正フレームとして切断する。
-        // THREAD_JOIN スタブは 1 通目で state を Closed にするため、同一セッションでの
-        // 追加フレーム受信を模すため新規セッションで種別のみ Thread へ導いて検証する。
+        // スレセッション確定後に gossip 専用メッセージが混在したら不正フレームとして切断する
+        // (1 TCP 接続 = 1 用途)。THREAD_JOIN でスレへ確定させた後、gossip 専用の
+        // GET_PEERS を送ると不正フレームになる。
         let mut s = Session::new_inbound(cfg(1), "p:23".into(), None);
         s.on_frame(64, hello(1, 3)).unwrap();
         s.on_frame(
@@ -796,10 +804,9 @@ mod tests {
             },
         )
         .unwrap();
-        // スタブは THREAD_JOIN 1 通目で Closed にするため、以後の受信は
-        // 既存の「Closed 状態は不正フレーム」経路(検査済み)で切断される。
         let err = s.on_frame(16, Message::GetPeers).unwrap_err();
         assert_eq!(err.category, Some(SecurityCategory::P2pInvalidFrame));
+        assert_eq!(s.state(), SessionState::Closed);
     }
 
     #[test]

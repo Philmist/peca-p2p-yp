@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::p2p::frame::{Message, close_reason, read_frame, write_frame};
+use crate::p2p::frame::{Message, close_reason, read_frame, thread_reject_reason, write_frame};
 use crate::p2p::hub::GossipHub;
 use crate::p2p::peers::{
     CandidateMode, InboundOutcome, OutboundOutcome, PeerAddr, PeerManager, ReachabilityState,
@@ -37,6 +37,8 @@ use crate::p2p::session::{
 use crate::p2p::sync::{self, SyncCounter};
 use crate::security::{SecurityCategory, SecurityLog};
 use crate::store::PeerSource;
+
+use crate::livechat::registry::LivechatRegistry;
 
 /// 外向き接続維持ループの周期。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -87,6 +89,9 @@ pub struct P2pRuntime {
     backoff: Mutex<HashMap<String, f64>>,
     /// 全ピア到達不能状態と回復通知(T047 / US3)。status API・再発行タスクと共有。
     reachability: Arc<ReachabilityState>,
+    /// スレ配送のホストレジストリ(006-livechat-thread)。`None` はスレ機能無効
+    /// (livechat_enabled=false)で、THREAD_JOIN は定型 `unknown_thread` で拒否する。
+    livechat: Option<Arc<LivechatRegistry>>,
     /// 単調時刻の基点。
     start: Instant,
 }
@@ -143,6 +148,24 @@ impl P2pRuntime {
         listen_port: u16,
         pex_enabled: bool,
     ) -> Self {
+        Self::new_with_livechat(peers, security, hub, nonce, listen_port, pex_enabled, None)
+    }
+
+    /// スレ配送のホストレジストリを配線して作る(006-livechat-thread)。
+    ///
+    /// `livechat` が `Some` のとき、スレセッション(THREAD_JOIN 等)を当該レジストリへ
+    /// 配線する。`None`(スレ機能無効)なら THREAD_JOIN は定型 `unknown_thread` REJECT で
+    /// 拒否する(内部情報を開示しない — FR-006)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_livechat(
+        peers: Arc<PeerManager>,
+        security: Arc<SecurityLog>,
+        hub: Arc<GossipHub>,
+        nonce: u64,
+        listen_port: u16,
+        pex_enabled: bool,
+        livechat: Option<Arc<LivechatRegistry>>,
+    ) -> Self {
         Self {
             peers,
             security,
@@ -152,6 +175,7 @@ impl P2pRuntime {
             pex_enabled,
             backoff: Mutex::new(HashMap::new()),
             reachability: ReachabilityState::new(),
+            livechat,
             start: Instant::now(),
         }
     }
@@ -159,6 +183,11 @@ impl P2pRuntime {
     /// 共有ハブへの参照(main 配線・status API 用)。
     pub fn hub(&self) -> &Arc<GossipHub> {
         &self.hub
+    }
+
+    /// スレ配送のホストレジストリ(main 配線・announce 発行タスク用)。
+    pub fn livechat(&self) -> Option<&Arc<LivechatRegistry>> {
+        self.livechat.as_ref()
     }
 
     /// 全ピア到達不能状態と回復通知の共有ハンドル(status API・再発行タスク用 — T047)。
@@ -468,6 +497,9 @@ impl P2pRuntime {
         // established 後に正常終了(相手 CLOSE / EOF / ローカル shutdown)したら true。
         // 異常切断(keepalive 無応答・I/O・違反)は false のままとし fail_count に反映する。
         let mut clean = false;
+        // スレセッション(006-livechat-thread)で登録済みの board_id。切断時に participant を
+        // 登録解除するため保持する。`None` は未 join(または gossip セッション)。
+        let mut thread_board: Option<String> = None;
         // 送信キュー: 他接続からの再伝搬・PONG・SYNC 応答の平滑送信を本接続へ流す。
         let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Message>();
         let mut conn_id: Option<u64> = None;
@@ -579,7 +611,14 @@ impl P2pRuntime {
                                         }
                                     }
                                     SessionAction::Deliver(msg) => {
-                                        if !self.handle_deliver(msg, addr, conn_id, &outbox_tx, &mut sync_counter, &sync_in_flight).await {
+                                        // スレメッセージ(006-livechat-thread)は registry 経由で
+                                        // 処理する。gossip メッセージは従来の handle_deliver へ。
+                                        let cont = if is_thread_message(&msg) {
+                                            self.handle_thread_deliver(msg, addr, &outbox_tx, &mut thread_board)
+                                        } else {
+                                            self.handle_deliver(msg, addr, conn_id, &outbox_tx, &mut sync_counter, &sync_in_flight).await
+                                        };
+                                        if !cont {
                                             stop = true;
                                             break;
                                         }
@@ -625,6 +664,10 @@ impl P2pRuntime {
         }
         if let Some(id) = conn_id {
             self.hub.unregister_peer(id);
+        }
+        // スレ参加者として登録済みなら登録解除する(凍結判定は参加者側 — FR-014)。
+        if let (Some(board_id), Some(registry)) = (&thread_board, &self.livechat) {
+            registry.unregister_participant(board_id, addr);
         }
         match (established, clean) {
             (false, _) => PumpEnd::HandshakeFailed,
@@ -744,6 +787,76 @@ impl P2pRuntime {
         }
     }
 
+    /// スレセッションの受信メッセージを処理する(006-livechat-thread — ホスト側配線)。
+    ///
+    /// `thread_board` は本接続が join 済みの board_id(登録済みなら `Some`)。処理結果として
+    /// 参加者へ送出すべきフレームを **outbox 経由**で流し、接続継続可否を返す:
+    ///
+    /// - **THREAD_JOIN**: registry で受理判定 + 同期フレームを生成して送出。受理なら participant
+    ///   を登録し `thread_board` を記録して接続維持。REJECT なら送出後に切断(能動 CLOSE)。
+    /// - **RESEND_REQ**: join 済みなら registry から範囲を再送。未 join は不正フレームで切断。
+    /// - **RES**(参→ホ 書き込み): US1 は読み取りのみのため採番せず黙って受理(前方互換で
+    ///   切断しない)。採番・配布は US2(T030)。
+    /// - スレ機能無効(registry なし)の THREAD_JOIN は定型 `unknown_thread` REJECT + 切断。
+    ///
+    /// 継続可否(`true` = 維持)。`false` のとき pump は CLOSE(going_away)を送って切断する。
+    fn handle_thread_deliver(
+        &self,
+        message: Message,
+        addr: &str,
+        outbox_tx: &mpsc::UnboundedSender<Message>,
+        thread_board: &mut Option<String>,
+    ) -> bool {
+        let Some(registry) = &self.livechat else {
+            // スレ機能無効: THREAD_JOIN は定型拒否して切断(内部情報を開示しない — FR-006)。
+            let _ = outbox_tx.send(Message::ThreadReject {
+                reason: thread_reject_reason::UNKNOWN_THREAD.to_string(),
+            });
+            return false;
+        };
+        match message {
+            Message::ThreadJoin {
+                thread,
+                challenge,
+                since_seq,
+            } => {
+                let outcome = registry.handle_join(&thread, &challenge, since_seq);
+                for frame in outcome.frames {
+                    if outbox_tx.send(frame).is_err() {
+                        return false;
+                    }
+                }
+                if outcome.accepted {
+                    // board_id は `<board_id>:<gen>` の先頭。参加者として登録し接続維持。
+                    let board_id = thread.split_once(':').map(|(b, _)| b).unwrap_or("");
+                    registry.register_participant(board_id, addr);
+                    *thread_board = Some(board_id.to_string());
+                    true
+                } else {
+                    // 定型拒否は送出済み。能動切断する(居座り防止)。
+                    false
+                }
+            }
+            Message::ResendReq { from_seq, to_seq } => {
+                // join 済みでなければ不正フレーム扱い(joined 前のスレメッセージ)。
+                let Some(board_id) = thread_board.clone() else {
+                    return false;
+                };
+                for frame in registry.handle_resend(&board_id, from_seq, to_seq) {
+                    if outbox_tx.send(frame).is_err() {
+                        return false;
+                    }
+                }
+                true
+            }
+            // RES(書き込み)は US2 の採番で処理する。US1 では受理のみ(前方互換で切断しない)。
+            Message::Res { .. } => true,
+            // その他のスレメッセージ(ホスト→参 の種別が参→ホ 方向に来た等)は無視する
+            // (前方互換 — 未知/方向違いは切断しない。厳格な方向検査は US2 で扱う)。
+            _ => true,
+        }
+    }
+
     /// inbound 接続の相手を PEX 候補として登録する(contracts §接続管理)。
     ///
     /// 相手が申告した `listen_port`(> 0)を接続元 host と組み合わせ、source=pex・verified=0
@@ -790,6 +903,22 @@ impl P2pRuntime {
             }
         }
     }
+}
+
+/// メッセージが THREAD_* 系(スレ配送専用)か(session.rs の同名判定と対 — 配線分岐用)。
+fn is_thread_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ThreadJoin { .. }
+            | Message::ThreadWelcome { .. }
+            | Message::ThreadReject { .. }
+            | Message::Res { .. }
+            | Message::Order { .. }
+            | Message::Settings { .. }
+            | Message::ResendReq { .. }
+            | Message::ThreadClose { .. }
+            | Message::NextThread { .. }
+    )
 }
 
 /// 現在の unix 時刻(秒)。SYNC の `since` 計算用。

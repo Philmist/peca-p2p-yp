@@ -12,5 +12,7 @@
 pub mod board;
 pub mod host;
 pub mod moderation;
+pub mod participant;
+pub mod registry;
 pub mod session;
 pub mod thread;

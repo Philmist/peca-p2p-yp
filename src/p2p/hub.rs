@@ -122,6 +122,14 @@ impl GossipHub {
         (self.clock)()
     }
 
+    /// スレ機能の有効/無効を IngestState へ反映する(Settings.livechat_enabled — 起動時)。
+    ///
+    /// false のとき gossip 受信の announce(kind 31311)は検証のみ行い不可視化する
+    /// (格納・再伝搬しない — 006 data-model §Settings)。
+    pub fn set_livechat_enabled(&self, enabled: bool) {
+        lock(&self.state).set_livechat_enabled(enabled);
+    }
+
     /// EventStore 設定(SYNC 閾値・鮮度窓の参照用)。
     pub fn store_config(&self) -> StoreConfig {
         self.store_config
