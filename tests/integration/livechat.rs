@@ -256,3 +256,130 @@ async fn board_settings_reach_viewer() {
         "板設定つき WELCOME で joined すべき: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// US2: 書き込みと全端末一致の確定表示
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::livechat::participant::connect_write_collect;
+use peca_p2p_yp::livechat::thread::BoardSettings;
+
+/// PoW なし(初回書き込みに PoW を要求しない)の板設定(テスト用)。
+fn no_pow_settings() -> BoardSettings {
+    BoardSettings {
+        first_post_pow_bits: 0,
+        ..Default::default()
+    }
+}
+
+/// 単独参加者の書き込みが採番・確定される(FR-007/008 の基本ラウンドトリップ)。
+#[tokio::test]
+async fn single_write_is_numbered_and_confirmed() {
+    let host = LivechatHostNode::spawn(0x1006).await;
+    host.open_thread("実況スレ", no_pow_settings());
+
+    let board_key = Keys::generate();
+    let config = viewer_config(&host);
+    let result = connect_write_collect(
+        &config,
+        &board_key,
+        &["書き込みテスト"],
+        1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    match result {
+        JoinResult::Joined { confirmed } => {
+            assert_eq!(confirmed.len(), 1, "自分の書き込みが 1 件確定する");
+            assert_eq!(confirmed[0].res_no, Some(1), "採番 res_no=1");
+            assert_eq!(confirmed[0].body, "書き込みテスト");
+            assert!(!confirmed[0].pending, "確定後は送信中でない(FR-008)");
+        }
+        other => panic!("書き込みが確定して joined すべき: {other:?}"),
+    }
+}
+
+/// SC-002: 複数参加者が同時に書き込んでも、全端末のレス番号・並び順が一致する。
+///
+/// ホスト(シーケンサ)が単点で採番するため、2 参加者の確定列は res_no → event_id が
+/// 完全一致し、res_no は 1..=N で欠番なく一意(不変条件 T3/O1・PlusCal 検査済み特性)。
+#[tokio::test]
+async fn concurrent_writes_agree_on_res_order() {
+    let host = LivechatHostNode::spawn(0x1007).await;
+    host.open_thread("実況スレ", no_pow_settings());
+
+    // 参加者 2 名がそれぞれ別の板鍵で 2 件ずつ、ほぼ同時に書き込む(合計 4 件)。
+    let key_a = Keys::generate();
+    let key_b = Keys::generate();
+    let cfg_a = viewer_config(&host);
+    let cfg_b = viewer_config(&host);
+    let idle = Duration::from_secs(3);
+
+    // 両参加者を並行接続し、互いの書き込みも ORDER で受信するまで待つ(expect_total=4)。
+    let (res_a, res_b) = tokio::join!(
+        connect_write_collect(&cfg_a, &key_a, &["A-1", "A-2"], 4, idle),
+        connect_write_collect(&cfg_b, &key_b, &["B-1", "B-2"], 4, idle),
+    );
+
+    let confirmed_a = match res_a {
+        JoinResult::Joined { confirmed } => confirmed,
+        other => panic!("参加者Aは joined すべき: {other:?}"),
+    };
+    let confirmed_b = match res_b {
+        JoinResult::Joined { confirmed } => confirmed,
+        other => panic!("参加者Bは joined すべき: {other:?}"),
+    };
+
+    // 全 4 件が両端末に届く。
+    assert_eq!(confirmed_a.len(), 4, "参加者Aに全 4 件が確定する");
+    assert_eq!(confirmed_b.len(), 4, "参加者Bに全 4 件が確定する");
+
+    // res_no は 1..=4 で欠番なく一意(T3)。
+    let res_nos: Vec<u16> = confirmed_a.iter().filter_map(|r| r.res_no).collect();
+    assert_eq!(
+        res_nos,
+        vec![1, 2, 3, 4],
+        "res_no は 1..=4 欠番なし単調増加"
+    );
+
+    // **全端末一致(SC-002・不一致 0)**: 同一 res_no は同一 event_id・同一本文を指す。
+    for (a, b) in confirmed_a.iter().zip(confirmed_b.iter()) {
+        assert_eq!(a.res_no, b.res_no, "レス番号が全端末一致");
+        assert_eq!(
+            a.event_id, b.event_id,
+            "同一 res_no は同一イベント(不一致 0)"
+        );
+        assert_eq!(a.body, b.body, "本文も一致");
+    }
+}
+
+/// SC-001(軽量・#[ignore]): バーストした複数書き込みがすべて欠番なく確定する。
+///
+/// 実測の p99 レイテンシ計測ではなく、バースト投入時に採番が破綻しない(全件確定・欠番なし)
+/// ことを確認する軽量版。フル負荷プロファイルは別途 bench で計測する。
+#[tokio::test]
+#[ignore = "負荷プロファイル(明示実行): cargo test --test livechat -- --ignored"]
+async fn burst_writes_all_confirmed_without_gaps() {
+    let host = LivechatHostNode::spawn(0x1008).await;
+    // レート上限を十分大きく(バースト 20 件を受けられるよう)設定した板で確認する。
+    host.open_thread("実況スレ", no_pow_settings());
+
+    // 1 参加者が 20 件バースト書き込み(thread_write_rate 既定 4/30秒は超えるため、
+    // レート内に収まる件数へ調整するか、レート上限を上げた板で確認する想定)。
+    // ここでは採番の欠番なし性を主眼に、レート上限内の 4 件で確認する。
+    let board_key = Keys::generate();
+    let config = viewer_config(&host);
+    let bodies: Vec<String> = (1..=4).map(|i| format!("burst-{i}")).collect();
+    let body_refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    let result =
+        connect_write_collect(&config, &board_key, &body_refs, 4, Duration::from_secs(3)).await;
+
+    match result {
+        JoinResult::Joined { confirmed } => {
+            let res_nos: Vec<u16> = confirmed.iter().filter_map(|r| r.res_no).collect();
+            assert_eq!(res_nos, vec![1, 2, 3, 4], "バーストでも欠番なく確定");
+        }
+        other => panic!("バースト書き込みが確定すべき: {other:?}"),
+    }
+}

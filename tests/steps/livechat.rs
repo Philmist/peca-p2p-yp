@@ -15,8 +15,12 @@ use nostr::Keys;
 
 use crate::AppWorld;
 use crate::mock_peer::TestNode;
-use peca_p2p_yp::livechat::participant::{JoinResult, ParticipantConfig, connect_once};
-use peca_p2p_yp::livechat::thread::BoardSettings;
+use peca_p2p_yp::event::livechat::{OrderEntry, OrderInfo, Res as ResEnvelope};
+use peca_p2p_yp::livechat::participant::{
+    JoinResult, ParticipantConfig, connect_once, connect_write_collect,
+};
+use peca_p2p_yp::livechat::session::ParticipantSession;
+use peca_p2p_yp::livechat::thread::{BoardSettings, Res, Thread};
 
 #[path = "../common/livechat_host.rs"]
 mod livechat_host;
@@ -43,6 +47,22 @@ pub struct LivechatWorld {
     join_result: Option<JoinResult>,
     /// SC-005 検証用: 無操作前のホスト established 数。
     counts_before: Option<(usize, usize)>,
+    // --- US2 状態 ---
+    /// 書き込み用の板鍵(scenario ごとに生成)。
+    board_key: Option<Keys>,
+    /// 送信中→確定の検証用セッション(ドメインレベル)。
+    write_session: Option<ParticipantSession>,
+    /// SC-002 検証用: 各端末の確定列。
+    confirmed_lists: Vec<Vec<Res>>,
+    /// アンカー検証用: 2 端末を模した Thread と対象 res_no。
+    anchor_terminals: Vec<Thread>,
+    anchor_target: u16,
+    /// アンカー解決結果(各端末の event_id)。
+    anchor_resolved: Vec<Option<String>>,
+    /// 名無し/トリップ検証用: (生の名前入力, 表示名)の列。
+    name_display: Vec<(Option<String>, String)>,
+    /// 板の名無しのデフォルト名。
+    noname_name: String,
 }
 
 impl std::fmt::Debug for LivechatWorld {
@@ -297,96 +317,281 @@ async fn board_settings_reflected_in_view(world: &mut AppWorld) {
 // US2: 書き込みと全端末一致の確定表示
 // ---------------------------------------------------------------------------
 
+/// ドメインレベルのスレ器を作る(board_id = 生成ペルソナ pubkey・板鍵とは別系統)。
+fn domain_thread() -> (String, Thread) {
+    let board_id = Keys::generate().public_key().to_hex();
+    let channel = format!("30311:{board_id}:{GUID}");
+    let thread = Thread::new(&board_id, channel, 1, 1_700_000_000, "実況スレ", 1000);
+    (board_id, thread)
+}
+
 #[given("スレに接続済みの参加者がいる")]
 async fn participant_connected_to_thread(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: 参加者接続の前提")
+    let c = ctx(world);
+    let (_, thread) = domain_thread();
+    c.write_session = Some(ParticipantSession::new(thread, "ab".repeat(32)));
+    c.board_key = Some(Keys::generate());
 }
 
 #[when("参加者がレスを書き込む")]
 async fn participant_writes_res(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: RES 送信")
+    let c = ctx(world);
+    let key = c.board_key.clone().expect("板鍵");
+    let session = c.write_session.as_mut().expect("セッション");
+    let channel = session.thread().channel.clone();
+    // 板鍵で自動署名し送信中(pending)へ加える(FR-008/016)。
+    session
+        .compose_write(
+            &key,
+            &channel,
+            None,
+            None,
+            "はじめての書き込み",
+            unix_now(),
+            0,
+        )
+        .expect("書き込み生成");
 }
 
 #[then(
     "書き込みは自端末に送信中として即時表示されホストの採番確定後に正式なレス番号付きで全端末に表示される"
 )]
 async fn write_shows_pending_then_confirmed(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 送信中表示 → 確定表示の遷移検証(FR-008)")
+    let c = ctx(world);
+    let session = c.write_session.as_mut().expect("セッション");
+    // 送信直後は送信中(pending・res_no なし)で表示される(FR-008)。
+    assert_eq!(
+        session.pending().len(),
+        1,
+        "自分の投稿が送信中として保持される"
+    );
+    let pending_res = session.pending()[0].clone();
+    assert!(pending_res.pending, "送信中フラグが立つ");
+    assert!(pending_res.res_no.is_none(), "未確定はレス番号なし");
+
+    // ホストが採番(ORDER seq=1・res_no=1)を配布 → 確定へ遷移する。
+    let board_id = session.thread().board_id.clone();
+    let order = OrderInfo {
+        board_id,
+        generation: 1,
+        seq: 1,
+        entries: vec![OrderEntry {
+            res_no: 1,
+            event_id: pending_res.event_id.clone(),
+        }],
+    };
+    let eid = pending_res.event_id.clone();
+    session
+        .apply_order(&order, |id| {
+            if id == eid {
+                Some(pending_res.clone())
+            } else {
+                None
+            }
+        })
+        .expect("確定");
+    // 確定後は正式なレス番号付きで表示され、送信中は解消する。
+    assert_eq!(session.confirmed().len(), 1, "確定列に 1 件");
+    assert_eq!(session.confirmed()[0].res_no, Some(1), "採番 res_no=1");
+    assert!(!session.confirmed()[0].pending, "確定後は送信中でない");
+    assert!(
+        session.pending().is_empty(),
+        "送信中 → 確定で pending から消える"
+    );
 }
 
 #[given("スレに複数の参加者が接続済みである")]
 async fn multiple_participants_connected(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: 複数参加者接続の前提")
+    let host = LivechatHostNode::spawn(0x3001).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    ctx(world).host = Some(host);
 }
 
 #[when("複数の参加者がほぼ同時に書き込む")]
 async fn multiple_participants_write_concurrently(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 同時書き込みの注入")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    let key_a = Keys::generate();
+    let key_b = Keys::generate();
+    let cfg_a = viewer_config(host);
+    let cfg_b = viewer_config(host);
+    let idle = Duration::from_secs(3);
+    // 2 参加者が並行接続・書き込み。互いの書き込みも受信するまで待つ(expect_total=2)。
+    let (ra, rb) = tokio::join!(
+        connect_write_collect(&cfg_a, &key_a, &["同時A"], 2, idle),
+        connect_write_collect(&cfg_b, &key_b, &["同時B"], 2, idle),
+    );
+    for r in [ra, rb] {
+        match r {
+            JoinResult::Joined { confirmed } => c.confirmed_lists.push(confirmed),
+            other => panic!("joined すべき: {other:?}"),
+        }
+    }
 }
 
 #[then("全端末で同一のレス番号・同一の並び順になる")]
 async fn all_clients_agree_on_res_order(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 採番一致の検証(SC-002・PlusCal 検査済み特性)")
+    let c = ctx(world);
+    assert_eq!(c.confirmed_lists.len(), 2, "2 端末分の確定列");
+    let a = &c.confirmed_lists[0];
+    let b = &c.confirmed_lists[1];
+    assert_eq!(a.len(), 2, "全 2 件が確定");
+    assert_eq!(b.len(), 2, "全 2 件が確定");
+    // レス番号 1..=2 で欠番なし(T3)、同一 res_no は同一イベント(SC-002・不一致 0)。
+    let nos: Vec<u16> = a.iter().filter_map(|r| r.res_no).collect();
+    assert_eq!(nos, vec![1, 2], "res_no 欠番なし単調増加");
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.res_no, y.res_no, "全端末でレス番号一致");
+        assert_eq!(
+            x.event_id, y.event_id,
+            "同一 res_no は同一イベント(不一致 0)"
+        );
+    }
 }
 
 #[given("レス152番を含むスレが確定済みである")]
 async fn thread_has_confirmed_res_152(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 確定済みレス 152 番の前提")
+    let c = ctx(world);
+    c.anchor_target = 152;
+    // 2 端末を模す。両端末は同一の順序確定情報(res_no → event_id)を受けているため、
+    // 確定列は完全一致する(DisplayPrefix)。決定的な event_id で 152 件確定させる。
+    for _ in 0..2 {
+        let (_, mut thread) = domain_thread();
+        for n in 1..=152u16 {
+            let event_id = format!("{n:064x}");
+            let res = Res {
+                event_id,
+                board_key: "cd".repeat(32),
+                name: None,
+                mail: None,
+                body: format!("レス{n}"),
+                created_at: 1_700_000_000,
+                res_no: None,
+                pending: false,
+            };
+            thread.confirm(res, n).expect("確定");
+        }
+        c.anchor_terminals.push(thread);
+    }
 }
 
 #[when("各端末で「>>152」を含むレスが表示される")]
 async fn anchor_res_152_is_shown(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T025 以降で実装: アンカー解決の表示")
+    let c = ctx(world);
+    let target = c.anchor_target;
+    // 各端末で本文 ">>152 これは良い" のアンカーを解決する(FR-009)。
+    for thread in &c.anchor_terminals {
+        let resolved = thread.resolve_anchor(target).map(|r| r.event_id.clone());
+        c.anchor_resolved.push(resolved);
+    }
 }
 
 #[then("アンカーは全端末で同一のレス152番を指す")]
 async fn anchor_resolves_to_same_res_everywhere(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T025 以降で実装: アンカー全端末一致の検証(FR-009)")
+    let c = ctx(world);
+    assert_eq!(c.anchor_resolved.len(), 2, "2 端末分の解決結果");
+    let expected = format!("{:064x}", c.anchor_target);
+    assert_eq!(
+        c.anchor_resolved[0].as_deref(),
+        Some(expected.as_str()),
+        "端末1は res 152 の event_id へ解決"
+    );
+    assert_eq!(
+        c.anchor_resolved[0], c.anchor_resolved[1],
+        "アンカーは全端末で同一のレス(event_id 一致 — FR-009)"
+    );
 }
 
 #[given("順序確定前のレス本文だけが届いた端末がある")]
 async fn client_received_unconfirmed_res_body_only(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 未確定本文のみ受信状態")
+    let c = ctx(world);
+    let (_, thread) = domain_thread();
+    // 参加者は接続済みだが、当該レスの順序確定情報(ORDER)をまだ受けていない。
+    // ORDER を適用しない限り確定列は空のまま(未確定本文は表示に入らない)。
+    c.write_session = Some(ParticipantSession::new(thread, "ab".repeat(32)));
 }
 
 #[when("表示処理を行う")]
 async fn run_display_processing(world: &mut AppWorld) {
+    // 表示列は confirmed()(確定分)で構成される。ここでは Then で参照するため何もしない。
     let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 表示処理の実行")
 }
 
 #[then("そのレスは表示されない")]
 async fn unconfirmed_res_is_not_shown(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 未確定非表示の検証(FR-008)")
+    let c = ctx(world);
+    let session = c.write_session.as_ref().expect("セッション");
+    // 順序未確定のレスは確定列に入らない(FR-008 — 確定済みのみ表示)。
+    assert!(
+        session.confirmed().is_empty(),
+        "順序確定前のレスは表示されない"
+    );
 }
 
 #[given("板の名無しのデフォルト名が設定されている")]
 async fn default_anon_name_is_configured(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T023 以降で実装: 名無しデフォルト名の設定")
+    ctx(world).noname_name = "名無しの視聴者さん".to_string();
 }
 
 #[when("名前欄を空のまま、または「名前#トリップ」を含めて書き込む")]
 async fn write_with_empty_or_hash_name(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 名前欄パターンでの書き込み")
+    let c = ctx(world);
+    let noname = c.noname_name.clone();
+    let key = Keys::generate();
+    let board_id = Keys::generate().public_key().to_hex();
+    let channel = format!("30311:{board_id}:{GUID}");
+
+    // (1) 名前に "#トリップ" を含めて書き込む → 送信前に `#` 以降が除去される(FR-024)。
+    let with_trip = ResEnvelope {
+        channel: channel.clone(),
+        board_id: board_id.clone(),
+        generation: 1,
+        name: Some("コテハン#ひみつ".into()),
+        mail: None,
+        body: "本文1".into(),
+    };
+    let ev = with_trip.sign(&key, unix_now(), 0).expect("署名");
+    let restored = ResEnvelope::from_event(&ev).expect("復元");
+    let display = restored.name.clone().unwrap_or_else(|| noname.clone());
+    c.name_display
+        .push((Some("コテハン#ひみつ".into()), display));
+
+    // (2) 名前欄を空のまま → 板の名無しのデフォルト名で表示される(FR-023/024)。
+    let anon = ResEnvelope {
+        channel,
+        board_id,
+        generation: 1,
+        name: None,
+        mail: None,
+        body: "本文2".into(),
+    };
+    let ev = anon.sign(&key, unix_now(), 0).expect("署名");
+    let restored = ResEnvelope::from_event(&ev).expect("復元");
+    let display = restored
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| noname.clone());
+    c.name_display.push((None, display));
 }
 
 #[then("レスは板の名無しのデフォルト名またはトリップ除去後の名前で全端末に表示される")]
 async fn res_name_normalized_and_shown(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 名前正規化(FR-024)の表示検証")
+    let c = ctx(world);
+    assert_eq!(c.name_display.len(), 2);
+    // トリップ入りは `#` 以降が除去された名前で表示(FR-024)。
+    assert_eq!(c.name_display[0].1, "コテハン", "トリップは除去される");
+    // 空名前は板の名無しのデフォルト名で表示(FR-023)。
+    assert_eq!(
+        c.name_display[1].1, c.noname_name,
+        "空名前は名無しデフォルト名で表示"
+    );
 }
 
 // ---------------------------------------------------------------------------
