@@ -104,7 +104,8 @@ specs/006-livechat-thread/
 │   ├── thread-delivery.md  # スレ配送ワイヤ(JOIN/WELCOME/RES/ORDER/…・状態機械・防御)
 │   └── compat-api.md       # 2ch 互換 API(subject.txt / dat / SETTING.TXT / bbs.cgi)
 ├── checklists/
-│   └── requirements.md  # 作成済み(spec 品質 16/16)
+│   ├── requirements.md  # 作成済み(spec 品質 16/16)
+│   └── interop.md       # 作成済み(interop 24 項目 — 反映結果は本文「Interop チェックリスト反映」)
 └── tasks.md             # Phase 2 output(/speckit-tasks — 本コマンドでは作らない)
 ```
 
@@ -123,6 +124,7 @@ src/
 │   └── moderation.rs    # NG/BAN(完全鍵照合)
 ├── p2p/                 # 既存: HELLO features "livechat1"・THREAD_* フレームの受付分岐(research R4)
 ├── web/
+│   ├── livechat.rs      # スレ一覧・閲覧・板設定/NG/BAN/ローテーション/クローズ/次スレの操作 UI・ローカル API
 │   └── compat/          # 互換 API(専用 loopback リスナー・SJIS・dat/subject/SETTING/bbs.cgi)
 ├── store/               # board_keys / livechat_moderation / board_settings テーブル追加
 └── security/            # SecurityEvent 6 カテゴリ追加
