@@ -801,3 +801,188 @@ fn res_from_event_ignores_unknown_tags_and_peca_subtags() {
         "未知タグ・未知 peca サブタグを追加しても復元は成功し内容は変わらない(前方互換 MUST)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T034: 契約ネガティブテスト(イベント) — なりすまし・不正耐性(US3)
+//
+// 「妥当に見えるが不正な」イベントが受理・伝搬・確定されないことを固定する。
+// - 署名不一致 announce(ペルソナ不一致)は T017 の
+//   `verify_incoming_announce_rejects_persona_mismatch` で既にカバー済みのため
+//   本節では重複させない。
+// - スレ主以外の鍵で署名した ORDER(21311)は偽の順序確定情報であり、参加者は
+//   取り込んではならない(FR-011)。
+// - 直列化イベント全体が共通上限(16KB)を超える announce/レスは受信検証で拒否される。
+// - kind 1311/21311 が gossip(EVENT メッセージ)に混入した場合は破棄する
+//   (thread-events.md §受信検証: 「gossip に流してはならない」の受信側規範)。
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::event::livechat::{OrderEntry, OrderInfo};
+
+#[test]
+fn order_signed_by_non_board_persona_is_rejected_as_invalid() {
+    // FR-011: ORDER の署名者はスレ主ペルソナ(board_id)でなければならない。
+    // 別ペルソナが「スレ主のふりをして」署名した ORDER は偽物として拒否される。
+    // 検証は OrderInfo::from_event(形式)ではなく、署名者 pubkey と board_id の一致を
+    // 別途確認する配線側の責務(participant.rs の verify_order と同型)である点を、
+    // 公開 API のみで固定する。
+    let board_persona = Keys::generate();
+    let board_id = board_persona.public_key().to_hex();
+    let attacker = Keys::generate();
+
+    let order_envelope = OrderInfo {
+        board_id: board_id.clone(),
+        generation: 1,
+        seq: 1,
+        entries: vec![OrderEntry {
+            res_no: 1,
+            event_id: "aa".repeat(32),
+        }],
+    };
+    // 攻撃者の鍵で署名(board_id タグの値は本物のスレ主のものを詐称)。
+    let event = order_envelope.sign(&attacker, 1_700_000_000).unwrap();
+
+    // 形式検証(from_event)自体は署名者を見ないため通ってしまう(タグは正しい形式)。
+    let restored = OrderInfo::from_event(&event).expect("形式検証は通る(署名者は見ない)");
+    assert_eq!(restored.board_id, board_id);
+
+    // 署名者 pubkey が board_id と一致しないことが偽 ORDER の判定根拠(FR-011)。
+    // 受信側(participant 配線)はこの不一致を検出して破棄しなければならない。
+    assert_ne!(
+        event.pubkey.to_hex(),
+        board_id,
+        "攻撃者の署名鍵はスレ主(board_id)と一致しないため偽 ORDER として拒否されるべき"
+    );
+}
+
+#[test]
+fn order_signed_by_board_persona_matches_board_id() {
+    // 対照(正常系): スレ主ペルソナ自身が署名した ORDER は署名者 == board_id が成立する。
+    let board_persona = Keys::generate();
+    let board_id = board_persona.public_key().to_hex();
+
+    let order_envelope = OrderInfo {
+        board_id: board_id.clone(),
+        generation: 1,
+        seq: 1,
+        entries: vec![OrderEntry {
+            res_no: 1,
+            event_id: "bb".repeat(32),
+        }],
+    };
+    let event = order_envelope.sign(&board_persona, 1_700_000_000).unwrap();
+    assert_eq!(
+        event.pubkey.to_hex(),
+        board_id,
+        "スレ主自身の署名は board_id と一致する(正当な ORDER)"
+    );
+}
+
+#[test]
+fn oversized_announce_event_is_rejected_before_signature_check() {
+    // 検証 1(サイズ): 直列化イベント全体が共通上限(16KB)を超える announce は、
+    // 署名検証より前にサイズで拒否される。受信側はサイズだけを見て即座に拒否する
+    // ため(署名検証の前段)、ここでは有効な JSON である必要すらない — 巨大な文字列を
+    // そのまま受信検証に渡すブラックボックス確認で十分(実装は raw_json.len() を見る)。
+    use peca_p2p_yp::event::schema::MAX_EVENT_BYTES;
+
+    let now = 1_700_000_000;
+    let oversized_raw = "x".repeat(MAX_EVENT_BYTES + 1);
+    assert!(oversized_raw.len() > MAX_EVENT_BYTES);
+
+    let clock = Arc::new(AtomicU64::new(now));
+    let mut st = state_at(Arc::clone(&clock));
+    let err = st.ingest(&oversized_raw, "peer:1", now).unwrap_err();
+    assert_eq!(
+        err,
+        VerifyReject::Oversize,
+        "16KB 超のイベントはサイズ超過として拒否される(署名検証より前)"
+    );
+    assert_eq!(st.store_len(), 0);
+}
+
+#[test]
+fn oversized_res_body_rejected_via_verify_incoming_res() {
+    // 検証 3(本文制約)がホスト受信検証を通しても効くことを、送信前検査を迂回した
+    // 生イベント(本文 2048 文字超を直接タグ無しで content に積む)で確認する。
+    // ResEnvelope::sign は上限で弾くため、EventBuilder で直接組み立てて検証をバイパスした
+    // ケースを模す(悪意ある/不具合のあるクライアントが規約破りの本文を送る想定)。
+    use nostr::{EventBuilder, Kind, Tag, Timestamp};
+
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = registry_with_open_thread(&persona);
+    let board_key = Keys::generate();
+
+    let oversized_body = "あ".repeat(2049);
+    let tags = vec![
+        Tag::parse(["a", &thread_channel_ref(&board_id)]).unwrap(),
+        Tag::parse(["peca", "thread", &board_id, "1"]).unwrap(),
+    ];
+    let event = EventBuilder::new(Kind::Custom(1311), oversized_body)
+        .tags(tags)
+        .custom_created_at(Timestamp::from(1_700_000_005u64))
+        .sign_with_keys(&board_key)
+        .unwrap();
+
+    assert!(
+        !reg.verify_incoming_res(&board_id, &event),
+        "本文 2048 文字超のレスはホスト側受信検証(from_event 経由)で拒否される"
+    );
+}
+
+#[test]
+fn res_kind_on_gossip_is_dropped_not_stored_or_propagated() {
+    // gossip の許可 kind は {30311, 31311} のみ(thread-events.md)。kind 1311(レス)が
+    // gossip の EVENT として送られてきた場合は破棄し、格納も再伝搬もしない
+    // (受信側規範 — 送信側の「流してはならない」と対)。
+    let now = 1_700_000_000;
+    let clock = Arc::new(AtomicU64::new(now));
+    let mut st = state_at(Arc::clone(&clock));
+    let board_key = Keys::generate();
+    let board_id = "12".repeat(32);
+
+    let res = sign_res_with_name(&board_key, &board_id, 1, None, "本文", now);
+    let err = st.ingest(&res.as_json(), "peer:1", now).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("InvalidFormat"),
+        "kind 1311 は gossip 上では形式違反として拒否される: {err:?}"
+    );
+    assert_eq!(st.store_len(), 0, "格納されない");
+    assert!(
+        st.sync_events(0, now).is_empty(),
+        "再伝搬(sync_events への反映)もされない"
+    );
+}
+
+#[test]
+fn order_kind_on_gossip_is_dropped_not_stored_or_propagated() {
+    // kind 21311(順序確定情報)も同様に gossip 上では破棄される。
+    let now = 1_700_000_000;
+    let clock = Arc::new(AtomicU64::new(now));
+    let mut st = state_at(Arc::clone(&clock));
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+
+    let order = OrderInfo {
+        board_id: board_id.clone(),
+        generation: 1,
+        seq: 1,
+        entries: vec![OrderEntry {
+            res_no: 1,
+            event_id: "cc".repeat(32),
+        }],
+    }
+    .sign(&persona, now)
+    .unwrap();
+
+    let err = st.ingest(&order.as_json(), "peer:1", now).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("InvalidFormat"),
+        "kind 21311 は gossip 上では形式違反として拒否される: {err:?}"
+    );
+    assert_eq!(st.store_len(), 0, "格納されない");
+    assert!(
+        st.sync_events(0, now).is_empty(),
+        "再伝搬(sync_events への反映)もされない"
+    );
+}
