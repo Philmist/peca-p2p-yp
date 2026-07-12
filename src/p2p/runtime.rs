@@ -44,6 +44,55 @@ use nostr::JsonUtil;
 /// 外向き接続維持ループの周期。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// スレ接続単位のメッセージレート上限(制御込み・1 秒窓 — Settings.thread_msg_rate 既定。
+/// data-model §Settings / FR-021)。
+const DEFAULT_THREAD_MSG_RATE: u32 = 16;
+
+/// スレ接続の継続違反(連続レート/書き込み違反)の切断しきい値(FR-021 — 継続違反は切断)。
+const MAX_CONSECUTIVE_THREAD_VIOLATIONS: u32 = 4;
+
+/// スレ接続単位のレート状態(T036 — FR-021)。1 秒窓の受信メッセージ数(制御込み)と
+/// 連続違反回数を持ち、継続違反で接続を切断する。窓・違反の判定は接続のライフタイムで閉じる。
+struct ThreadRateState {
+    /// 現在の 1 秒窓(unix 秒)。
+    window_start: u64,
+    /// 窓内の受信メッセージ数。
+    msg_count: u32,
+    /// 連続違反回数(正常メッセージでリセット)。
+    consecutive_violations: u32,
+}
+
+impl ThreadRateState {
+    fn new() -> Self {
+        Self {
+            window_start: 0,
+            msg_count: 0,
+            consecutive_violations: 0,
+        }
+    }
+
+    /// 1 秒窓のメッセージを計上する。窓上限を超えたら `true`(レート違反)。
+    fn count_message(&mut self, now: u64, max_per_sec: u32) -> bool {
+        if now != self.window_start {
+            self.window_start = now;
+            self.msg_count = 0;
+        }
+        self.msg_count += 1;
+        self.msg_count > max_per_sec
+    }
+
+    /// 違反を記録し、連続違反が上限に達したら `true`(切断すべき)。
+    fn note_violation(&mut self) -> bool {
+        self.consecutive_violations += 1;
+        self.consecutive_violations >= MAX_CONSECUTIVE_THREAD_VIOLATIONS
+    }
+
+    /// 正常メッセージで連続違反をリセットする。
+    fn note_ok(&mut self) {
+        self.consecutive_violations = 0;
+    }
+}
+
 /// keepalive 判定(PING 送信・無応答切断)の tick 周期。しきい値(60/120 秒)より
 /// 十分細かくし、判定の粒度を確保する(T046)。
 const KEEPALIVE_TICK: Duration = Duration::from_secs(5);
@@ -501,6 +550,8 @@ impl P2pRuntime {
         // スレセッション(006-livechat-thread)で登録済みの board_id。切断時に participant を
         // 登録解除するため保持する。`None` は未 join(または gossip セッション)。
         let mut thread_board: Option<String> = None;
+        // スレ接続単位のレート状態(接続メッセージ数・継続違反 — T036 / FR-021)。
+        let mut thread_rate = ThreadRateState::new();
         // gossip の接続時同期オープナー(SYNC_REQ + GET_PEERS)を送信済みか。outbound は
         // established 直後に送る。inbound は最初の gossip メッセージ受信で Gossip 用途が
         // 確定してから一度だけ送る(スレ用途 = THREAD_JOIN のときは送らない)。
@@ -622,7 +673,7 @@ impl P2pRuntime {
                                         // スレメッセージ(006-livechat-thread)は registry 経由で
                                         // 処理する。gossip メッセージは従来の handle_deliver へ。
                                         let cont = if is_thread_message(&msg) {
-                                            self.handle_thread_deliver(msg, addr, &outbox_tx, &mut thread_board)
+                                            self.handle_thread_deliver(msg, addr, &outbox_tx, &mut thread_board, &mut thread_rate)
                                         } else {
                                             // inbound で最初の gossip メッセージを受けた =
                                             // Gossip 用途が確定した。ここで一度だけ SYNC_REQ/
@@ -849,6 +900,7 @@ impl P2pRuntime {
         addr: &str,
         outbox_tx: &mpsc::UnboundedSender<Message>,
         thread_board: &mut Option<String>,
+        rate: &mut ThreadRateState,
     ) -> bool {
         let Some(registry) = &self.livechat else {
             // スレ機能無効: THREAD_JOIN は定型拒否して切断(内部情報を開示しない — FR-006)。
@@ -857,6 +909,16 @@ impl P2pRuntime {
             });
             return false;
         };
+        // 接続単位のメッセージレート(制御込み — thread_msg_rate。FR-021 / T036)。1 秒窓の
+        // 上限を超えたら破棄し違反を計上、継続違反(連続しきい値)で切断する。
+        if rate.count_message(unix_now_u64(), DEFAULT_THREAD_MSG_RATE) {
+            self.security.log(
+                SecurityCategory::LivechatWriteRejected,
+                addr,
+                "thread message rate exceeded",
+            );
+            return !rate.note_violation();
+        }
         match message {
             Message::ThreadJoin {
                 thread,
@@ -876,6 +938,7 @@ impl P2pRuntime {
                     let board_id = thread.split_once(':').map(|(b, _)| b).unwrap_or("");
                     registry.register_participant(board_id, addr, outbox_tx.clone());
                     *thread_board = Some(board_id.to_string());
+                    rate.note_ok();
                     true
                 } else {
                     // 定型拒否は送出済み。能動切断する(居座り防止)。
@@ -892,6 +955,7 @@ impl P2pRuntime {
                         return false;
                     }
                 }
+                rate.note_ok();
                 true
             }
             Message::Res { event } => {
@@ -912,13 +976,18 @@ impl P2pRuntime {
                         // 採番・配布(重複は No-op、非 Active/満杯は Rejected)。
                         match registry.accept_write(&board_id, &ev, unix_now_u64()) {
                             Ok(crate::livechat::registry::AcceptOutcome::Numbered { .. })
-                            | Ok(crate::livechat::registry::AcceptOutcome::Duplicate) => {}
+                            | Ok(crate::livechat::registry::AcceptOutcome::Duplicate) => {
+                                rate.note_ok();
+                                true
+                            }
                             Ok(crate::livechat::registry::AcceptOutcome::Rejected) | Err(_) => {
                                 self.security.log(
                                     SecurityCategory::LivechatWriteRejected,
                                     addr,
                                     "res rejected: not active or over limit",
                                 );
+                                // 継続違反(連続する採番拒否 = レート/BAN/満杯の連打)で切断(FR-021)。
+                                !rate.note_violation()
                             }
                         }
                     }
@@ -928,9 +997,10 @@ impl P2pRuntime {
                             addr,
                             "res failed signature or format verification",
                         );
+                        // 継続違反(連続する不正 RES)で切断(FR-021)。
+                        !rate.note_violation()
                     }
                 }
-                true
             }
             // その他のスレメッセージ(ホスト→参 の種別が参→ホ 方向に来た等)は無視する
             // (前方互換 — 未知/方向違いは切断しない。厳格な方向検査は US2 で扱う)。
@@ -1029,6 +1099,43 @@ mod tests {
     use crate::p2p::peers::PeerManagerConfig;
     use crate::store::{PeerSource, Store};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ---- スレ接続レート状態(T036 — FR-021)----
+
+    #[test]
+    fn thread_rate_counts_within_one_second_window() {
+        let mut r = ThreadRateState::new();
+        // 上限 4/秒。同一秒に 4 件までは違反なし、5 件目で違反。
+        for _ in 0..4 {
+            assert!(!r.count_message(100, 4), "上限内は違反なし");
+        }
+        assert!(r.count_message(100, 4), "上限超過は違反");
+        // 次の秒(窓を跨ぐ)で計数リセット。
+        assert!(!r.count_message(101, 4), "窓を跨ぐとリセット");
+    }
+
+    #[test]
+    fn thread_rate_disconnects_on_consecutive_violations() {
+        let mut r = ThreadRateState::new();
+        // 連続違反が MAX_CONSECUTIVE_THREAD_VIOLATIONS に達したら note_violation が true(切断)。
+        for _ in 0..(MAX_CONSECUTIVE_THREAD_VIOLATIONS - 1) {
+            assert!(!r.note_violation(), "しきい値未満は継続");
+        }
+        assert!(r.note_violation(), "しきい値到達で切断");
+    }
+
+    #[test]
+    fn thread_rate_ok_resets_consecutive_violations() {
+        let mut r = ThreadRateState::new();
+        r.note_violation();
+        r.note_violation();
+        r.note_ok(); // 正常メッセージで連続違反リセット。
+        // リセット後は再びしきい値まで継続を要する。
+        for _ in 0..(MAX_CONSECUTIVE_THREAD_VIOLATIONS - 1) {
+            assert!(!r.note_violation());
+        }
+        assert!(r.note_violation());
+    }
 
     /// テスト用ランタイムと、その SecurityLog ファイルを保持する tempdir ガードを返す。
     fn runtime(nonce: u64, listen_port: u16) -> (Arc<P2pRuntime>, tempfile::TempDir) {

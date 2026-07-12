@@ -571,7 +571,12 @@ fn registry_with_open_thread(persona: &Keys) -> Arc<LivechatRegistry> {
         1,
         1_700_000_000,
         "実況スレ",
-        BoardSettings::default(),
+        // first_post_pow_bits=0: 採番・配布の契約検証に PoW 計算を挟まない(PoW 自体の
+        // 契約は別テスト。71cc9d9 で初見板鍵に PoW を課すようになったため明示的に無効化)。
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
         "198.51.100.1:7147",
     )
     .unwrap();
@@ -763,9 +768,11 @@ fn accept_write_rejects_over_res_limit_without_broadcast() {
     // T3)であり、配布もされない。
     let persona = Keys::generate();
     let board_id = persona.public_key().to_hex();
-    let reg = LivechatRegistry::new(128);
+    // res_limit の契約だけを見たいので PoW・レートは無効化(pow=0・十分高いレート)。
+    let reg = LivechatRegistry::new_with_rate(128, 1000);
     let settings = BoardSettings {
         res_limit: 100,
+        first_post_pow_bits: 0,
         ..Default::default()
     };
     reg.open_thread(

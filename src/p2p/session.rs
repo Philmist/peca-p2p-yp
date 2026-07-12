@@ -144,6 +144,20 @@ enum SessionKind {
     Thread,
 }
 
+/// `RES` に載る kind(NIP-53 Live Chat Message の封筒援用 — thread-events.md)。
+const RES_KIND: u64 = 1311;
+/// `ORDER` に載る kind(peca 固有 ephemeral — thread-events.md)。
+const ORDER_KIND: u64 = 21311;
+
+/// スレイベント JSON(`event`)の `kind` を軽く覗く(種別 × kind の 1:1 検査用 — T037)。
+///
+/// 署名・形式・サイズの検証は配線側([`crate::livechat`])が行う。本ヘルパは「種別と kind の
+/// 対応が正しいか」だけをワイヤ層で確認するために kind フィールドのみ読む。欠落・非数値は
+/// `None`(呼び出し側が不正フレームとして扱う)。
+fn peek_kind(event: &serde_json::Value) -> Option<u64> {
+    event.get("kind").and_then(serde_json::Value::as_u64)
+}
+
 /// メッセージが THREAD_* 系(スレ配送専用)か。
 fn is_thread_message(message: &Message) -> bool {
     matches!(
@@ -527,14 +541,31 @@ impl Session {
     /// スレメッセージ(THREAD_JOIN/RES/RESEND_REQ/THREAD_* 等)は上位
     /// ([`crate::p2p::runtime`] が [`crate::livechat::registry`] と連携)へ
     /// [`SessionAction::Deliver`] で委譲する。受理判定(WELCOME/REJECT)・接続時同期・
-    /// 配布の実体は配線側が担う。本セッションは 1 用途原則のみ強制する: スレ接続に
-    /// gossip 専用メッセージ(EVENT/SYNC_REQ 等)が混在したら不正フレームとして切断する。
+    /// 配布の実体は配線側が担う。本セッションが強制する防御(contracts/thread-delivery.md
+    /// §防御):
+    ///
+    /// - **1 用途原則**: スレ接続に gossip 専用メッセージ(EVENT/SYNC_REQ 等)が混在したら
+    ///   不正フレームとして切断する。
+    /// - **kind と種別の 1:1 対応(T037)**: `RES` に kind 1311 以外・`ORDER` に kind 21311 以外の
+    ///   イベントが載っていたら不正フレームとして切断する(thread-events.md — kind と
+    ///   メッセージ種別の対応は 1:1)。封筒の署名・形式・サイズ検証は配線側が行うが、**種別と
+    ///   kind の不一致はワイヤ層の逸脱**であり、ここで即切断する(委譲前の水際防御)。
     fn handle_thread_session(
         &mut self,
         message: Message,
     ) -> Result<Vec<SessionAction>, Disconnect> {
         if !is_thread_message(&message) {
             return self.fail_invalid_frame();
+        }
+        // kind と種別の 1:1 対応を水際で強制する(T037)。
+        match &message {
+            Message::Res { event } if peek_kind(event) != Some(RES_KIND) => {
+                return self.fail_invalid_frame();
+            }
+            Message::Order { event } if peek_kind(event) != Some(ORDER_KIND) => {
+                return self.fail_invalid_frame();
+            }
+            _ => {}
         }
         Ok(vec![SessionAction::Deliver(message)])
     }
