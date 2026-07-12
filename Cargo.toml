@@ -68,6 +68,10 @@ name = "thread_delivery"
 path = "tests/contract/thread_delivery.rs"
 
 [[test]]
+name = "thread_events"
+path = "tests/contract/thread_events.rs"
+
+[[test]]
 name = "key_envelope"
 path = "tests/contract/key_envelope.rs"
 
