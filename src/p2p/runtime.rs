@@ -501,6 +501,10 @@ impl P2pRuntime {
         // スレセッション(006-livechat-thread)で登録済みの board_id。切断時に participant を
         // 登録解除するため保持する。`None` は未 join(または gossip セッション)。
         let mut thread_board: Option<String> = None;
+        // gossip の接続時同期オープナー(SYNC_REQ + GET_PEERS)を送信済みか。outbound は
+        // established 直後に送る。inbound は最初の gossip メッセージ受信で Gossip 用途が
+        // 確定してから一度だけ送る(スレ用途 = THREAD_JOIN のときは送らない)。
+        let mut gossip_openers_sent = false;
         // 送信キュー: 他接続からの再伝搬・PONG・SYNC 応答の平滑送信を本接続へ流す。
         let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Message>();
         let mut conn_id: Option<u64> = None;
@@ -599,16 +603,19 @@ impl P2pRuntime {
                                         if direction == Direction::Inbound {
                                             self.register_inbound_candidate(addr, session.peer());
                                         }
-                                        // established 直後に SYNC_REQ(since = now − 鮮度窓)。
-                                        let since = sync::sync_req_since(
-                                            unix_now_u64(),
-                                            self.hub.store_config().freshness_window_sec,
-                                        );
-                                        sync_counter.begin();
-                                        let _ = outbox_tx.send(Message::SyncReq { since });
-                                        // 接続先拡大のため GET_PEERS を送る(PEX 有効時のみ)。
-                                        if self.pex_enabled {
-                                            let _ = outbox_tx.send(Message::GetPeers);
+                                        // established 直後の SYNC_REQ/GET_PEERS 送信は
+                                        // **outbound(自ノードが gossip 目的で張った接続)のみ**。
+                                        // inbound は用途未確定(相手の最初のメッセージが
+                                        // THREAD_JOIN ならスレ用途)なので、ここでは送らず、
+                                        // 最初に gossip メッセージを受信して Gossip と確定して
+                                        // から送る(1 TCP = 1 用途原則 — スレ接続に gossip の
+                                        // SYNC_REQ を送ると participant の WELCOME 待ちを妨げる)。
+                                        if direction == Direction::Outbound {
+                                            self.send_gossip_openers(
+                                                &outbox_tx,
+                                                &mut sync_counter,
+                                                &mut gossip_openers_sent,
+                                            );
                                         }
                                     }
                                     SessionAction::Deliver(msg) => {
@@ -617,6 +624,14 @@ impl P2pRuntime {
                                         let cont = if is_thread_message(&msg) {
                                             self.handle_thread_deliver(msg, addr, &outbox_tx, &mut thread_board)
                                         } else {
+                                            // inbound で最初の gossip メッセージを受けた =
+                                            // Gossip 用途が確定した。ここで一度だけ SYNC_REQ/
+                                            // GET_PEERS を送る(双方向 SYNC を inbound 側でも維持)。
+                                            self.send_gossip_openers(
+                                                &outbox_tx,
+                                                &mut sync_counter,
+                                                &mut gossip_openers_sent,
+                                            );
                                             self.handle_deliver(msg, addr, conn_id, &outbox_tx, &mut sync_counter, &sync_in_flight).await
                                         };
                                         if !cont {
@@ -785,6 +800,33 @@ impl P2pRuntime {
             }
             // PONG は本タスクでは処理しない(keepalive 追跡は T046)。前方互換のため切断しない。
             _ => true,
+        }
+    }
+
+    /// gossip の接続時同期オープナー(SYNC_REQ + GET_PEERS)を一度だけ送る。
+    ///
+    /// `sent` フラグで冪等化する(既送なら何もしない)。SYNC_REQ は `since = now − 鮮度窓`
+    /// で送り、`sync_counter.begin()` で応答量検査の窓を開く。GET_PEERS は PEX 有効時のみ。
+    ///
+    /// outbound established 直後(gossip 目的の接続)と、inbound で最初の gossip メッセージを
+    /// 受信して Gossip 用途が確定した時点の**両方**から呼ぶ。スレ用途(THREAD_JOIN)の inbound
+    /// では呼ばれないため、スレ接続に gossip 制御が混入しない(1 TCP = 1 用途原則)。
+    fn send_gossip_openers(
+        &self,
+        outbox_tx: &mpsc::UnboundedSender<Message>,
+        sync_counter: &mut SyncCounter,
+        sent: &mut bool,
+    ) {
+        if *sent {
+            return;
+        }
+        *sent = true;
+        let since =
+            sync::sync_req_since(unix_now_u64(), self.hub.store_config().freshness_window_sec);
+        sync_counter.begin();
+        let _ = outbox_tx.send(Message::SyncReq { since });
+        if self.pex_enabled {
+            let _ = outbox_tx.send(Message::GetPeers);
         }
     }
 

@@ -130,3 +130,7 @@ path = "tests/integration/index_lan.rs"
 [[test]]
 name = "thread_mock"
 path = "tests/integration/thread_mock.rs"
+
+[[test]]
+name = "livechat"
+path = "tests/integration/livechat.rs"
