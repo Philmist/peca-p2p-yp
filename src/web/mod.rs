@@ -37,6 +37,7 @@ use crate::store::Store;
 pub mod announced;
 pub mod channels;
 pub mod compat;
+pub mod livechat;
 pub mod mutes;
 pub mod peers;
 pub mod personas;
