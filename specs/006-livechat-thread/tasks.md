@@ -39,16 +39,16 @@
 
 **⚠️ CRITICAL**: 本フェーズ完了までユーザーストーリー実装を開始しない
 
-- [ ] T007 store に 3 テーブルを追加: `board_keys` / `livechat_moderation` / `board_settings` のスキーマとマイグレーションを src/store/mod.rs に実装(data-model §永続化。スレデータのテーブルは作らない — FR-015 揮発)
-- [ ] T008 [P] SecurityEvent に 6 カテゴリを追加(15 → 21): `livechat_announce_invalid` / `livechat_challenge_failed` / `livechat_order_invalid` / `livechat_write_rejected` / `livechat_settings_invalid` / `compat_bbs_denied` を src/security/mod.rs に定義(data-model §SecurityEvent)
-- [ ] T009 [P] Settings に 6 キーを追加: `livechat_enabled`(既定 true)/ `thread_max_participants`(128)/ `thread_write_rate`(4 レス/30 秒)/ `thread_msg_rate`(16 msg/秒)/ `announce_store_quota`(2048)/ `compat_bbs_bind`(`127.0.0.1:7183`・非 loopback 値は起動拒否・空文字で無効化)を src/config.rs に実装し src/web/settings.rs へ公開(data-model §Settings)
-- [ ] T010 kind 1311 / 21311 / 31311 のイベントスキーマ・直列化・フィールド検証を src/event/livechat.rs に実装: 31311 のタグ集合(d="livechat"・a・title・gen・key・res_count・tip・expiration)と置換規則、1311 の peca タグ(thread/name/mail)と本文制約(≤ 2048 文字・≤ 32 行・制御文字除去)、21311 の seq/order タグと連続性検証、未知タグ・未知 peca サブタグの無視(前方互換 MUST — contracts/thread-events.md)
-- [ ] T011 [P] EventStore に kind 31311 の独立保持枠(`announce_store_quota`・板ごと最新 1 件へ置換)を src/event/store.rs に実装(research R3 — 既存 4096 枠と分離)
-- [ ] T012 板鍵管理の基盤を src/livechat/board.rs に実装: 鍵ペア生成・keystore 抽象(DPAPI / Linux エンベロープ)による秘密鍵暗号化・`board_keys` テーブル CRUD・ペルソナテーブルとの構造分離(識別子・外部キー共有なし)・エクスポート機能なし(research R8 / FR-016)
-- [ ] T013 [P] スレ状態の型と状態機械を src/livechat/thread.rs に実装: Thread(board_id / channel / gen / key / title / res_limit スナップショット / state)・BoardSettings(title ≤ 128・res_limit 100〜4000・noname_name 1〜64・local_rules ≤ 2048・first_post_pow_bits 0〜32)・Res・OrderInfo と、状態遷移(Active/Frozen/Closed)・不変条件 T1/T2/T3 の強制(data-model §エンティティ)
-- [ ] T014 [P] P2P 受け口の多重化を実装: HELLO `features` に `livechat1` を追加し、established 後の最初のメッセージが `THREAD_JOIN` ならスレセッションに分岐(1 TCP 接続 = 1 用途・以後の種別混在は不正フレーム切断)。THREAD_* / RES / ORDER / SETTINGS / RESEND_REQ / THREAD_CLOSE / NEXT_THREAD のフレーム種別を src/p2p/frame.rs に追加し src/p2p/session.rs で分岐(research R4 / contracts/thread-delivery.md §トランスポート)
-- [ ] T015 モックピアを THREAD_* 対応に拡張: JOIN/WELCOME/REJECT・RES/ORDER 送受・不正フレーム注入を tests/common/mock_peer.rs に追加(T014 のフレーム種別に依存)
-- [ ] T016 [P] Gherkin feature を作成: spec US1〜US6 の受け入れシナリオを tests/features/livechat.feature に記述し、ステップ骨格 tests/steps/livechat.rs を tests/cucumber.rs へ登録。**実装前に全シナリオが失敗することを確認**(quickstart §1 テストファースト)
+- [X] T007 store に 3 テーブルを追加: `board_keys` / `livechat_moderation` / `board_settings` のスキーマとマイグレーションを src/store/mod.rs に実装(data-model §永続化。スレデータのテーブルは作らない — FR-015 揮発)
+- [X] T008 [P] SecurityEvent に 6 カテゴリを追加(15 → 21): `livechat_announce_invalid` / `livechat_challenge_failed` / `livechat_order_invalid` / `livechat_write_rejected` / `livechat_settings_invalid` / `compat_bbs_denied` を src/security/mod.rs に定義(data-model §SecurityEvent)
+- [X] T009 [P] Settings に 6 キーを追加: `livechat_enabled`(既定 true)/ `thread_max_participants`(128)/ `thread_write_rate`(4 レス/30 秒)/ `thread_msg_rate`(16 msg/秒)/ `announce_store_quota`(2048)/ `compat_bbs_bind`(`127.0.0.1:7183`・非 loopback 値は起動拒否・空文字で無効化)を src/config.rs に実装し src/web/settings.rs へ公開(data-model §Settings)
+- [X] T010 kind 1311 / 21311 / 31311 のイベントスキーマ・直列化・フィールド検証を src/event/livechat.rs に実装: 31311 のタグ集合(d="livechat"・a・title・gen・key・res_count・tip・expiration)と置換規則、1311 の peca タグ(thread/name/mail)と本文制約(≤ 2048 文字・≤ 32 行・制御文字除去)、21311 の seq/order タグと連続性検証、未知タグ・未知 peca サブタグの無視(前方互換 MUST — contracts/thread-events.md)
+- [X] T011 [P] EventStore に kind 31311 の独立保持枠(`announce_store_quota`・板ごと最新 1 件へ置換)を src/event/store.rs に実装(research R3 — 既存 4096 枠と分離)
+- [X] T012 板鍵管理の基盤を src/livechat/board.rs に実装: 鍵ペア生成・keystore 抽象(DPAPI / Linux エンベロープ)による秘密鍵暗号化・`board_keys` テーブル CRUD・ペルソナテーブルとの構造分離(識別子・外部キー共有なし)・エクスポート機能なし(research R8 / FR-016)
+- [X] T013 [P] スレ状態の型と状態機械を src/livechat/thread.rs に実装: Thread(board_id / channel / gen / key / title / res_limit スナップショット / state)・BoardSettings(title ≤ 128・res_limit 100〜4000・noname_name 1〜64・local_rules ≤ 2048・first_post_pow_bits 0〜32)・Res・OrderInfo と、状態遷移(Active/Frozen/Closed)・不変条件 T1/T2/T3 の強制(data-model §エンティティ)
+- [X] T014 [P] P2P 受け口の多重化を実装: HELLO `features` に `livechat1` を追加し、established 後の最初のメッセージが `THREAD_JOIN` ならスレセッションに分岐(1 TCP 接続 = 1 用途・以後の種別混在は不正フレーム切断)。THREAD_* / RES / ORDER / SETTINGS / RESEND_REQ / THREAD_CLOSE / NEXT_THREAD のフレーム種別を src/p2p/frame.rs に追加し src/p2p/session.rs で分岐(research R4 / contracts/thread-delivery.md §トランスポート)
+- [X] T015 モックピアを THREAD_* 対応に拡張: JOIN/WELCOME/REJECT・RES/ORDER 送受・不正フレーム注入を tests/common/mock_peer.rs に追加(T014 のフレーム種別に依存)
+- [X] T016 [P] Gherkin feature を作成: spec US1〜US6 の受け入れシナリオを tests/features/livechat.feature に記述し、ステップ骨格 tests/steps/livechat.rs を tests/cucumber.rs へ登録。**実装前に全シナリオが失敗することを確認**(quickstart §1 テストファースト)
 
 **Checkpoint**: 基盤完了 — 以降のユーザーストーリーは並列着手可能
 

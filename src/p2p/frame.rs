@@ -80,6 +80,71 @@ pub enum Message {
     /// 正常切断。`reason` は定型コードのみ(内部情報を含めてはならない — MUST NOT)。
     #[serde(rename = "CLOSE")]
     Close { reason: String },
+
+    // --- 006-livechat-thread: スレ配送(contracts/thread-delivery.md §メッセージ種別) ---
+    /// スレ参加要求(参→ホ)。`thread` は `<board_id>:<gen>`。established 後の最初の
+    /// メッセージがこれならスレセッションへ分岐する(それ以外は gossip セッション)。
+    #[serde(rename = "THREAD_JOIN")]
+    ThreadJoin {
+        thread: String,
+        challenge: String,
+        since_seq: u32,
+    },
+    /// 参加受理(ホ→参)。`sig` はスレ主ペルソナ鍵による
+    /// `challenge || board_id || gen` への Schnorr 署名(FR-005)。
+    #[serde(rename = "THREAD_WELCOME")]
+    ThreadWelcome {
+        thread: String,
+        sig: String,
+        board_settings: Value,
+        res_count: u32,
+    },
+    /// 定型拒否(ホ→参)。`reason` は [`thread_reject_reason`] のいずれか。
+    /// 内部情報を含めてはならない (MUST NOT — FR-006)。
+    #[serde(rename = "THREAD_REJECT")]
+    ThreadReject { reason: String },
+    /// レス(双方向)。参→ホ: 書き込み。ホ→参: 確定レス本文の配布。`event` は kind 1311。
+    #[serde(rename = "RES")]
+    Res { event: Value },
+    /// 順序確定情報の配布(ホ→参)。`event` は kind 21311。
+    #[serde(rename = "ORDER")]
+    Order { event: Value },
+    /// 板設定の即時配布(ホ→参、FR-023)。
+    #[serde(rename = "SETTINGS")]
+    Settings { board_settings: Value },
+    /// 欠落した確定情報・対応レスの再送要求(参→ホ)。
+    #[serde(rename = "RESEND_REQ")]
+    ResendReq { from_seq: u32, to_seq: u32 },
+    /// 明示クローズ通知(ホ→参)。`event` はスレ主署名付きクローズ通知(kind 21311 の
+    /// `["peca","close"]` タグ付き特殊形)。受信側はスレデータを削除する(FR-14)。
+    #[serde(rename = "THREAD_CLOSE")]
+    ThreadClose { event: Value },
+    /// 次スレ移行通知(ホ→参)。旧世代は書き込み不可(FR-013)。
+    ///
+    /// ワイヤ上のキー名は `gen` だが、Rust edition 2024 で `gen` は予約語のため
+    /// フィールド名は `generation` とし `#[serde(rename = "gen")]` で対応付ける。
+    #[serde(rename = "NEXT_THREAD")]
+    NextThread {
+        #[serde(rename = "gen")]
+        generation: u32,
+        key: u64,
+    },
+}
+
+/// THREAD_REJECT の定型 reason コード(内部情報を含めない — MUST NOT。FR-006)。
+///
+/// 受信側は前方互換のため未知コードを許容する(文字列として保持)。送信時は本定数を使う。
+pub mod thread_reject_reason {
+    /// 参加上限到達。
+    pub const FULL: &str = "full";
+    /// スレが凍結中。
+    pub const FROZEN: &str = "frozen";
+    /// スレがクローズ済み。
+    pub const CLOSED: &str = "closed";
+    /// 未知のスレ(`thread` が指す板・世代が存在しない)。
+    pub const UNKNOWN_THREAD: &str = "unknown_thread";
+    /// レート制限。
+    pub const RATE: &str = "rate";
 }
 
 /// CLOSE の定型 reason コード(内部情報を含めない — MUST NOT)。
@@ -284,6 +349,40 @@ mod tests {
             Message::Close {
                 reason: close_reason::INCOMPATIBLE.into(),
             },
+            Message::ThreadJoin {
+                thread: "abc:1".into(),
+                challenge: "deadbeef".into(),
+                since_seq: 0,
+            },
+            Message::ThreadWelcome {
+                thread: "abc:1".into(),
+                sig: "sig-hex".into(),
+                board_settings: serde_json::json!({"title":"板タイトル"}),
+                res_count: 3,
+            },
+            Message::ThreadReject {
+                reason: thread_reject_reason::FULL.into(),
+            },
+            Message::Res {
+                event: serde_json::json!({"kind":1311}),
+            },
+            Message::Order {
+                event: serde_json::json!({"kind":21311}),
+            },
+            Message::Settings {
+                board_settings: serde_json::json!({"title":"板タイトル"}),
+            },
+            Message::ResendReq {
+                from_seq: 10,
+                to_seq: 20,
+            },
+            Message::ThreadClose {
+                event: serde_json::json!({"kind":21311,"tags":[["peca","close"]]}),
+            },
+            Message::NextThread {
+                generation: 2,
+                key: 1_720_000_000,
+            },
         ];
         for m in msgs {
             let bytes = encode(&m).unwrap();
@@ -301,6 +400,25 @@ mod tests {
         let mut cur = Cursor::new(bytes);
         let got = read_frame(&mut cur).await.unwrap().unwrap();
         assert_eq!(got.message, Message::Ping { nonce: u64::MAX });
+    }
+
+    #[tokio::test]
+    async fn next_thread_uses_gen_wire_key() {
+        // Rust edition 2024 では `gen` が予約語のためフィールド名は `generation` だが、
+        // ワイヤ JSON のキーは contracts/thread-delivery.md どおり `gen` でなければならない。
+        let m = Message::NextThread {
+            generation: 7,
+            key: 42,
+        };
+        let bytes = encode(&m).unwrap();
+        let payload = &bytes[4..];
+        let value: Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(value["gen"], 7);
+        assert!(value.get("generation").is_none());
+
+        let mut cur = Cursor::new(bytes);
+        let got = read_frame(&mut cur).await.unwrap().unwrap();
+        assert_eq!(got.message, m);
     }
 
     #[tokio::test]

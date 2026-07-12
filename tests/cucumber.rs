@@ -5,6 +5,7 @@
 //! - `steps/us2.rs` — US2 発見(T034 骨格 → T044 で実装)
 //! - `steps/us3.rs` — US3 継続性(T045 骨格 → T049 で実装)
 //! - `steps/outbound_only.rs` — 着信不可ノード参加(T051 骨格 → T054 で実装)
+//! - `steps/livechat.rs` — 006-livechat-thread US1〜US6(T016 骨格 → 後続タスクで実装)
 //!
 //! `fail_on_skipped` により、未実装ステップのシナリオは失敗として報告される
 //! (Principle IV — テストファーストの失敗確認)。
@@ -23,6 +24,8 @@ pub(crate) mod log_capture;
 
 #[path = "steps/keystore.rs"]
 mod keystore;
+#[path = "steps/livechat.rs"]
+mod livechat;
 #[path = "steps/outbound_only.rs"]
 mod outbound_only;
 #[path = "steps/persona_selection.rs"]
@@ -53,6 +56,8 @@ pub struct AppWorld {
     keystore: Option<keystore::KeystoreWorld>,
     /// 掲載前ペルソナ選択・配信中ロックシナリオの状態(Background で初期化 — T012/T021)。
     persona_selection: Option<persona_selection::PersonaSelectionWorld>,
+    /// 配信実況スレ(006-livechat-thread)シナリオの状態。各シナリオの Given で初期化する(T016)。
+    livechat: Option<livechat::LivechatWorld>,
 }
 
 /// ステップの async 未来型は debug ビルドで巨大になり、Windows 既定の main スレッド

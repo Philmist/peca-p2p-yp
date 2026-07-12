@@ -31,7 +31,8 @@ use crate::p2p::peers::{
 };
 use crate::p2p::pex::{self, PEX_MAX_PEERS};
 use crate::p2p::session::{
-    Direction, Keepalive, KeepaliveAction, PeerHello, Session, SessionAction, SessionConfig,
+    Direction, FEATURE_LIVECHAT1, Keepalive, KeepaliveAction, PeerHello, Session, SessionAction,
+    SessionConfig,
 };
 use crate::p2p::sync::{self, SyncCounter};
 use crate::security::{SecurityCategory, SecurityLog};
@@ -171,10 +172,14 @@ impl P2pRuntime {
     }
 
     /// 各接続に用いるセッション設定(自ノードの申告値・レート上限は既定)。
+    ///
+    /// `features` に `livechat1`(006-livechat-thread)を掲げる。旧ノードは未知 feature を
+    /// 無視する既存規則(MUST)によりそのまま gossip として動作する(research R4)。
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
             local_nonce: self.nonce,
             local_listen_port: self.listen_port,
+            local_features: vec![FEATURE_LIVECHAT1.into()],
             ..SessionConfig::default()
         }
     }

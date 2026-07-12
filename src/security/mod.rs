@@ -1,7 +1,8 @@
 //! セキュリティ共通部(T014)
 //!
 //! - 入力検証ヘルパ(サイズ・制御文字・URL 警告判定 — FR-012)
-//! - SecurityEvent カテゴリの一元定義(data-model.md §SecurityEvent を正とする全 12 カテゴリ)
+//! - SecurityEvent カテゴリの一元定義(data-model.md §SecurityEvent を正とする全 21 カテゴリ。
+//!   うち 6 件は 006-livechat-thread data-model §SecurityEvent 追加カテゴリ — T008)
 //! - セキュリティイベントログ: サイズローテーション(10MB × 5 世代)+
 //!   同一 `(category, source)` の高頻度イベントの 10 秒間隔件数集約
 //!   (ログ洪水によるディスク枯渇の防止 — constitution §Security Requirements, Principle II)
@@ -52,11 +53,25 @@ pub enum SecurityCategory {
     /// ではなく、**利用者が明示的に選んだ露出状態の監査**である。起動時に非 loopback かつ
     /// bind 成功のとき 1 件だけ記録する(loopback 値・bind 失敗・機能無効では記録しない)。
     IndexTxtLanExposed,
+    /// announce(kind 31311)の署名者がチャンネル掲載ペルソナと不一致・形式違反
+    /// (006-livechat-thread data-model §SecurityEvent — FR-003)
+    LivechatAnnounceInvalid,
+    /// 接続時チャレンジの検証失敗(切断 + バックオフ — FR-005)
+    LivechatChallengeFailed,
+    /// スレ主以外の鍵で署名された順序確定情報(kind 21311 — FR-011)
+    LivechatOrderInvalid,
+    /// サイズ・形式・PoW・レート違反の書き込み(ホスト側)。BAN による採番拒否は
+    /// 記録するが応答では理由を開示しない(FR-007/FR-021)
+    LivechatWriteRejected,
+    /// 検証に失敗する板設定の受信(FR-025)
+    LivechatSettingsInvalid,
+    /// 互換 API への loopback 外アクセス・Host 検証失敗・レート違反(FR-026)
+    CompatBbsDenied,
 }
 
 impl SecurityCategory {
-    /// 全カテゴリ(データモデルの全量 15 件)。リリース前ゲート(T035)の一致確認に使う。
-    pub const ALL: [SecurityCategory; 15] = [
+    /// 全カテゴリ(データモデルの全量 21 件)。リリース前ゲート(T035)の一致確認に使う。
+    pub const ALL: [SecurityCategory; 21] = [
         SecurityCategory::PcpReject,
         SecurityCategory::P2pInvalidFrame,
         SecurityCategory::P2pOversize,
@@ -72,6 +87,12 @@ impl SecurityCategory {
         SecurityCategory::KeyPermissionFixed,
         SecurityCategory::KeyPermissionUnfixable,
         SecurityCategory::IndexTxtLanExposed,
+        SecurityCategory::LivechatAnnounceInvalid,
+        SecurityCategory::LivechatChallengeFailed,
+        SecurityCategory::LivechatOrderInvalid,
+        SecurityCategory::LivechatWriteRejected,
+        SecurityCategory::LivechatSettingsInvalid,
+        SecurityCategory::CompatBbsDenied,
     ];
 
     /// ログに書き出すカテゴリ名(data-model.md の表記と一致させる)。
@@ -92,6 +113,12 @@ impl SecurityCategory {
             SecurityCategory::KeyPermissionFixed => "key_permission_fixed",
             SecurityCategory::KeyPermissionUnfixable => "key_permission_unfixable",
             SecurityCategory::IndexTxtLanExposed => "index_txt_lan_exposed",
+            SecurityCategory::LivechatAnnounceInvalid => "livechat_announce_invalid",
+            SecurityCategory::LivechatChallengeFailed => "livechat_challenge_failed",
+            SecurityCategory::LivechatOrderInvalid => "livechat_order_invalid",
+            SecurityCategory::LivechatWriteRejected => "livechat_write_rejected",
+            SecurityCategory::LivechatSettingsInvalid => "livechat_settings_invalid",
+            SecurityCategory::CompatBbsDenied => "compat_bbs_denied",
         }
     }
 }
@@ -347,9 +374,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn all_15_categories_have_unique_names() {
+    fn all_21_categories_have_unique_names() {
         let names: HashSet<&str> = SecurityCategory::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 21);
         assert!(names.contains("pcp_reject"));
         assert!(names.contains("p2p_invalid_frame"));
         assert!(names.contains("p2p_oversize"));
@@ -365,6 +392,12 @@ mod tests {
         assert!(names.contains("key_permission_fixed"));
         assert!(names.contains("key_permission_unfixable"));
         assert!(names.contains("index_txt_lan_exposed"));
+        assert!(names.contains("livechat_announce_invalid"));
+        assert!(names.contains("livechat_challenge_failed"));
+        assert!(names.contains("livechat_order_invalid"));
+        assert!(names.contains("livechat_write_rejected"));
+        assert!(names.contains("livechat_settings_invalid"));
+        assert!(names.contains("compat_bbs_denied"));
     }
 
     #[test]

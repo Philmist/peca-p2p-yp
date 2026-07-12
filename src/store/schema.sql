@@ -43,3 +43,40 @@ CREATE TABLE IF NOT EXISTS settings (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL
 );
+
+-- ===========================================================================
+-- 006-livechat-thread(T007 — data-model.md §永続化)
+--
+-- スレデータ(レス・順序確定情報)は揮発でメモリのみ(FR-015)。テーブルを作らない。
+-- 復活させてはならない (MUST NOT)。以下 3 テーブルのみが livechat の永続情報。
+-- ===========================================================================
+
+-- 板鍵(自分の書き込み鍵。板 = 配信者ペルソナ単位で 1 本 — FR-016)
+-- 秘密鍵は keystore 暗号化エンベロープのみ保存(平文保存 MUST NOT — research R8)。
+-- personas とは識別子・外部キーを一切共有しない(構造分離 — FR-016)。
+CREATE TABLE IF NOT EXISTS board_keys (
+    board_id    TEXT PRIMARY KEY,       -- 板スコープ = スレ主(配信者)ペルソナの公開鍵(hex 64)
+    pubkey      TEXT NOT NULL,          -- 板鍵の公開鍵(hex 64)。ID 表示・NG/BAN 完全鍵照合に使用
+    secret_enc  BLOB NOT NULL,          -- keystore 暗号化済み板鍵秘密鍵。平文保存禁止 (MUST NOT)
+    created_at  INTEGER NOT NULL        -- 生成/ローテーション時刻(unix 秒。ローテーションで行ごと置換)
+);
+
+-- NG / BAN(ローカル保存のみ。ネットワークへは送出しない = 不変条件 M1 — FR-019)
+CREATE TABLE IF NOT EXISTS livechat_moderation (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id    TEXT NOT NULL,          -- 板スコープ(pubkey hex 64)
+    kind        TEXT NOT NULL,          -- 'ng' / 'ban' / 'conn_ban'
+    target      TEXT NOT NULL,          -- 完全鍵(hex 64)または接続元アドレス。短縮 ID 照合禁止(FR-018)
+    created_at  INTEGER NOT NULL,
+    UNIQUE(board_id, kind, target)
+);
+
+-- 板設定(自分が板主の板。BoardSettings — FR-022〜FR-025)
+CREATE TABLE IF NOT EXISTS board_settings (
+    board_id             TEXT PRIMARY KEY,  -- 板スコープ(= 自ペルソナ pubkey hex 64)
+    title                TEXT NOT NULL,     -- ≤ 128 文字
+    res_limit            INTEGER NOT NULL,  -- 100〜4000(既定 1000)
+    noname_name          TEXT NOT NULL,     -- 1〜64 文字
+    local_rules          TEXT NOT NULL,     -- ≤ 2048 文字(Markdown)
+    first_post_pow_bits  INTEGER NOT NULL   -- 0〜32(既定 20)。唯一の正式名(ノード Settings には置かない)
+);

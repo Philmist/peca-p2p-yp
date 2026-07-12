@@ -241,6 +241,80 @@ pub struct MuteEntry {
     pub created_at: i64,
 }
 
+// --- 006-livechat-thread(T007 — data-model §永続化)------------------------
+
+/// 板鍵の保管行(data-model §BoardKey)。秘密鍵は keystore 暗号化 BLOB のみ保持し、
+/// 平文を持たない(MUST NOT)。板 = 配信者ペルソナ単位で 1 本(FR-016)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardKeyRow {
+    /// 板スコープ = スレ主(配信者)ペルソナの公開鍵(hex 64)。
+    pub board_id: String,
+    /// 板鍵の公開鍵(hex 64)。ID 表示・NG/BAN 完全鍵照合に使用。
+    pub pubkey: String,
+    /// keystore 暗号化済み板鍵秘密鍵(エンベロープ)。
+    pub secret_enc: Vec<u8>,
+    /// 生成/ローテーション時刻(unix 秒)。
+    pub created_at: i64,
+}
+
+/// モデレーション種別(data-model §NG/BAN エントリ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModerationKind {
+    /// 視聴者ローカル非表示。
+    Ng,
+    /// スレ主: 採番拒否。
+    Ban,
+    /// スレ主: 接続拒否。
+    ConnBan,
+}
+
+impl ModerationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ModerationKind::Ng => "ng",
+            ModerationKind::Ban => "ban",
+            ModerationKind::ConnBan => "conn_ban",
+        }
+    }
+
+    /// DB 値からの復元(未知値は最も影響の小さい `ng` = ローカル非表示へ倒す)。
+    fn from_db(s: &str) -> ModerationKind {
+        match s {
+            "ban" => ModerationKind::Ban,
+            "conn_ban" => ModerationKind::ConnBan,
+            _ => ModerationKind::Ng,
+        }
+    }
+}
+
+/// NG / BAN エントリ(data-model §NG/BAN エントリ)。ネットワーク非送出(不変条件 M1)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationEntry {
+    pub id: i64,
+    /// 板スコープ(pubkey hex 64)。
+    pub board_id: String,
+    pub kind: ModerationKind,
+    /// 完全鍵(hex 64)または接続元アドレス。短縮 ID 照合禁止(FR-018)。
+    pub target: String,
+    pub created_at: i64,
+}
+
+/// 板設定の保管行(data-model §BoardSettings — FR-022〜FR-025)。
+///
+/// 値域(title ≤ 128・res_limit 100〜4000・noname_name 1〜64・local_rules ≤ 2048・
+/// first_post_pow_bits 0〜32)の強制は上位([`crate::livechat::thread`] T013)の責務で、
+/// ストアは行の保管のみを担う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardSettingsRow {
+    /// 板スコープ(= 自ペルソナ pubkey hex 64)。
+    pub board_id: String,
+    pub title: String,
+    pub res_limit: i64,
+    pub noname_name: String,
+    pub local_rules: String,
+    pub first_post_pow_bits: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -621,6 +695,176 @@ impl Store {
         }
         Ok(map)
     }
+
+    // -------------------------------------------------------------- board_keys
+
+    /// 板鍵を登録またはローテーションする(`board_id` 一意 — 板単位で 1 本)。
+    ///
+    /// 既存行があれば **行ごと置換**する(ローテーション = 旧鍵の破棄。FR-017)。
+    /// `secret_enc` は keystore 暗号化済みエンベロープ(平文を渡してはならない — MUST NOT)。
+    pub fn upsert_board_key(
+        &self,
+        board_id: &str,
+        pubkey: &str,
+        secret_enc: &[u8],
+        created_at: i64,
+    ) -> Result<BoardKeyRow> {
+        if !is_lower_hex(board_id, PUBKEY_HEX_LEN) || !is_lower_hex(pubkey, PUBKEY_HEX_LEN) {
+            return Err(StoreError::Validation("公開鍵の形式が不正です"));
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO board_keys (board_id, pubkey, secret_enc, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(board_id) DO UPDATE SET
+                 pubkey = excluded.pubkey,
+                 secret_enc = excluded.secret_enc,
+                 created_at = excluded.created_at",
+            rusqlite::params![board_id, pubkey, secret_enc, created_at],
+        )
+        .map_err(map_sqlite)?;
+        Ok(BoardKeyRow {
+            board_id: board_id.to_string(),
+            pubkey: pubkey.to_string(),
+            secret_enc: secret_enc.to_vec(),
+            created_at,
+        })
+    }
+
+    /// 板鍵を取得する(未登録は `None`)。
+    pub fn get_board_key(&self, board_id: &str) -> Result<Option<BoardKeyRow>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT board_id, pubkey, secret_enc, created_at FROM board_keys WHERE board_id = ?1",
+            [board_id],
+            row_to_board_key,
+        )
+        .optional()
+    }
+
+    /// 全板鍵を board_id 昇順で列挙する。
+    pub fn list_board_keys(&self) -> Result<Vec<BoardKeyRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT board_id, pubkey, secret_enc, created_at FROM board_keys
+                 ORDER BY board_id ASC",
+            )
+            .map_err(map_sqlite)?;
+        let rows = stmt.query_map([], row_to_board_key).map_err(map_sqlite)?;
+        collect_rows(rows)
+    }
+
+    /// 板鍵を削除する(行削除 — 復元不可)。削除できれば `true`。
+    pub fn delete_board_key(&self, board_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute("DELETE FROM board_keys WHERE board_id = ?1", [board_id])
+            .map_err(map_sqlite)?;
+        Ok(n > 0)
+    }
+
+    // ------------------------------------------------------- livechat_moderation
+
+    /// NG/BAN を登録する(同一 `(board_id, kind, target)` は再登録せず既存を返す)。
+    pub fn insert_moderation(
+        &self,
+        board_id: &str,
+        kind: ModerationKind,
+        target: &str,
+    ) -> Result<ModerationEntry> {
+        if target.is_empty() {
+            return Err(StoreError::Validation("対象が空です"));
+        }
+        let created_at = unix_now();
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO livechat_moderation (board_id, kind, target, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![board_id, kind.as_str(), target, created_at],
+        )
+        .map_err(map_sqlite)?;
+        conn.query_row(
+            "SELECT id, board_id, kind, target, created_at FROM livechat_moderation
+             WHERE board_id = ?1 AND kind = ?2 AND target = ?3",
+            rusqlite::params![board_id, kind.as_str(), target],
+            row_to_moderation,
+        )
+        .map_err(map_sqlite)
+    }
+
+    /// 指定板の NG/BAN を id 昇順で列挙する。
+    pub fn list_moderation(&self, board_id: &str) -> Result<Vec<ModerationEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, board_id, kind, target, created_at FROM livechat_moderation
+                 WHERE board_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(map_sqlite)?;
+        let rows = stmt
+            .query_map([board_id], row_to_moderation)
+            .map_err(map_sqlite)?;
+        collect_rows(rows)
+    }
+
+    /// NG/BAN を id で削除する(解除)。削除できれば `true`。
+    pub fn delete_moderation(&self, id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute("DELETE FROM livechat_moderation WHERE id = ?1", [id])
+            .map_err(map_sqlite)?;
+        Ok(n > 0)
+    }
+
+    // ----------------------------------------------------------- board_settings
+
+    /// 板設定を取得する(未保存は `None`)。
+    pub fn get_board_settings(&self, board_id: &str) -> Result<Option<BoardSettingsRow>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT board_id, title, res_limit, noname_name, local_rules, first_post_pow_bits
+             FROM board_settings WHERE board_id = ?1",
+            [board_id],
+            row_to_board_settings,
+        )
+        .optional()
+    }
+
+    /// 板設定を保存する(UPSERT — board_id 一意)。
+    pub fn set_board_settings(&self, row: &BoardSettingsRow) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO board_settings
+                 (board_id, title, res_limit, noname_name, local_rules, first_post_pow_bits)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(board_id) DO UPDATE SET
+                 title = excluded.title,
+                 res_limit = excluded.res_limit,
+                 noname_name = excluded.noname_name,
+                 local_rules = excluded.local_rules,
+                 first_post_pow_bits = excluded.first_post_pow_bits",
+            rusqlite::params![
+                row.board_id,
+                row.title,
+                row.res_limit,
+                row.noname_name,
+                row.local_rules,
+                row.first_post_pow_bits,
+            ],
+        )
+        .map_err(map_sqlite)?;
+        Ok(())
+    }
+
+    /// 板設定を削除する。削除できれば `true`。
+    pub fn delete_board_settings(&self, board_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute("DELETE FROM board_settings WHERE board_id = ?1", [board_id])
+            .map_err(map_sqlite)?;
+        Ok(n > 0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +905,36 @@ fn row_to_mute(row: &Row<'_>) -> rusqlite::Result<MuteEntry> {
         kind: MuteKind::from_db(&row.get::<_, String>(1)?),
         value: row.get(2)?,
         created_at: row.get(3)?,
+    })
+}
+
+fn row_to_board_key(row: &Row<'_>) -> rusqlite::Result<BoardKeyRow> {
+    Ok(BoardKeyRow {
+        board_id: row.get(0)?,
+        pubkey: row.get(1)?,
+        secret_enc: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
+fn row_to_moderation(row: &Row<'_>) -> rusqlite::Result<ModerationEntry> {
+    Ok(ModerationEntry {
+        id: row.get(0)?,
+        board_id: row.get(1)?,
+        kind: ModerationKind::from_db(&row.get::<_, String>(2)?),
+        target: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+fn row_to_board_settings(row: &Row<'_>) -> rusqlite::Result<BoardSettingsRow> {
+    Ok(BoardSettingsRow {
+        board_id: row.get(0)?,
+        title: row.get(1)?,
+        res_limit: row.get(2)?,
+        noname_name: row.get(3)?,
+        local_rules: row.get(4)?,
+        first_post_pow_bits: row.get(5)?,
     })
 }
 
@@ -1027,6 +1301,117 @@ mod tests {
         let all = s.all_settings().unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all["pex_enabled"], "1");
+    }
+
+    // --- 006-livechat-thread(T007)------------------------------------------
+
+    #[test]
+    fn livechat_tables_exist() {
+        let s = store();
+        // 各テーブルへの単純クエリが成功する = スキーマ適用済み。
+        assert!(s.get_board_key(PK1).unwrap().is_none());
+        assert!(s.list_board_keys().unwrap().is_empty());
+        assert!(s.list_moderation(PK1).unwrap().is_empty());
+        assert!(s.get_board_settings(PK1).unwrap().is_none());
+    }
+
+    #[test]
+    fn board_key_upsert_get_and_rotate() {
+        let s = store();
+        let row = s.upsert_board_key(PK1, PK2, b"enc-secret-1", 100).unwrap();
+        assert_eq!(row.board_id, PK1);
+        assert_eq!(row.pubkey, PK2);
+        let got = s.get_board_key(PK1).unwrap().unwrap();
+        assert_eq!(got.secret_enc, b"enc-secret-1");
+        assert_eq!(got.created_at, 100);
+
+        // ローテーション = 行ごと置換(旧鍵の破棄。FR-017)。board_id は 1 本のまま。
+        let pk3 = "1111111111111111111111111111111111111111111111111111111111111111";
+        s.upsert_board_key(PK1, pk3, b"enc-secret-2", 200).unwrap();
+        let got = s.get_board_key(PK1).unwrap().unwrap();
+        assert_eq!(got.pubkey, pk3);
+        assert_eq!(got.secret_enc, b"enc-secret-2");
+        assert_eq!(got.created_at, 200);
+        assert_eq!(s.list_board_keys().unwrap().len(), 1);
+
+        assert!(s.delete_board_key(PK1).unwrap());
+        assert!(s.get_board_key(PK1).unwrap().is_none());
+        assert!(!s.delete_board_key(PK1).unwrap());
+    }
+
+    #[test]
+    fn board_key_rejects_bad_pubkey() {
+        let s = store();
+        assert!(matches!(
+            s.upsert_board_key("XYZ", PK2, b"x", 1).unwrap_err(),
+            StoreError::Validation(_)
+        ));
+        assert!(matches!(
+            s.upsert_board_key(PK1, "short", b"x", 1).unwrap_err(),
+            StoreError::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn moderation_crud_scoped_by_board_and_dedup() {
+        let s = store();
+        let e = s.insert_moderation(PK1, ModerationKind::Ban, PK2).unwrap();
+        assert_eq!(e.kind, ModerationKind::Ban);
+        // 同一 (board_id, kind, target) は再登録せず同じ id。
+        let again = s.insert_moderation(PK1, ModerationKind::Ban, PK2).unwrap();
+        assert_eq!(again.id, e.id);
+        // kind 違いは別エントリ。
+        s.insert_moderation(PK1, ModerationKind::Ng, PK2).unwrap();
+        // 別板スコープは混ざらない(板単位スコープ)。
+        s.insert_moderation(PK2, ModerationKind::Ban, PK1).unwrap();
+        assert_eq!(s.list_moderation(PK1).unwrap().len(), 2);
+        assert_eq!(s.list_moderation(PK2).unwrap().len(), 1);
+
+        assert!(s.delete_moderation(e.id).unwrap());
+        assert_eq!(s.list_moderation(PK1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn moderation_kind_roundtrip() {
+        let s = store();
+        for (kind, target) in [
+            (ModerationKind::Ng, "a"),
+            (ModerationKind::Ban, "b"),
+            (ModerationKind::ConnBan, "127.0.0.1:1234"),
+        ] {
+            let e = s.insert_moderation(PK1, kind, target).unwrap();
+            assert_eq!(e.kind, kind);
+        }
+        assert_eq!(s.list_moderation(PK1).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn board_settings_upsert_get_delete() {
+        let s = store();
+        let row = BoardSettingsRow {
+            board_id: PK1.to_string(),
+            title: "実況板".to_string(),
+            res_limit: 1000,
+            noname_name: "名無しさん".to_string(),
+            local_rules: "# ローカルルール".to_string(),
+            first_post_pow_bits: 20,
+        };
+        s.set_board_settings(&row).unwrap();
+        assert_eq!(s.get_board_settings(PK1).unwrap().unwrap(), row);
+
+        // UPSERT: 同一 board_id は置換。
+        let updated = BoardSettingsRow {
+            title: "改名板".to_string(),
+            res_limit: 4000,
+            ..row.clone()
+        };
+        s.set_board_settings(&updated).unwrap();
+        let got = s.get_board_settings(PK1).unwrap().unwrap();
+        assert_eq!(got.title, "改名板");
+        assert_eq!(got.res_limit, 4000);
+
+        assert!(s.delete_board_settings(PK1).unwrap());
+        assert!(s.get_board_settings(PK1).unwrap().is_none());
     }
 
     #[test]

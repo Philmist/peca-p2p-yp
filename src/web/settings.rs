@@ -1,10 +1,12 @@
 //! 設定 API(T062 — contracts/local-api.md `GET/PUT /settings`)
 //!
-//! - `GET /api/v1/settings`: data-model §Settings の全 13 キーを返す。
-//! - `PUT /api/v1/settings`: 検証つき更新。`pcp_bind` / `http_bind` の非 loopback 値は
-//!   400 で拒否する(ADR-0006 決定 4 — [`crate::config::Settings::validate`] を活用)。
-//!   バインド系キー(`pcp_bind` / `http_bind` / `p2p_bind`)の変更は保存のうえ
-//!   応答に再起動要求(`restart_required` / `restart_keys`)を含める。
+//! - `GET /api/v1/settings`: data-model §Settings の全 19 キー(001 の 13 +
+//!   006-livechat-thread 追加分 6)を返す。
+//! - `PUT /api/v1/settings`: 検証つき更新。`pcp_bind` / `http_bind` / `compat_bbs_bind`
+//!   の非 loopback 値は 400 で拒否する(ADR-0006 決定 4 —
+//!   [`crate::config::Settings::validate`] を活用)。
+//!   バインド系キー(`pcp_bind` / `http_bind` / `p2p_bind` / `compat_bbs_bind`)の変更は
+//!   保存のうえ応答に再起動要求(`restart_required` / `restart_keys`)を含める。
 //!
 //! ルートは [`super::api_router`] へ登録され、4 層の保護(Host 検証・レート制限・
 //! トークン検証・ボディ上限)を自動継承する。エラー応答は `{"error":"<code>"}` のみ。
@@ -24,7 +26,13 @@ use crate::config::{ConfigError, Settings};
 use super::{AppState, error_response};
 
 /// バインド系キー(変更時に再起動が必要)。
-const BIND_KEYS: [&str; 4] = ["pcp_bind", "http_bind", "p2p_bind", "index_bind"];
+const BIND_KEYS: [&str; 5] = [
+    "pcp_bind",
+    "http_bind",
+    "p2p_bind",
+    "index_bind",
+    "compat_bbs_bind",
+];
 
 /// `GET /api/v1/settings` — 全設定キーを JSON で返す。
 pub async fn get_settings(State(state): State<AppState>) -> Response {
@@ -99,6 +107,9 @@ fn changed_bind_keys(current: &Settings, next: &Settings) -> Vec<&'static str> {
     if current.index_bind != next.index_bind {
         keys.push(BIND_KEYS[3]);
     }
+    if current.compat_bbs_bind != next.compat_bbs_bind {
+        keys.push(BIND_KEYS[4]);
+    }
     keys
 }
 
@@ -119,6 +130,12 @@ fn settings_to_json(s: &Settings) -> serde_json::Value {
         "event_store_max": s.event_store_max,
         "index_txt_encoding": s.index_txt_encoding,
         "index_bind": s.index_bind,
+        "livechat_enabled": s.livechat_enabled,
+        "thread_max_participants": s.thread_max_participants,
+        "thread_write_rate": s.thread_write_rate,
+        "thread_msg_rate": s.thread_msg_rate,
+        "announce_store_quota": s.announce_store_quota,
+        "compat_bbs_bind": s.compat_bbs_bind,
     })
 }
 
@@ -140,6 +157,12 @@ struct SettingsUpdate {
     event_store_max: Option<u64>,
     index_txt_encoding: Option<String>,
     index_bind: Option<String>,
+    livechat_enabled: Option<bool>,
+    thread_max_participants: Option<u32>,
+    thread_write_rate: Option<u32>,
+    thread_msg_rate: Option<u32>,
+    announce_store_quota: Option<u64>,
+    compat_bbs_bind: Option<String>,
 }
 
 impl SettingsUpdate {
@@ -186,6 +209,24 @@ impl SettingsUpdate {
         }
         if let Some(v) = self.index_bind {
             base.index_bind = v;
+        }
+        if let Some(v) = self.livechat_enabled {
+            base.livechat_enabled = v;
+        }
+        if let Some(v) = self.thread_max_participants {
+            base.thread_max_participants = v;
+        }
+        if let Some(v) = self.thread_write_rate {
+            base.thread_write_rate = v;
+        }
+        if let Some(v) = self.thread_msg_rate {
+            base.thread_msg_rate = v;
+        }
+        if let Some(v) = self.announce_store_quota {
+            base.announce_store_quota = v;
+        }
+        if let Some(v) = self.compat_bbs_bind {
+            base.compat_bbs_bind = v;
         }
         base
     }

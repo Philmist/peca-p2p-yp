@@ -17,11 +17,17 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::p2p::frame::{Hello, Message, close_reason};
+use crate::p2p::frame::{Hello, Message, close_reason, thread_reject_reason};
 use crate::security::{SecurityCategory, SecurityLog};
 
 /// プロトコルバージョン(v1)。互換判定は完全一致。
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// HELLO の機能フラグ: スレ配送対応(contracts/thread-delivery.md §トランスポート)。
+///
+/// 未知 feature は無視する既存規則(MUST)により、本フラグを知らない旧ノードとの
+/// gossip 互換性はそのまま保たれる(research R4)。
+pub const FEATURE_LIVECHAT1: &str = "livechat1";
 
 /// 受信レート上限(検査 2): 1 ピアあたり 256KB/秒。
 pub const DEFAULT_MAX_BYTES_PER_SEC: usize = 256 * 1024;
@@ -115,6 +121,41 @@ pub enum SessionAction {
     Deliver(Message),
     /// 相手からの CLOSE 受信(定型 reason コード)。
     PeerClosed(String),
+}
+
+/// 1 TCP 接続の用途(contracts/thread-delivery.md §トランスポート「1 TCP 接続 = 1 用途」)。
+///
+/// established 直後は [`Unclassified`](Self::Unclassified) で、最初に届いたメッセージで
+/// 確定する: `THREAD_JOIN` ならスレセッション、それ以外は gossip セッション。
+/// 以後の種別混在(gossip 接続に THREAD_* / スレ接続に gossip 専用メッセージ)は
+/// 不正フレームとして切断する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    /// 最初のメッセージ未受信(established 直後の一過状態)。
+    Unclassified,
+    /// gossip セッション(EVENT/SYNC_REQ/GET_PEERS/PEERS/PING/PONG)。
+    Gossip,
+    /// スレセッション(THREAD_JOIN で開始)。
+    ///
+    /// スレセッション本体(採番・配布)は未実装(T021/T022 以降)のため、
+    /// v1 では [`Session`] が定型 THREAD_REJECT を返して切断するスタブに留まる。
+    Thread,
+}
+
+/// メッセージが THREAD_* 系(スレ配送専用)か。
+fn is_thread_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ThreadJoin { .. }
+            | Message::ThreadWelcome { .. }
+            | Message::ThreadReject { .. }
+            | Message::Res { .. }
+            | Message::Order { .. }
+            | Message::Settings { .. }
+            | Message::ResendReq { .. }
+            | Message::ThreadClose { .. }
+            | Message::NextThread { .. }
+    )
 }
 
 /// 切断を伴う条件。呼び出し側は `reason` で CLOSE を送って切断する。
@@ -266,6 +307,8 @@ pub struct Session {
     peer: Option<PeerHello>,
     rate: RateLimiter,
     clock: Box<dyn Fn() -> f64 + Send>,
+    /// 1 TCP 接続 = 1 用途の分類(006-livechat-thread T014)。
+    kind: SessionKind,
 }
 
 /// 既定クロック: 生成時点からの単調経過秒。
@@ -309,6 +352,7 @@ impl Session {
             peer: None,
             rate,
             clock: default_clock(),
+            kind: SessionKind::Unclassified,
         }
     }
 
@@ -444,13 +488,67 @@ impl Session {
         match message {
             // established 後の再ハンドシェイクは順序違反。
             Message::Hello(_) | Message::HelloAck(_) => self.fail_invalid_frame(),
-            // CLOSE は正常切断として通知。
+            // CLOSE は正常切断として通知(種別未確定・gossip・スレのいずれでも共通)。
             Message::Close { reason } => {
                 self.state = SessionState::Closed;
                 Ok(vec![SessionAction::PeerClosed(reason)])
             }
-            // その他は上位レイヤへ委譲(伝搬・同期・PEX・keepalive は担当外)。
-            other => Ok(vec![SessionAction::Deliver(other)]),
+            other => self.route_established(other),
+        }
+    }
+
+    /// 種別未確定 → 最初のメッセージで gossip / スレへ分岐し、以後は種別ごとに検査する
+    /// (contracts/thread-delivery.md §トランスポート「1 TCP 接続 = 1 用途」)。
+    fn route_established(&mut self, message: Message) -> Result<Vec<SessionAction>, Disconnect> {
+        if self.kind == SessionKind::Unclassified {
+            self.kind = if matches!(message, Message::ThreadJoin { .. }) {
+                SessionKind::Thread
+            } else {
+                SessionKind::Gossip
+            };
+        }
+        match self.kind {
+            SessionKind::Gossip => {
+                // gossip セッションに THREAD_* が混在したら不正フレーム。
+                if is_thread_message(&message) {
+                    return self.fail_invalid_frame();
+                }
+                Ok(vec![SessionAction::Deliver(message)])
+            }
+            SessionKind::Thread => self.handle_thread_session(message),
+            SessionKind::Unclassified => unreachable!("直前に確定させている"),
+        }
+    }
+
+    /// スレセッションの受け口(T014 スタブ)。
+    ///
+    /// スレセッション本体(採番・配布 — T021/T022 以降)は未実装のため、v1 では
+    /// `THREAD_JOIN` に対し定型 `THREAD_REJECT(unknown_thread)` を返して `CLOSE(going_away)`
+    /// で切断する安全なスタブとする。以後の gossip 専用メッセージ(EVENT/SYNC_REQ 等)が
+    /// スレ接続に混在した場合も不正フレームとして切断する(1 用途原則)。
+    fn handle_thread_session(
+        &mut self,
+        message: Message,
+    ) -> Result<Vec<SessionAction>, Disconnect> {
+        if !is_thread_message(&message) {
+            return self.fail_invalid_frame();
+        }
+        match message {
+            Message::ThreadJoin { .. } => {
+                self.state = SessionState::Closed;
+                Ok(vec![
+                    SessionAction::Send(Message::ThreadReject {
+                        reason: thread_reject_reason::UNKNOWN_THREAD.into(),
+                    }),
+                    SessionAction::Send(Message::Close {
+                        reason: close_reason::GOING_AWAY.into(),
+                    }),
+                ])
+            }
+            // THREAD_JOIN 以外のスレメッセージが最初に届くことはない(Unclassified からの
+            // 分岐は THREAD_JOIN のみで Thread へ遷移するため)。以後の同一接続上の
+            // 追加メッセージも本スタブでは受け付けない。
+            _ => self.fail_invalid_frame(),
         }
     }
 
@@ -618,6 +716,112 @@ mod tests {
                 .any(|x| matches!(x, SessionAction::PeerClosed(r) if r == "going_away"))
         );
         assert_eq!(s.state(), SessionState::Closed);
+    }
+
+    // ---- スレ配送の多重化(006-livechat-thread T014) ----
+
+    #[test]
+    fn established_first_message_thread_join_routes_to_thread_session() {
+        // established 後の最初のメッセージが THREAD_JOIN ならスレセッションへ分岐する
+        // (contracts/thread-delivery.md §トランスポート)。本スタブは定型
+        // THREAD_REJECT(unknown_thread) + CLOSE(going_away) を返す。
+        let mut s = Session::new_inbound(cfg(1), "p:20".into(), None);
+        s.on_frame(64, hello(1, 3)).unwrap();
+        let actions = s
+            .on_frame(
+                32,
+                Message::ThreadJoin {
+                    thread: "board:1".into(),
+                    challenge: "deadbeef".into(),
+                    since_seq: 0,
+                },
+            )
+            .unwrap();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            SessionAction::Send(Message::ThreadReject { reason })
+                if reason == thread_reject_reason::UNKNOWN_THREAD
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            SessionAction::Send(Message::Close { reason }) if reason == close_reason::GOING_AWAY
+        )));
+    }
+
+    #[test]
+    fn established_first_message_non_thread_routes_to_gossip_session() {
+        // 最初のメッセージが THREAD_JOIN でなければ従来どおり gossip として委譲する。
+        let mut s = Session::new_inbound(cfg(1), "p:21".into(), None);
+        s.on_frame(64, hello(1, 3)).unwrap();
+        let actions = s.on_frame(16, Message::GetPeers).unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::Deliver(Message::GetPeers)))
+        );
+    }
+
+    #[test]
+    fn thread_message_mixed_into_gossip_session_disconnects() {
+        // gossip セッション確定後に THREAD_* が混在したら不正フレームとして切断する
+        // (1 TCP 接続 = 1 用途)。
+        let mut s = Session::new_inbound(cfg(1), "p:22".into(), None);
+        s.on_frame(64, hello(1, 3)).unwrap();
+        s.on_frame(16, Message::GetPeers).unwrap(); // gossip として確定させる
+        let err = s
+            .on_frame(
+                16,
+                Message::Res {
+                    event: serde_json::json!({"kind":1311}),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.category, Some(SecurityCategory::P2pInvalidFrame));
+        assert_eq!(s.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn gossip_message_mixed_into_thread_session_disconnects() {
+        // スレセッション確定後に gossip 専用メッセージが混在したら不正フレームとして切断する。
+        // THREAD_JOIN スタブは 1 通目で state を Closed にするため、同一セッションでの
+        // 追加フレーム受信を模すため新規セッションで種別のみ Thread へ導いて検証する。
+        let mut s = Session::new_inbound(cfg(1), "p:23".into(), None);
+        s.on_frame(64, hello(1, 3)).unwrap();
+        s.on_frame(
+            32,
+            Message::ThreadJoin {
+                thread: "board:1".into(),
+                challenge: "deadbeef".into(),
+                since_seq: 0,
+            },
+        )
+        .unwrap();
+        // スタブは THREAD_JOIN 1 通目で Closed にするため、以後の受信は
+        // 既存の「Closed 状態は不正フレーム」経路(検査済み)で切断される。
+        let err = s.on_frame(16, Message::GetPeers).unwrap_err();
+        assert_eq!(err.category, Some(SecurityCategory::P2pInvalidFrame));
+    }
+
+    #[test]
+    fn hello_advertises_livechat1_feature() {
+        // HELLO/HELLO_ACK の features に livechat1 を掲げられること(session_config 側の
+        // 既定は runtime.rs が設定するため、ここでは Session が申告値をそのまま送ることを
+        // 確認する)。
+        let mut s = Session::new_outbound(
+            SessionConfig {
+                local_features: vec![FEATURE_LIVECHAT1.into()],
+                ..cfg(1)
+            },
+            "p:24".into(),
+            None,
+        );
+        let msg = s.start().unwrap();
+        match msg {
+            Message::Hello(hello) => {
+                assert!(hello.features.iter().any(|f| f == FEATURE_LIVECHAT1))
+            }
+            other => panic!("HELLO を期待: {other:?}"),
+        }
     }
 
     #[test]

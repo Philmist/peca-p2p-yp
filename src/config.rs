@@ -37,6 +37,18 @@ const DEFAULT_INDEX_TXT_ENCODING: &str = "utf-8";
 // 空文字 = index.txt の LAN 公開を無効(既定 — ADR-0012 はオプトイン)。
 const DEFAULT_INDEX_BIND: &str = "";
 
+// 006-livechat-thread data-model §Settings 追加分。
+const DEFAULT_LIVECHAT_ENABLED: bool = true;
+const DEFAULT_THREAD_MAX_PARTICIPANTS: u32 = 128;
+// 窓は 30 秒固定(data-model §Settings)。値そのものは窓内のレス数上限で、
+// 窓の長さは定数化せずここにコメントとして明記する(FR-021)。
+const DEFAULT_THREAD_WRITE_RATE: u32 = 4;
+// 接続あたり msg/秒(制御メッセージ込み — FR-021)。
+const DEFAULT_THREAD_MSG_RATE: u32 = 16;
+const DEFAULT_ANNOUNCE_STORE_QUOTA: u64 = 2048;
+// 空文字 = 互換 API の待受無効(既定)。非空は loopback のみ受理(research R5)。
+const DEFAULT_COMPAT_BBS_BIND: &str = "127.0.0.1:7183";
+
 // settings テーブルのキー名(data-model §Settings と一致)。
 const KEY_PCP_BIND: &str = "pcp_bind";
 const KEY_HTTP_BIND: &str = "http_bind";
@@ -52,6 +64,12 @@ const KEY_MIN_POW_BITS: &str = "min_pow_bits";
 const KEY_EVENT_STORE_MAX: &str = "event_store_max";
 const KEY_INDEX_TXT_ENCODING: &str = "index_txt_encoding";
 const KEY_INDEX_BIND: &str = "index_bind";
+const KEY_LIVECHAT_ENABLED: &str = "livechat_enabled";
+const KEY_THREAD_MAX_PARTICIPANTS: &str = "thread_max_participants";
+const KEY_THREAD_WRITE_RATE: &str = "thread_write_rate";
+const KEY_THREAD_MSG_RATE: &str = "thread_msg_rate";
+const KEY_ANNOUNCE_STORE_QUOTA: &str = "announce_store_quota";
+const KEY_COMPAT_BBS_BIND: &str = "compat_bbs_bind";
 
 // ---------------------------------------------------------------------------
 // エラー
@@ -146,6 +164,21 @@ pub struct Settings {
     /// index.txt の LAN 公開バインド先(ADR-0012)。空文字 = 機能無効(既定)。
     /// 非空時は loopback または LAN 内プライベートアドレスのみ受理する。
     pub index_bind: String,
+
+    // --- 006-livechat-thread data-model §Settings 追加分 ---
+    /// false でスレ機能全体を無効化する(announce は検証のみ行い不可視 — 006 data-model)。
+    pub livechat_enabled: bool,
+    /// ホストの受入接続上限。超過は定型拒否する(FR-006)。
+    pub thread_max_participants: u32,
+    /// 板鍵あたりの書き込みレート上限(FR-021)。窓は 30 秒固定、値は窓内のレス数上限。
+    pub thread_write_rate: u32,
+    /// 接続あたりの msg/秒上限(制御メッセージ込み — FR-021)。
+    pub thread_msg_rate: u32,
+    /// kind 31311(announce)の EventStore 独立保持枠(research R3)。
+    pub announce_store_quota: u64,
+    /// 互換 BBS API の待受アドレス(research R5)。既定は loopback で有効
+    /// (`127.0.0.1:7183`)。空文字で機能無効、非空時は loopback のみ受理する。
+    pub compat_bbs_bind: String,
 }
 
 impl Default for Settings {
@@ -165,6 +198,12 @@ impl Default for Settings {
             event_store_max: DEFAULT_EVENT_STORE_MAX,
             index_txt_encoding: DEFAULT_INDEX_TXT_ENCODING.to_string(),
             index_bind: DEFAULT_INDEX_BIND.to_string(),
+            livechat_enabled: DEFAULT_LIVECHAT_ENABLED,
+            thread_max_participants: DEFAULT_THREAD_MAX_PARTICIPANTS,
+            thread_write_rate: DEFAULT_THREAD_WRITE_RATE,
+            thread_msg_rate: DEFAULT_THREAD_MSG_RATE,
+            announce_store_quota: DEFAULT_ANNOUNCE_STORE_QUOTA,
+            compat_bbs_bind: DEFAULT_COMPAT_BBS_BIND.to_string(),
         }
     }
 }
@@ -203,6 +242,20 @@ impl Settings {
             event_store_max: parse_or(&stored, KEY_EVENT_STORE_MAX, d.event_store_max),
             index_txt_encoding: s(KEY_INDEX_TXT_ENCODING, &d.index_txt_encoding),
             index_bind: s(KEY_INDEX_BIND, &d.index_bind),
+            livechat_enabled: parse_bool_or(&stored, KEY_LIVECHAT_ENABLED, d.livechat_enabled),
+            thread_max_participants: parse_or(
+                &stored,
+                KEY_THREAD_MAX_PARTICIPANTS,
+                d.thread_max_participants,
+            ),
+            thread_write_rate: parse_or(&stored, KEY_THREAD_WRITE_RATE, d.thread_write_rate),
+            thread_msg_rate: parse_or(&stored, KEY_THREAD_MSG_RATE, d.thread_msg_rate),
+            announce_store_quota: parse_or(
+                &stored,
+                KEY_ANNOUNCE_STORE_QUOTA,
+                d.announce_store_quota,
+            ),
+            compat_bbs_bind: s(KEY_COMPAT_BBS_BIND, &d.compat_bbs_bind),
         })
     }
 
@@ -231,6 +284,18 @@ impl Settings {
         store.set_setting(KEY_EVENT_STORE_MAX, &self.event_store_max.to_string())?;
         store.set_setting(KEY_INDEX_TXT_ENCODING, &self.index_txt_encoding)?;
         store.set_setting(KEY_INDEX_BIND, &self.index_bind)?;
+        store.set_setting(KEY_LIVECHAT_ENABLED, bool_to_str(self.livechat_enabled))?;
+        store.set_setting(
+            KEY_THREAD_MAX_PARTICIPANTS,
+            &self.thread_max_participants.to_string(),
+        )?;
+        store.set_setting(KEY_THREAD_WRITE_RATE, &self.thread_write_rate.to_string())?;
+        store.set_setting(KEY_THREAD_MSG_RATE, &self.thread_msg_rate.to_string())?;
+        store.set_setting(
+            KEY_ANNOUNCE_STORE_QUOTA,
+            &self.announce_store_quota.to_string(),
+        )?;
+        store.set_setting(KEY_COMPAT_BBS_BIND, &self.compat_bbs_bind)?;
         Ok(())
     }
 
@@ -258,6 +323,8 @@ impl Settings {
     /// - `index_txt_encoding` は shift_jis / utf-8 のいずれか。
     /// - `index_bind` は空文字(機能無効)を許容し、非空は loopback / LAN 内
     ///   プライベートアドレスのみ受理(ADR-0012)。
+    /// - `compat_bbs_bind` は空文字(機能無効)を許容し、非空は loopback のみ受理
+    ///   (006-livechat-thread data-model §Settings — research R5)。
     pub fn validate(&self) -> Result<(), ConfigError> {
         require_loopback(KEY_PCP_BIND, &self.pcp_bind)?;
         require_loopback(KEY_HTTP_BIND, &self.http_bind)?;
@@ -268,6 +335,10 @@ impl Settings {
         // index_bind: 空は機能無効(検証スキップ)、非空は LAN/loopback 許可リスト検証。
         if !self.index_bind.is_empty() {
             require_lan_or_loopback(KEY_INDEX_BIND, &self.index_bind)?;
+        }
+        // compat_bbs_bind: 空は機能無効(検証スキップ)、非空は loopback のみ受理。
+        if !self.compat_bbs_bind.is_empty() {
+            require_loopback(KEY_COMPAT_BBS_BIND, &self.compat_bbs_bind)?;
         }
         Ok(())
     }
@@ -474,6 +545,12 @@ mod tests {
         assert_eq!(d.min_pow_bits, 0);
         assert_eq!(d.event_store_max, 4096);
         assert_eq!(d.index_txt_encoding, "utf-8");
+        assert!(d.livechat_enabled);
+        assert_eq!(d.thread_max_participants, 128);
+        assert_eq!(d.thread_write_rate, 4);
+        assert_eq!(d.thread_msg_rate, 16);
+        assert_eq!(d.announce_store_quota, 2048);
+        assert_eq!(d.compat_bbs_bind, "127.0.0.1:7183");
     }
 
     #[test]
@@ -497,6 +574,12 @@ mod tests {
             min_pow_bits: 12,
             event_store_max: 8192,
             index_txt_encoding: "utf-8".to_string(),
+            livechat_enabled: false,
+            thread_max_participants: 64,
+            thread_write_rate: 8,
+            thread_msg_rate: 32,
+            announce_store_quota: 4096,
+            compat_bbs_bind: "127.0.0.2:7183".to_string(),
             ..Default::default()
         };
         s.save(&store).unwrap();
@@ -850,6 +933,43 @@ mod tests {
             ..Default::default()
         };
         assert!(s.validate().is_ok());
+    }
+
+    // --- compat_bbs_bind(loopback 強制。006-livechat-thread data-model §Settings)---
+
+    #[test]
+    fn compat_bbs_bind_empty_skips_validation() {
+        // 空文字は機能無効 — 非 loopback でも検証をスキップして通過する
+        let s = Settings {
+            compat_bbs_bind: String::new(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn compat_bbs_bind_accepts_loopback() {
+        for addr in ["127.0.0.1:7183", "[::1]:7183"] {
+            let s = Settings {
+                compat_bbs_bind: addr.to_string(),
+                ..Default::default()
+            };
+            assert!(s.validate().is_ok(), "{addr} は許容されるべき");
+        }
+    }
+
+    #[test]
+    fn compat_bbs_bind_rejects_non_loopback() {
+        let s = Settings {
+            compat_bbs_bind: "0.0.0.0:7183".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate(),
+            Err(ConfigError::NonLoopbackBind {
+                key: "compat_bbs_bind"
+            })
+        ));
     }
 
     #[test]

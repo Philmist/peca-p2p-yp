@@ -118,3 +118,7 @@ path = "tests/integration/persona_lock.rs"
 [[test]]
 name = "index_lan"
 path = "tests/integration/index_lan.rs"
+
+[[test]]
+name = "thread_mock"
+path = "tests/integration/thread_mock.rs"

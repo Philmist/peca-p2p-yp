@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nostr::Event;
 
+use super::livechat::ANNOUNCE_KIND;
 use super::schema::EventSummary;
 
 /// EventStore 既定容量(data-model §Settings `event_store_max`)。
@@ -34,6 +35,10 @@ pub const DEFAULT_EVENT_STORE_MAX: usize = 4096;
 pub const DEFAULT_MAX_EVENTS_PER_PUBKEY: usize = 64;
 /// 鮮度判定窓の既定値(data-model §Settings `freshness_window_sec`)。
 pub const DEFAULT_FRESHNESS_WINDOW_SEC: u64 = 600;
+/// kind 31311(スレ announce)の EventStore 独立保持枠の既定値(research R3)。
+///
+/// 30311 用の [`DEFAULT_EVENT_STORE_MAX`] とは別枠(容量カウント・退避を kind で分離)。
+pub const DEFAULT_ANNOUNCE_STORE_QUOTA: usize = 2048;
 /// DedupCache 保持期間の下限(research R16。ADR-0005 の連動制約の下限)。
 pub const DEDUP_MIN_RETENTION_SEC: u64 = 600;
 
@@ -56,10 +61,15 @@ fn unix_now() -> u64 {
 pub struct StoreConfig {
     /// 鮮度判定窓(秒)。
     pub freshness_window_sec: u64,
-    /// 容量上限。超過時は created_at が古い順に破棄。
+    /// 容量上限(kind 31311 を除く)。超過時は created_at が古い順に破棄。
     pub event_store_max: usize,
-    /// 同一 pubkey の保持上限(超過は当該 pubkey の古い順破棄)。
+    /// 同一 pubkey の保持上限(超過は当該 pubkey の古い順破棄。kind を問わず合算)。
     pub max_events_per_pubkey: usize,
+    /// kind 31311(スレ announce)専用の容量上限(research R3)。
+    ///
+    /// [`Self::event_store_max`] とは独立のバケットで容量カウント・退避を行い、
+    /// announce の流入が 30311 等の保持枠を消費しない。
+    pub announce_store_quota: usize,
 }
 
 impl Default for StoreConfig {
@@ -68,6 +78,7 @@ impl Default for StoreConfig {
             freshness_window_sec: DEFAULT_FRESHNESS_WINDOW_SEC,
             event_store_max: DEFAULT_EVENT_STORE_MAX,
             max_events_per_pubkey: DEFAULT_MAX_EVENTS_PER_PUBKEY,
+            announce_store_quota: DEFAULT_ANNOUNCE_STORE_QUOTA,
         }
     }
 }
@@ -270,10 +281,32 @@ impl EventStore {
         }
     }
 
-    /// 容量上限を超える場合、全体の古い順に破棄する。
+    /// 容量上限を超える場合、古い順に破棄する。
+    ///
+    /// kind 31311(announce)は [`StoreConfig::announce_store_quota`] の独立バケットで
+    /// カウント・退避し、kind 31311 以外は [`StoreConfig::event_store_max`] のバケットで
+    /// 行う(research R3 — announce の流入が他 kind の保持枠を消費しない)。
     fn enforce_capacity(&mut self) {
-        while self.entries.len() > self.config.event_store_max {
-            let Some(victim) = self.oldest_among(self.entries.keys()) else {
+        self.enforce_capacity_for(
+            |kind| kind == ANNOUNCE_KIND,
+            self.config.announce_store_quota,
+        );
+        self.enforce_capacity_for(|kind| kind != ANNOUNCE_KIND, self.config.event_store_max);
+    }
+
+    /// `in_bucket` に該当する保持数が `quota` を超える場合、そのバケット内で古い順に破棄する。
+    fn enforce_capacity_for(&mut self, in_bucket: impl Fn(u16) -> bool, quota: usize) {
+        loop {
+            let bucket_keys: Vec<&StoreKey> = self
+                .entries
+                .iter()
+                .filter(|(k, _)| in_bucket(k.0))
+                .map(|(k, _)| k)
+                .collect();
+            if bucket_keys.len() <= quota {
+                break;
+            }
+            let Some(victim) = self.oldest_among(bucket_keys.into_iter()) else {
                 break;
             };
             self.remove_key(&victim);
@@ -379,10 +412,34 @@ impl DedupCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::livechat::{ANNOUNCE_D, ThreadAnnounce};
     use crate::event::schema::{ChannelListing, ChannelStatus};
     use nostr::Keys;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// テスト用の `a` タグ値(`30311:<pubkey>:<guid>`)。
+    fn channel_ref(pubkey: &Keys) -> String {
+        format!(
+            "30311:{}:{}",
+            pubkey.public_key().to_hex(),
+            "0123456789abcdef0123456789abcdef"
+        )
+    }
+
+    /// kind 31311(スレ announce)イベントを作る(板 = pubkey 単位で `d="livechat"` 固定)。
+    fn mk_announce(keys: &Keys, created: u64, generation: u32, title: &str) -> Event {
+        ThreadAnnounce {
+            channel: channel_ref(keys),
+            title: title.into(),
+            generation,
+            key: created,
+            res_count: None,
+            tip: "198.51.100.1:7147".into(),
+        }
+        .sign(keys, created, 0)
+        .unwrap()
+    }
 
     fn listing(d: &str, status: ChannelStatus, title: &str) -> ChannelListing {
         ChannelListing {
@@ -631,5 +688,105 @@ mod tests {
         clock.store(1000 + 601, Ordering::SeqCst);
         assert!(!cache.contains(id));
         assert!(!cache.check_and_insert(id)); // 期限切れ後は再び未知扱い
+    }
+
+    // ---- kind 31311(スレ announce)の独立保持枠(T011 / research R3) ----
+
+    #[test]
+    fn announce_capacity_is_independent_from_event_store_max() {
+        // 31311 用容量を 1 に絞っても、30311 用の event_store_max は消費されない。
+        let clock = Arc::new(AtomicU64::new(1_700_000_100));
+        let config = StoreConfig {
+            announce_store_quota: 1,
+            ..StoreConfig::default()
+        };
+        let mut store = store_at(config, Arc::clone(&clock));
+        let keys30311 = Keys::generate();
+
+        // 30311 側を 3 件格納(既定 event_store_max=4096 の枠内)。
+        store.insert(mk(&keys30311, D1, 1_700_000_010, ChannelStatus::Live, "1"));
+        store.insert(mk(&keys30311, D2, 1_700_000_020, ChannelStatus::Live, "2"));
+        store.insert(mk(&keys30311, D3, 1_700_000_030, ChannelStatus::Live, "3"));
+        assert_eq!(store.len(), 3);
+
+        // 31311 側(別 pubkey = 別板)を 2 件格納 → announce_store_quota=1 のため
+        // 古い方(board A)が退避され、30311 側の 3 件はそのまま残る。
+        let board_a = Keys::generate();
+        let board_b = Keys::generate();
+        store.insert(mk_announce(&board_a, 1_700_000_040, 1, "board A"));
+        store.insert(mk_announce(&board_b, 1_700_000_050, 1, "board B"));
+
+        assert_eq!(store.len(), 4, "30311 の 3 件 + 31311 の 1 件");
+        assert!(
+            store
+                .get(30311, &keys30311.public_key().to_hex(), D1)
+                .is_some(),
+            "31311 の容量退避が 30311 の枠を消費してはならない"
+        );
+        assert!(
+            store
+                .get(ANNOUNCE_KIND, &board_a.public_key().to_hex(), ANNOUNCE_D)
+                .is_none(),
+            "announce_store_quota 超過で古い board A の announce が退避されるべき"
+        );
+        assert!(
+            store
+                .get(ANNOUNCE_KIND, &board_b.public_key().to_hex(), ANNOUNCE_D)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn announce_is_replaced_per_board_with_fixed_d() {
+        // 同一板(同一 pubkey)の announce は d="livechat" 固定により常に最新 1 件へ置換される。
+        let clock = Arc::new(AtomicU64::new(1_700_000_100));
+        let mut store = store_at(StoreConfig::default(), Arc::clone(&clock));
+        let keys = Keys::generate();
+
+        let gen1 = mk_announce(&keys, 1_700_000_010, 1, "スレ1");
+        let gen2 = mk_announce(&keys, 1_700_000_020, 2, "スレ2");
+        assert_eq!(store.insert(gen1), InsertOutcome::Stored);
+        assert_eq!(store.insert(gen2.clone()), InsertOutcome::Replaced);
+
+        assert_eq!(store.len(), 1);
+        let kept = store
+            .get(ANNOUNCE_KIND, &keys.public_key().to_hex(), ANNOUNCE_D)
+            .unwrap();
+        assert_eq!(kept.id, gen2.id);
+    }
+
+    #[test]
+    fn announce_capacity_evicts_oldest_first_within_own_bucket() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_100));
+        let config = StoreConfig {
+            announce_store_quota: 2,
+            ..StoreConfig::default()
+        };
+        let mut store = store_at(config, Arc::clone(&clock));
+        let a = Keys::generate();
+        let b = Keys::generate();
+        let c = Keys::generate();
+
+        store.insert(mk_announce(&a, 1_700_000_010, 1, "A"));
+        store.insert(mk_announce(&b, 1_700_000_020, 1, "B"));
+        store.insert(mk_announce(&c, 1_700_000_030, 1, "C"));
+
+        assert_eq!(store.len(), 2);
+        assert!(
+            store
+                .get(ANNOUNCE_KIND, &a.public_key().to_hex(), ANNOUNCE_D)
+                .is_none(),
+            "最古の板 A の announce が退避されるべき"
+        );
+        assert!(
+            store
+                .get(ANNOUNCE_KIND, &b.public_key().to_hex(), ANNOUNCE_D)
+                .is_some()
+        );
+        assert!(
+            store
+                .get(ANNOUNCE_KIND, &c.public_key().to_hex(), ANNOUNCE_D)
+                .is_some()
+        );
     }
 }

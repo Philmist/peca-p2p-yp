@@ -66,6 +66,21 @@ pub fn decode_message(payload: &[u8]) -> Option<Message> {
 // MockPeer
 // ---------------------------------------------------------------------------
 
+/// モックホストが THREAD_JOIN に返す応答(T015 — contracts/thread-delivery.md)。
+#[derive(Clone)]
+pub enum ThreadResponse {
+    /// 受理(THREAD_WELCOME を返す)。`sig` はスレ主鍵署名だが、モックでは固定値を
+    /// 差し込めるため、契約テスト側でチャレンジ検証の成否を制御できる。
+    Welcome {
+        thread: String,
+        sig: String,
+        board_settings: Value,
+        res_count: u32,
+    },
+    /// 定型拒否(THREAD_REJECT を返す。reason は `thread_reject_reason` の定数)。
+    Reject { reason: String },
+}
+
 /// モックピアの共有状態(接続ハンドラと制御 API で共有)。
 #[derive(Clone)]
 struct Shared {
@@ -79,6 +94,16 @@ struct Shared {
     listen_port: u16,
     /// GET_PEERS 応答で返すアドレス列(PEX 検証用)。
     pex_peers: Arc<Mutex<Vec<String>>>,
+
+    // --- 006-livechat-thread スレ配送(T015)---
+    /// THREAD_JOIN への応答(未設定なら応答せず接続を維持する)。
+    thread_response: Arc<Mutex<Option<ThreadResponse>>>,
+    /// THREAD_WELCOME 送出直後に順に送るスレフレーム(RES/ORDER/SETTINGS 等の初期同期)。
+    thread_served: Arc<Mutex<Vec<Message>>>,
+    /// 接続中スレセッションへ即時送出する任意フレーム(偽 ORDER・不正フレーム注入用)。
+    thread_push_tx: broadcast::Sender<Message>,
+    /// 受信したスレメッセージ(THREAD_JOIN / RES / RESEND_REQ 等)の記録。
+    received_thread: Arc<Mutex<Vec<Message>>>,
 }
 
 /// 契約参照実装としてのモックピア(TCP でダイヤルを受ける)。
@@ -96,12 +121,17 @@ impl MockPeer {
         let addr = listener.local_addr().unwrap().to_string();
         let port = listener.local_addr().unwrap().port();
         let (push_tx, _rx) = broadcast::channel(256);
+        let (thread_push_tx, _trx) = broadcast::channel(256);
         let shared = Shared {
             served: Arc::new(Mutex::new(Vec::new())),
             received: Arc::new(Mutex::new(Vec::new())),
             push_tx,
             listen_port: port,
             pex_peers: Arc::new(Mutex::new(Vec::new())),
+            thread_response: Arc::new(Mutex::new(None)),
+            thread_served: Arc::new(Mutex::new(Vec::new())),
+            thread_push_tx,
+            received_thread: Arc::new(Mutex::new(Vec::new())),
         };
         let (sd_tx, sd_rx) = watch::channel(false);
         let accept = {
@@ -154,6 +184,34 @@ impl MockPeer {
     pub fn share_peer(&self, addr: &str) {
         self.shared.pex_peers.lock().unwrap().push(addr.to_string());
     }
+
+    // --- 006-livechat-thread スレ配送(T015)-------------------------------
+
+    /// THREAD_JOIN への応答(WELCOME か REJECT)を設定する。
+    ///
+    /// 未設定(既定)なら THREAD_JOIN を受信しても応答せず接続を維持する
+    /// (JOIN 前のスレメッセージ・無応答の検証に使える)。
+    pub fn set_thread_response(&self, response: ThreadResponse) {
+        *self.shared.thread_response.lock().unwrap() = Some(response);
+    }
+
+    /// THREAD_WELCOME 送出直後に順に送るスレフレームを追加する(接続時同期の RES/ORDER 等)。
+    pub fn serve_thread_frame(&self, message: Message) {
+        self.shared.thread_served.lock().unwrap().push(message);
+    }
+
+    /// 接続中スレセッションへ任意フレームを即時送出する。
+    ///
+    /// 偽 ORDER(スレ主以外の鍵で署名)・kind 不一致の RES・不正フレームなど、悪性入力の
+    /// 注入に使う(ネガティブ契約テスト — T035/T040)。
+    pub fn push_thread_frame(&self, message: Message) {
+        let _ = self.shared.thread_push_tx.send(message);
+    }
+
+    /// これまでに受信したスレメッセージ(THREAD_JOIN / RES / RESEND_REQ 等)。
+    pub fn received_thread_messages(&self) -> Vec<Message> {
+        self.shared.received_thread.lock().unwrap().clone()
+    }
 }
 
 impl Drop for MockPeer {
@@ -205,6 +263,7 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
     }
 
     let mut push_rx = shared.push_tx.subscribe();
+    let mut thread_push_rx = shared.thread_push_tx.subscribe();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -219,12 +278,37 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
                     Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
+            pushed = thread_push_rx.recv() => {
+                // 接続中スレセッションへ任意フレームを即時送出(偽 ORDER・不正フレーム注入)。
+                match pushed {
+                    Ok(message) => {
+                        if write_frame(&mut writer, &message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
             res = read_frame(&mut reader) => {
                 let frame = match res {
                     Ok(Some(f)) => f,
                     _ => break, // EOF / エラーで終了
                 };
+                // スレメッセージ(参→ホ)は記録する(T015)。
+                if matches!(
+                    frame.message,
+                    Message::ThreadJoin { .. } | Message::Res { .. } | Message::ResendReq { .. }
+                ) {
+                    shared.received_thread.lock().unwrap().push(frame.message.clone());
+                }
                 match frame.message {
+                    Message::ThreadJoin { .. } => {
+                        // 設定された応答(WELCOME/REJECT)を返す。WELCOME 後は served を初期同期。
+                        if !respond_thread_join(&mut writer, &shared).await {
+                            break;
+                        }
+                    }
                     Message::SyncReq { .. } => {
                         // 保持イベントを EVENT で返し、末尾に SYNC_DONE。
                         let events = shared.served.lock().unwrap().clone();
@@ -259,12 +343,53 @@ async fn handle_conn(stream: TcpStream, shared: Shared, mut shutdown: watch::Rec
                         }
                     }
                     Message::Close { .. } => break,
-                    // SYNC_DONE・PONG・PEERS などは無視(前方互換)。
+                    // SYNC_DONE・PONG・PEERS・RES・ORDER・RESEND_REQ 等は無視(記録済み/前方互換)。
                     _ => {}
                 }
             }
         }
     }
+}
+
+/// THREAD_JOIN に対し設定された応答を返す(WELCOME → served 初期同期、または REJECT)。
+///
+/// 戻り値は接続継続可否(`false` = 送信失敗で切断すべき)。応答未設定なら何もせず
+/// `true`(接続維持)。
+async fn respond_thread_join(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    shared: &Shared,
+) -> bool {
+    let Some(response) = shared.thread_response.lock().unwrap().clone() else {
+        return true;
+    };
+    let is_welcome = matches!(response, ThreadResponse::Welcome { .. });
+    let reply = match response {
+        ThreadResponse::Welcome {
+            thread,
+            sig,
+            board_settings,
+            res_count,
+        } => Message::ThreadWelcome {
+            thread,
+            sig,
+            board_settings,
+            res_count,
+        },
+        ThreadResponse::Reject { reason } => Message::ThreadReject { reason },
+    };
+    if write_frame(writer, &reply).await.is_err() {
+        return false;
+    }
+    // WELCOME 受理後は初期同期フレーム(RES/ORDER/SETTINGS 等)を seq 順に送る。
+    if is_welcome {
+        let frames = shared.thread_served.lock().unwrap().clone();
+        for frame in frames {
+            if write_frame(writer, &frame).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
