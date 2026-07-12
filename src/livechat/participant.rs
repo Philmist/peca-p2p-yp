@@ -116,55 +116,11 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // 1. HELLO(livechat1 を掲げる)。
-    let hello = Message::Hello(Hello {
-        version: PROTOCOL_VERSION,
-        listen_port: 0,
-        features: vec![FEATURE_LIVECHAT1.into()],
-        nonce: rand_nonce(),
-        ts: unix_now(),
-    });
-    if write_frame(&mut writer, &hello).await.is_err() {
-        return JoinResult::Transport;
-    }
-    match read_frame(&mut reader).await {
-        Ok(Some(frame)) if matches!(frame.message, Message::HelloAck(_)) => {}
-        _ => return JoinResult::Transport,
-    }
-
-    // 2. THREAD_JOIN(challenge を生成してセッションへ保持)。
-    let challenge = generate_challenge();
-    let mut session = ParticipantSession::new(config.make_thread(), challenge.clone());
-    // since_seq を反映するため、器の状態にかかわらずワイヤの since_seq を採用する。
-    let join = Message::ThreadJoin {
-        thread: format!("{}:{}", config.board_id, config.generation),
-        challenge,
-        since_seq,
+    // 1〜3. ハンドシェイク(HELLO → JOIN → WELCOME 検証)。joined 済みセッションを得る。
+    let mut session = match handshake_join(config, since_seq, &mut reader, &mut writer).await {
+        Ok(s) => s,
+        Err(result) => return result,
     };
-    if write_frame(&mut writer, &join).await.is_err() {
-        return JoinResult::Transport;
-    }
-
-    // 3. WELCOME / REJECT を待つ。
-    let first = match read_frame(&mut reader).await {
-        Ok(Some(f)) => f.message,
-        _ => return JoinResult::Transport,
-    };
-    match first {
-        Message::ThreadWelcome { sig, .. } => match session.on_welcome(&sig) {
-            WelcomeOutcome::Accepted => {}
-            WelcomeOutcome::ChallengeFailed { category } => {
-                self_log(config, category);
-                return JoinResult::ChallengeFailed;
-            }
-        },
-        Message::ThreadReject { reason } => {
-            let handling = session.on_reject(&reason);
-            return JoinResult::Rejected { reason, handling };
-        }
-        // WELCOME/REJECT 以外が最初に来るのはプロトコル違反。
-        _ => return JoinResult::Transport,
-    }
 
     // 4. 同期受信(WELCOME 後に続く RES/ORDER を確定列へ反映する)。
     //    保留プール: event_id → 未確定レス(RES 先着 → ORDER 確定で res_no 付与)。
@@ -218,6 +174,164 @@ where
             // SETTINGS/その他ホスト→参 メッセージは US1 では観測対象外(前方互換で無視)。
             Message::Settings { .. } => {}
             // gossip 混在・不正フレームはホスト側が切断する。参加者側は EOF で抜ける。
+            _ => {}
+        }
+    }
+
+    JoinResult::Joined {
+        confirmed: session.confirmed().to_vec(),
+    }
+}
+
+/// ハンドシェイク(HELLO → THREAD_JOIN → WELCOME 検証)を行い joined 済みセッションを返す
+/// ([`drive`] と [`connect_write_collect`] の共通部)。
+///
+/// 成功時は [`SessionState::Joined`] な [`ParticipantSession`](提示した challenge を保持)を
+/// `Ok` で返す。失敗はそのまま返すべき [`JoinResult`](Transport / ChallengeFailed / Rejected)を
+/// `Err` で返す(呼び出し側は `return` するだけ)。
+async fn handshake_join<R, W>(
+    config: &ParticipantConfig,
+    since_seq: u32,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<ParticipantSession, JoinResult>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // 1. HELLO(livechat1 を掲げる)。
+    let hello = Message::Hello(Hello {
+        version: PROTOCOL_VERSION,
+        listen_port: 0,
+        features: vec![FEATURE_LIVECHAT1.into()],
+        nonce: rand_nonce(),
+        ts: unix_now(),
+    });
+    if write_frame(writer, &hello).await.is_err() {
+        return Err(JoinResult::Transport);
+    }
+    match read_frame(reader).await {
+        Ok(Some(frame)) if matches!(frame.message, Message::HelloAck(_)) => {}
+        _ => return Err(JoinResult::Transport),
+    }
+
+    // 2. THREAD_JOIN(challenge を生成してセッションへ保持)。
+    let challenge = generate_challenge();
+    let mut session = ParticipantSession::new(config.make_thread(), challenge.clone());
+    let join = Message::ThreadJoin {
+        thread: format!("{}:{}", config.board_id, config.generation),
+        challenge,
+        since_seq,
+    };
+    if write_frame(writer, &join).await.is_err() {
+        return Err(JoinResult::Transport);
+    }
+
+    // 3. WELCOME / REJECT を待つ。
+    let first = match read_frame(reader).await {
+        Ok(Some(f)) => f.message,
+        _ => return Err(JoinResult::Transport),
+    };
+    match first {
+        Message::ThreadWelcome { sig, .. } => match session.on_welcome(&sig) {
+            WelcomeOutcome::Accepted => Ok(session),
+            WelcomeOutcome::ChallengeFailed { category } => {
+                self_log(config, category);
+                Err(JoinResult::ChallengeFailed)
+            }
+        },
+        Message::ThreadReject { reason } => {
+            let handling = session.on_reject(&reason);
+            Err(JoinResult::Rejected { reason, handling })
+        }
+        // WELCOME/REJECT 以外が最初に来るのはプロトコル違反。
+        _ => Err(JoinResult::Transport),
+    }
+}
+
+/// **書き込みラウンドトリップ**: joined 後に `bodies` を書き込み、自分と他参加者の確定が
+/// `expect_total` 件溜まるまで受信して確定列を返す(US2 — T033 統合テスト用)。
+///
+/// 手順:
+/// 1. TCP 接続 → [`handshake_join`](HELLO → JOIN → WELCOME 検証)。失敗は
+///    [`JoinResult::Transport`] / [`JoinResult::ChallengeFailed`] / [`JoinResult::Rejected`]。
+/// 2. joined 後、`bodies` を [`ParticipantSession::compose_write`](板鍵 `board_keys`・
+///    name/mail なし・PoW 0)で 1 件ずつ RES 送出(pending = 送信中 — FR-008)。
+/// 3. 受信ループ: RES は保留プールへ、ORDER は FR-011 検証([`verify_order`])後に
+///    [`ParticipantSession::apply_order`] で確定。**`confirmed().len() >= expect_total`** に
+///    達したら終了。各読みは `tokio::time::timeout(idle, …)` で包み、**アイドル/EOF/エラーでも
+///    打ち切って現在の確定列を返す(絶対にハングしない)**。SeqGap 時は [`resend_request`] 送出。
+/// 4. [`JoinResult::Joined { confirmed }`] を返す(`confirmed` は res_no 順の確定列)。
+pub async fn connect_write_collect(
+    config: &ParticipantConfig,
+    board_keys: &nostr::Keys,
+    bodies: &[&str],
+    expect_total: usize,
+    idle: Duration,
+) -> JoinResult {
+    let Ok(stream) = TcpStream::connect(&config.host_addr).await else {
+        return JoinResult::Transport;
+    };
+    let (mut reader, mut writer) = stream.into_split();
+
+    // 1. ハンドシェイク。
+    let mut session = match handshake_join(config, 0, &mut reader, &mut writer).await {
+        Ok(s) => s,
+        Err(result) => return result,
+    };
+
+    // 2. 自分の書き込みを送出(送信中 = pending)。
+    for body in bodies {
+        match session.compose_write(
+            board_keys,
+            &config.channel,
+            None,
+            None,
+            body,
+            unix_now() as u64,
+            0,
+        ) {
+            Ok(msg) => {
+                if write_frame(&mut writer, &msg).await.is_err() {
+                    return JoinResult::Transport;
+                }
+            }
+            // 形式違反(本文長・行数等)は送らずスキップ(前方互換で切断しない)。
+            Err(_) => continue,
+        }
+    }
+
+    // 3. 受信ループ: expect_total に達するまで RES/ORDER を処理。ハング防止のため各読みを
+    //    idle タイムアウトで包み、アイドル/EOF/エラーで打ち切る。
+    let mut pending: std::collections::HashMap<String, Res> = std::collections::HashMap::new();
+    while session.confirmed().len() < expect_total {
+        let read = tokio::time::timeout(idle, read_frame(&mut reader)).await;
+        let frame = match read {
+            Err(_) => break, // アイドル打ち切り(これ以上来ない)
+            Ok(Ok(Some(f))) => f,
+            Ok(Ok(None)) | Ok(Err(_)) => break, // EOF / I/O エラー
+        };
+        match frame.message {
+            Message::Res { event } => {
+                if let Some(res) = verify_res(&event) {
+                    pending.insert(res.event_id.clone(), res);
+                }
+            }
+            Message::Order { event } => match verify_order(&event, &config.board_id) {
+                Some(order) => {
+                    let resolve = |eid: &str| pending.get(eid).cloned();
+                    match session.apply_order(&order, resolve) {
+                        Ok(()) => {}
+                        Err(SyncError::SeqGap { .. }) => {
+                            let _ =
+                                write_frame(&mut writer, &session.resend_request(order.seq)).await;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                None => self_log(config, SecurityCategory::LivechatOrderInvalid),
+            },
+            Message::Settings { .. } => {}
             _ => {}
         }
     }
