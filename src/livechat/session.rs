@@ -297,17 +297,25 @@ impl ParticipantSession {
 
     // --- T023: 接続時同期の受信 --------------------------------------------
 
-    /// 同期の `ORDER`(kind 21311)を適用して確定列を進める(T023 — 参加者側)。
+    /// 同期の `ORDER`(kind 21311)を適用して確定列を進める(T023/T031 — 参加者側)。
     ///
-    /// 検証順(thread-events.md §参加者側検証): 署名者一致(スレ主)→ seq 連続性 →
-    /// res_no 連続性。`resolve` は event_id から本文(未確定に保持済みのレス封筒)を引く
-    /// コールバックで、確定対象のレス実体を配線側の保留プールから取得する。
+    /// **検証順(thread-events.md §参加者側検証 — サイズ → 署名 → スレ主一致 → seq 連続 →
+    /// res_no 連続)**:
     ///
-    /// - seq が `last_seq + 1` でなければ [`SyncError::SeqGap`](表示を進めず再送要求)。
-    /// - スレ主以外の署名は [`SyncError::OrderInvalid`](記録は配線側 — FR-011)。
-    /// - res_no 連続性違反・確定失敗は [`SyncError::Confirm`]。
+    /// 1. **サイズ・署名**: 封筒([`OrderEnvelope::from_event`] + `Event::verify`)が呼び出し前に
+    ///    担う(≤ 16KB・id/sig 検証)。本メソッドは検証済み封筒を受け取る前提。
+    /// 2. **スレ主一致(FR-011)**: 署名者 = board_id・対象スレの世代一致。不一致は
+    ///    [`SyncError::OrderInvalid`](別スレ・偽 ORDER を取り込まない。記録は配線側)。
+    /// 3. **seq 連続(O2)**: seq が `last_seq + 1` でなければ [`SyncError::SeqGap`]。表示を
+    ///    進めず、配線側は [`Self::resend_request`] で `RESEND_REQ` を送って欠落を埋める。
+    /// 4. **res_no 連続(T3)**: [`Thread::confirm`] が欠番なし単調増加・res_limit を強制する。
+    ///    違反は [`SyncError::Confirm`]。
     ///
-    /// 成功時は `entries` を順に [`Thread::confirm`] し、`last_seq` を更新する。
+    /// `resolve` は event_id から確定対象のレス実体(配線側の保留プール)を引くコールバック。
+    /// 見つからなければ [`SyncError::MissingRes`](RES 未着 → 再送要求)。
+    ///
+    /// 成功時は `entries` を順に確定し、`last_seq` を更新する。**確定したレスのみが表示列
+    /// ([`Self::confirmed`])に入る**(未確定は表示しない — FR-008)。
     pub fn apply_order<F>(&mut self, order: &OrderEnvelope, mut resolve: F) -> Result<(), SyncError>
     where
         F: FnMut(&str) -> Option<Res>,
@@ -336,6 +344,27 @@ impl ParticipantSession {
         }
         self.last_seq = order.seq;
         Ok(())
+    }
+
+    /// 欠落した確定情報の再送を要求する `RESEND_REQ` を生成する(T031 — 不変条件 O2)。
+    ///
+    /// [`SyncError::SeqGap`] を検出したとき、受信済みの次(`last_seq + 1`)から欠落を検出した
+    /// `up_to_seq` までの範囲をホストへ要求する(ホストは [`crate::livechat::registry`] の
+    /// `handle_resend` で対応 RES + ORDER を seq 順に再送する)。表示は欠落が埋まるまで進めない。
+    pub fn resend_request(&self, up_to_seq: u32) -> WireMessage {
+        WireMessage::ResendReq {
+            from_seq: self.last_seq + 1,
+            to_seq: up_to_seq,
+        }
+    }
+
+    /// 本文中のアンカー `>>n` を確定レスへ解決する(T031 — FR-009)。
+    ///
+    /// 確定列([`Thread::resolve_anchors_in`])に委譲する。全端末で確定列(res_no → event_id)が
+    /// 一致するため、同一 `>>n` は全端末で同一イベントに解決される。未確定・範囲外のアンカーは
+    /// 解決しない(確定済みのみ — FR-008/FR-009)。
+    pub fn resolve_anchors(&self, body: &str) -> Vec<(u16, &Res)> {
+        self.thread.resolve_anchors_in(body)
     }
 
     // --- T029: 書き込みクライアント経路(FR-008/FR-024/FR-029)---------------
@@ -929,5 +958,74 @@ mod tests {
         assert!(!rows[0].pending);
         assert_eq!(rows[1].res_no, None, "送信中は末尾・res_no なし");
         assert!(rows[1].pending, "送信中フラグ");
+    }
+
+    // --- T031: 参加者 ORDER 検証・表示(FR-008/FR-009/FR-011・O2)-----------
+
+    #[test]
+    fn seq_gap_yields_resend_request() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        // last_seq=0 のとき seq=3 が来ると欠落(seq 1・2 が未着 — O2)。
+        let order = OrderEnvelope {
+            board_id: board_id.clone(),
+            generation: 1,
+            seq: 3,
+            entries: vec![OrderEntry {
+                res_no: 1,
+                event_id: "11".repeat(32),
+            }],
+        };
+        let err = session
+            .apply_order(&order, |_| Some(sample_res(&"11".repeat(32))))
+            .unwrap_err();
+        let SyncError::SeqGap { got, .. } = err else {
+            panic!("SeqGap を期待: {err:?}");
+        };
+        // 欠落検出 → RESEND_REQ(from_seq=1, to_seq=3)を生成する(表示は進めない)。
+        let req = session.resend_request(got);
+        assert_eq!(
+            req,
+            WireMessage::ResendReq {
+                from_seq: 1,
+                to_seq: 3
+            }
+        );
+        assert!(session.confirmed().is_empty(), "欠落中は表示を進めない(O2)");
+    }
+
+    #[test]
+    fn resolve_anchors_resolves_confirmed_only() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+
+        // 2 レスを確定させる。
+        let id1 = "11".repeat(32);
+        let id2 = "22".repeat(32);
+        for (seq, res_no, id) in [(1u32, 1u16, &id1), (2, 2, &id2)] {
+            let order = OrderEnvelope {
+                board_id: board_id.clone(),
+                generation: 1,
+                seq,
+                entries: vec![OrderEntry {
+                    res_no,
+                    event_id: id.clone(),
+                }],
+            };
+            let idc = id.clone();
+            session
+                .apply_order(&order, move |_| Some(sample_res(&idc)))
+                .unwrap();
+        }
+
+        // 本文 ">>1 >>2 >>5" → 確定済み 1・2 のみ解決(FR-009 の全端末一致・確定のみ)。
+        let resolved = session.resolve_anchors(">>1 と >>2 と >>5");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].0, 1);
+        assert_eq!(resolved[0].1.event_id, id1);
+        assert_eq!(resolved[1].0, 2);
+        assert_eq!(resolved[1].1.event_id, id2);
     }
 }

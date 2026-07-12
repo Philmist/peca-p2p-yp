@@ -410,6 +410,76 @@ impl Thread {
         self.state = self.state.close()?;
         Ok(())
     }
+
+    // --- アンカー解決(`>>n`)— FR-009(全端末一致)--------------------------
+
+    /// アンカー `>>n` を確定レスへ解決する(T031 — FR-009)。
+    ///
+    /// `res_no` に対応する確定レスを返す(未確定・欠番・範囲外は `None`)。確定列は不変条件
+    /// T3(1 から欠番なく単調増加)を満たすため `res[res_no - 1]` が res_no のレスになる。
+    /// 全端末で確定列(res_no → event_id)が一致する(DisplayPrefix / 不変条件 O2)ため、
+    /// **同一 `>>n` は全端末で同一イベントに解決される**(FR-009 のアンカー一致)。
+    ///
+    /// `res_no == 0`(`>>0` は無効)や `res_no > 確定数` は `None`。
+    pub fn resolve_anchor(&self, res_no: u16) -> Option<&Res> {
+        if res_no == 0 {
+            return None;
+        }
+        let res = self.res.get(usize::from(res_no) - 1)?;
+        // 防御的整合性チェック: 格納位置と res_no が一致すること(T3 の帰結)。
+        if res.res_no == Some(res_no) {
+            Some(res)
+        } else {
+            // T3 が守られていれば到達しないが、破損時は解決しない(誤リンクを避ける)。
+            self.res.iter().find(|r| r.res_no == Some(res_no))
+        }
+    }
+
+    /// 本文中の全アンカー `>>n` を解決した `(res_no, 対応レス)` 列を返す(表現層の補助)。
+    ///
+    /// 未確定・範囲外のアンカーは含めない(確定済みのみ解決 — FR-008/FR-009)。同一 `>>n` が
+    /// 複数回現れても各出現ごとに 1 エントリ返す(表現層が本文の該当箇所へリンクを張るため)。
+    pub fn resolve_anchors_in<'a>(&'a self, body: &str) -> Vec<(u16, &'a Res)> {
+        parse_anchors(body)
+            .into_iter()
+            .filter_map(|n| self.resolve_anchor(n).map(|r| (n, r)))
+            .collect()
+    }
+}
+
+/// 本文中のアンカー `>>n` の参照先 res_no を出現順に抽出する(T031 — FR-009)。
+///
+/// `>>` に続く 1 桁以上の 10 進数を 1 アンカーとして読む。`>>>` のような 3 連以上は
+/// 「先頭 2 個を `>>`、残りを本文」とはせず、**`>` が 2 個連続した直後の数字列**のみを
+/// アンカーとする(伝統的掲示板の慣習に沿う。`>>12` は 12、`>>>12` も末尾の `>>12` を拾う)。
+/// u16 を超える数値(> 65535)は採番され得ないためスキップする(res_limit ≤ 4000)。
+pub fn parse_anchors(body: &str) -> Vec<u16> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        // `>>` を探す(直前が `>` でも、連続する `>` の最後の 2 個を境界に数字を読む)。
+        if bytes[i] == b'>' && bytes[i + 1] == b'>' {
+            let mut j = i + 2;
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start {
+                // 数字列を u32 でパースし u16 に収まるものだけ採る(桁溢れは無効アンカー)。
+                if let Ok(n) = body[start..j].parse::<u32>()
+                    && let Ok(n16) = u16::try_from(n)
+                    && n16 != 0
+                {
+                    out.push(n16);
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -697,5 +767,58 @@ mod tests {
         let restored = BoardSettings::from_row(&row);
         assert_eq!(restored.res_limit, RES_LIMIT_DEFAULT);
         assert_eq!(restored.first_post_pow_bits, FIRST_POST_POW_BITS_DEFAULT);
+    }
+
+    // --- アンカー `>>n` の解決(T031 — FR-009)------------------------------
+
+    #[test]
+    fn parse_anchors_extracts_res_numbers() {
+        assert_eq!(parse_anchors(">>1 に返信"), vec![1]);
+        assert_eq!(parse_anchors(">>152 を参照"), vec![152]);
+        // 複数アンカー(出現順)。
+        assert_eq!(parse_anchors(">>1 と >>23 と >>456"), vec![1, 23, 456]);
+        // アンカーなし。
+        assert!(parse_anchors("ただの本文").is_empty());
+        // 単一 `>` は非アンカー。
+        assert!(parse_anchors(">12 は引用").is_empty());
+        // `>>0` は無効(採番は 1 始まり)。
+        assert!(parse_anchors(">>0").is_empty());
+        // 3 連 `>` の末尾 `>>` を拾う。
+        assert_eq!(parse_anchors(">>>12"), vec![12]);
+        // u16 溢れ(> 65535)は無効。
+        assert!(parse_anchors(">>70000").is_empty());
+    }
+
+    #[test]
+    fn resolve_anchor_returns_confirmed_res() {
+        let mut thread = sample_thread(10);
+        let id1 = "11".repeat(32);
+        let id2 = "22".repeat(32);
+        thread.confirm(sample_res(&id1), 1).unwrap();
+        thread.confirm(sample_res(&id2), 2).unwrap();
+
+        // res_no 1・2 は確定レスへ解決される(全端末で同じ event_id を指す — FR-009)。
+        assert_eq!(thread.resolve_anchor(1).unwrap().event_id, id1);
+        assert_eq!(thread.resolve_anchor(2).unwrap().event_id, id2);
+        // 未確定・範囲外・0 は解決しない。
+        assert!(thread.resolve_anchor(3).is_none());
+        assert!(thread.resolve_anchor(0).is_none());
+    }
+
+    #[test]
+    fn resolve_anchors_in_body() {
+        let mut thread = sample_thread(10);
+        let id1 = "11".repeat(32);
+        let id2 = "22".repeat(32);
+        thread.confirm(sample_res(&id1), 1).unwrap();
+        thread.confirm(sample_res(&id2), 2).unwrap();
+
+        // 本文中の >>1 >>2 >>9(未確定)を解決 → 確定分のみ返る。
+        let resolved = thread.resolve_anchors_in(">>1 と >>2、それと >>9");
+        assert_eq!(resolved.len(), 2, "確定済みの 2 件のみ解決される");
+        assert_eq!(resolved[0].0, 1);
+        assert_eq!(resolved[0].1.event_id, id1);
+        assert_eq!(resolved[1].0, 2);
+        assert_eq!(resolved[1].1.event_id, id2);
     }
 }
