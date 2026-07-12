@@ -2,6 +2,7 @@ pub mod broadcast;
 pub mod config;
 pub mod event;
 pub mod identity;
+pub mod livechat;
 pub mod p2p;
 pub mod pcp;
 pub mod platform;

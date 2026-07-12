@@ -43,6 +43,16 @@ spec の Assumptions で plan へ先送りした 3 点(NIP-53 援用可否・ann
   の割当がないことを確認(2026-07-12。モデル知識ベースの確認であり、一次資料の再突合は
   未了)。**実装フェーズ開始時に同レジストリを再確認する**こと。割当が生じていた場合の
   改番判断基準は contracts/thread-events.md §NIP 適合に規定した。
+- **一次資料再確認(2026-07-12・実装フェーズ開始時 — T001)**: nostr-protocol/nips
+  `master` の README(Event Kinds レジストリ)を直接取得して突合した。結果:
+  - **21311 / 31311 とも割当なし**(完全一致行なし。213xx・313xx 帯の kind も存在せず、
+    20000 番台にも登録された個別 kind はない)
+  - kind 1311 = "Live Chat Message"(NIP-53)を確認 — R1 の予約履行の前提どおり
+  - NIP-53 の割当 kind は 1311 / 10312(Room Presence)/ 30311(Live Event)/
+    30312(Interactive Room)/ 30313(Conference Event)の 5 種で、31311/21311 と
+    近接領域の衝突なし
+  - 改番判断(thread-events.md §NIP 適合の基準に照らして): 割当が存在しないため
+    **改番不要**。判断は ADR-0014 に記録した
 - **Risk / follow-up**: 将来 nostr 側が 31311/21311 を別用途に割り当てる可能性はあるが、
   本ソフトウェアはリレーと通信しない(FR-014)ため実害は命名衝突のみ。contracts に
   「peca 固有 kind であり NIP 互換を主張しない」と明記する。また peca イベントは有効な

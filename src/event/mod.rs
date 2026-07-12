@@ -7,7 +7,9 @@
 //! - [`store`] — EventStore(置換ストア)・DedupCache(重複抑制)(T016)
 //! - [`view`] — DiscoveredChannel ビュー(T039)
 //! - [`publish`] — 掲載エンジン(T029)
+//! - [`livechat`] — kind 1311/21311/31311 のスキーマ・検証(006-livechat-thread T010)
 
+pub mod livechat;
 pub mod publish;
 pub mod schema;
 pub mod store;

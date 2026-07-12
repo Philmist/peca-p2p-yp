@@ -24,12 +24,12 @@
 
 **Purpose**: Constitution Gate 条件(ADR-0014・PlusCal モデル)の履行と、新規モジュールの骨格作成
 
-- [ ] T001 nostr-protocol/nips の kind レジストリで 21311 / 31311 の未割当を一次資料で再確認し(research R2 CHK017)、結果と改番判断(thread-events.md §NIP 適合の基準)を specs/006-livechat-thread/research.md の R2 確認記録へ追記
-- [ ] T002 ADR-0014 を作成: 脅威モデル追加(announce 反射攻撃・偽 ORDER・荒らし)・Principle V 該当/非該当の判定理由・kind 31311/21311 採番根拠を docs/adr/0014-livechat-thread.md に記録(T001 の結果を含む)
-- [ ] T003 [P] PlusCal モデルを作成: シーケンサ状態機械(採番・ORDER 配布・次スレ移行(レス上限到達・配信者の明示操作の両トリガー — FR-013)・凍結/クローズ)を docs/formal/livechat_sequencer.tla + docs/formal/livechat_sequencer.cfg に記述。検査対象: 採番一意性・欠番なし単調増加(T3)・上限超過採番なし・移行境界の二重採番なし(O1)・確定情報の全接続参加者への到達(ライブネス)
-- [ ] T004 TLC で docs/formal/livechat_sequencer.tla を検査しパスさせ、結果を docs/adr/0014-livechat-thread.md へ記録(**実装前ゲート**: シーケンサ実装 T030 の開始条件 — research R9)
-- [ ] T005 [P] Cargo.toml に pulldown-cmark を追加(research R7。他の新規依存はなし)
-- [ ] T006 [P] モジュール骨格を作成: src/livechat/mod.rs(host / session / thread / board / moderation の空サブモジュール)・src/event/livechat.rs・src/web/compat/mod.rs を作成し src/lib.rs / src/event/mod.rs / src/web/mod.rs へ配線。`cargo build` が通ること
+- [X] T001 nostr-protocol/nips の kind レジストリで 21311 / 31311 の未割当を一次資料で再確認し(research R2 CHK017)、結果と改番判断(thread-events.md §NIP 適合の基準)を specs/006-livechat-thread/research.md の R2 確認記録へ追記
+- [X] T002 ADR-0014 を作成: 脅威モデル追加(announce 反射攻撃・偽 ORDER・荒らし)・Principle V 該当/非該当の判定理由・kind 31311/21311 採番根拠を docs/adr/0014-livechat-thread.md に記録(T001 の結果を含む)
+- [X] T003 [P] PlusCal モデルを作成: シーケンサ状態機械(採番・ORDER 配布・次スレ移行(レス上限到達・配信者の明示操作の両トリガー — FR-013)・凍結/クローズ)を docs/formal/livechat_sequencer.tla + docs/formal/livechat_sequencer.cfg に記述。検査対象: 採番一意性・欠番なし単調増加(T3)・上限超過採番なし・移行境界の二重採番なし(O1)・確定情報の全接続参加者への到達(ライブネス)
+- [X] T004 TLC で docs/formal/livechat_sequencer.tla を検査しパスさせ、結果を docs/adr/0014-livechat-thread.md へ記録(**実装前ゲート**: シーケンサ実装 T030 の開始条件 — research R9)
+- [X] T005 [P] Cargo.toml に pulldown-cmark を追加(research R7。他の新規依存はなし)
+- [X] T006 [P] モジュール骨格を作成: src/livechat/mod.rs(host / session / thread / board / moderation の空サブモジュール)・src/event/livechat.rs・src/web/compat/mod.rs を作成し src/lib.rs / src/event/mod.rs / src/web/mod.rs へ配線。`cargo build` が通ること
 
 ---
 

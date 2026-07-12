@@ -9,6 +9,7 @@ axum = "0.8.9"
 encoding_rs = "0.8.35"
 igd-next = { version = "0.17.1", features = ["aio_tokio"] }
 nostr = "0.44.4"
+pulldown-cmark = "0.13"
 rand = "0.9"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
