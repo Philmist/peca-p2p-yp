@@ -443,6 +443,11 @@ async fn run() -> Result<(), i32> {
     if let Some(status) = index_lan_status {
         state = state.with_index_lan(status);
     }
+    // 実況スレ一覧・板設定の供給元(T024 — web/livechat.rs の LivechatDirectory)。
+    // TODO(統括): LivechatRegistry(自板)・gossip ハブ(他ノード板 31311)を束ねた実装を
+    // ここで生成して `.with_livechat_directory(...)` を配線する。registry.rs / hub.rs に
+    // 読み取り専用の公開 API が必要になる見込み(web/livechat.rs モジュール doc 参照)。
+    // 現時点では未配線(None)のため、スレ一覧 API は空・詳細 API は 404 を返す。
     let app = build_router(state.clone());
 
     // 15d. bind に成功していれば index.txt 専用の第 2 リスナーを serve する(既存

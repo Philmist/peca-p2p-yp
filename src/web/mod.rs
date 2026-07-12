@@ -86,6 +86,9 @@ pub struct AppState {
     /// index.txt の LAN 公開状態(ADR-0012)。`None` = 機能無効(`index_bind` 空)。
     /// 起動時に一度だけ確定する不変値のため `Mutex` を持たない(research R3)。
     pub index_lan: Option<Arc<IndexLanStatus>>,
+    /// 実況スレ一覧・詳細の供給元(T024 — 006-livechat-thread)。未配線時は空一覧
+    /// (`GET /livechat/threads`)・`not_found`(`GET /livechat/threads/{board_id}`)。
+    pub livechat_directory: Option<Arc<dyn crate::web::livechat::LivechatDirectory>>,
 }
 
 /// index.txt LAN 公開の実行時状態(data-model §3)。起動時に一度だけ確定する不変値。
@@ -121,6 +124,7 @@ impl AppState {
             node_status: None,
             broadcast: None,
             index_lan: None,
+            livechat_directory: None,
         }
     }
 
@@ -145,6 +149,7 @@ impl AppState {
             node_status: None,
             broadcast: None,
             index_lan: None,
+            livechat_directory: None,
         }
     }
 
@@ -181,6 +186,15 @@ impl AppState {
     /// index.txt の LAN 公開状態を配線する(ADR-0012 — `GET /status` の `index_txt_lan`)。
     pub fn with_index_lan(mut self, index_lan: Arc<IndexLanStatus>) -> Self {
         self.index_lan = Some(index_lan);
+        self
+    }
+
+    /// 実況スレ一覧・詳細の供給元を配線する(T024 — 起動配線・テストで使用)。
+    pub fn with_livechat_directory(
+        mut self,
+        directory: Arc<dyn crate::web::livechat::LivechatDirectory>,
+    ) -> Self {
+        self.livechat_directory = Some(directory);
         self
     }
 
@@ -346,6 +360,7 @@ pub(crate) fn api_router(state: AppState) -> Router<AppState> {
             get(settings::get_settings).put(settings::put_settings),
         )
         .merge(channels::routes())
+        .merge(livechat::routes())
         .merge(mutes::routes())
         .merge(peers::routes())
         .merge(personas::routes())
