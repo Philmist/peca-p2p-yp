@@ -113,15 +113,15 @@
 
 ### Tests for User Story 3
 
-- [ ] T034 [P] [US3] 契約ネガティブテスト(イベント): 署名不一致 announce(ペルソナ不一致)・スレ主以外の鍵の ORDER・過大サイズ(> 16KB / 本文 > 2048 文字 / > 32 行)・gossip への 1311/21311 混入を tests/contract/thread_events.rs に追加し失敗を確認
-- [ ] T035 [P] [US3] 契約ネガティブテスト(配送): 第三者アドレス announce へのチャレンジ失敗 → 切断 + バックオフ、JOIN 前のスレメッセージ・joined 前の RES・RES/ORDER の kind 不一致 → 不正フレーム切断、レート違反 → 破棄をモックピアで tests/contract/thread_delivery.rs に追加し失敗を確認
+- [X] T034 [P] [US3] 契約ネガティブテスト(イベント): 署名不一致 announce(ペルソナ不一致)・スレ主以外の鍵の ORDER・過大サイズ(> 16KB / 本文 > 2048 文字 / > 32 行)・gossip への 1311/21311 混入を tests/contract/thread_events.rs に追加し失敗を確認
+- [X] T035 [P] [US3] 契約ネガティブテスト(配送): 第三者アドレス announce へのチャレンジ失敗 → 切断 + バックオフ、JOIN 前のスレメッセージ・joined 前の RES・RES/ORDER の kind 不一致 → 不正フレーム切断、レート違反 → 破棄をモックピアで tests/contract/thread_delivery.rs に追加し失敗を確認
 
 ### Implementation for User Story 3
 
-- [ ] T036 [US3] レート制限を実装: `thread_write_rate`(板鍵単位)・`thread_msg_rate`(接続単位・制御メッセージ込み)のホスト側強制、違反は破棄 + `livechat_write_rejected`、継続違反は切断(FR-021)— src/livechat/host.rs
-- [ ] T037 [US3] 不正フレーム防御を実装: THREAD_JOIN 前のスレメッセージ・joined 前の RES の切断、RES に 1311 以外・ORDER に 21311 以外が載った場合の切断、フレーム長 ≤ 64KB・イベント ≤ 16KB の強制(contracts/thread-delivery.md §防御)— src/livechat/host.rs / src/livechat/session.rs
-- [ ] T038 [US3] SecurityEvent 記録と定型エラーの全経路確認: 6 カテゴリの記録配線を検証し、全エラー応答(THREAD_REJECT・切断コード)が内部情報を漏洩しないことを確認。tests/features/security.feature にネガティブシナリオを追記し tests/steps/security.rs で検証(FR-003/FR-005/FR-011/FR-021/SC-004)
-- [ ] T039 [US3] US3 の cucumber ステップを tests/steps/livechat.rs に実装し、統合テスト(注入攻撃がすべて不可視 + 記録 = SC-004 100%)を tests/integration/livechat.rs に追加して全パス
+- [X] T036 [US3] レート制限を実装: `thread_write_rate`(板鍵単位)・`thread_msg_rate`(接続単位・制御メッセージ込み)のホスト側強制、違反は破棄 + `livechat_write_rejected`、継続違反は切断(FR-021)— src/livechat/host.rs
+- [X] T037 [US3] 不正フレーム防御を実装: THREAD_JOIN 前のスレメッセージ・joined 前の RES の切断、RES に 1311 以外・ORDER に 21311 以外が載った場合の切断、フレーム長 ≤ 64KB・イベント ≤ 16KB の強制(contracts/thread-delivery.md §防御)— src/livechat/host.rs / src/livechat/session.rs
+- [X] T038 [US3] SecurityEvent 記録と定型エラーの全経路確認: 6 カテゴリの記録配線を検証し、全エラー応答(THREAD_REJECT・切断コード)が内部情報を漏洩しないことを確認。tests/features/security.feature にネガティブシナリオを追記し tests/steps/security.rs で検証(FR-003/FR-005/FR-011/FR-021/SC-004)
+- [X] T039 [US3] US3 の cucumber ステップを tests/steps/livechat.rs に実装し、統合テスト(注入攻撃がすべて不可視 + 記録 = SC-004 100%)を tests/integration/livechat.rs に追加して全パス
 
 **Checkpoint**: P1 ストーリー(US1〜US3)完了 — リリース可能な安全性水準
 
