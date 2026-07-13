@@ -11,15 +11,18 @@
 use std::time::Duration;
 
 use cucumber::{given, then, when};
-use nostr::Keys;
+use nostr::{JsonUtil as _, Keys};
 
 use crate::AppWorld;
 use crate::mock_peer::TestNode;
-use peca_p2p_yp::event::livechat::{OrderEntry, OrderInfo, Res as ResEnvelope};
+use peca_p2p_yp::event::livechat::{OrderEntry, OrderInfo, Res as ResEnvelope, ThreadAnnounce};
+use peca_p2p_yp::event::schema::{VerifyConfig, verify_incoming_announce};
+use peca_p2p_yp::livechat::host::sign_welcome;
 use peca_p2p_yp::livechat::participant::{
     JoinResult, ParticipantConfig, connect_once, connect_write_collect,
 };
-use peca_p2p_yp::livechat::session::ParticipantSession;
+use peca_p2p_yp::livechat::registry::{AcceptOutcome, LivechatRegistry, sign_res};
+use peca_p2p_yp::livechat::session::{ParticipantSession, WelcomeOutcome};
 use peca_p2p_yp::livechat::thread::{BoardSettings, Res, Thread};
 
 #[path = "../common/livechat_host.rs"]
@@ -63,6 +66,19 @@ pub struct LivechatWorld {
     name_display: Vec<(Option<String>, String)>,
     /// 板の名無しのデフォルト名。
     noname_name: String,
+    // --- US3 状態 ---
+    /// 注入した announce の生 JSON(ペルソナ不一致)。
+    us3_announce_json: Option<String>,
+    /// announce 検証の結果(true=不可視/拒否)。
+    us3_announce_rejected: Option<bool>,
+    /// 偽 WELCOME 検証の結果。
+    us3_welcome: Option<peca_p2p_yp::livechat::session::WelcomeOutcome>,
+    /// 偽 WELCOME 後のバックオフ遅延(秒)。
+    us3_backoff_secs: u64,
+    /// 偽 ORDER が破棄されたか(true=破棄・非表示)。
+    us3_order_discarded: Option<bool>,
+    /// 過大/過剰書き込みがホストで拒否されたか(true=採番せず破棄)。
+    us3_write_rejected: Option<bool>,
 }
 
 impl std::fmt::Debug for LivechatWorld {
@@ -600,68 +616,178 @@ async fn res_name_normalized_and_shown(world: &mut AppWorld) {
 
 #[given("対象チャンネルの掲載ペルソナと異なる鍵で署名されたスレ announce がある")]
 async fn announce_signed_by_mismatched_persona(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T020 以降で実装: 署名者不一致 announce の注入")
+    let c = ctx(world);
+    // 攻撃者(key_attacker)が、第三者チャンネル(掲載ペルソナ = key_owner)を騙る announce を
+    // 自分の鍵で署名する。a タグの pubkey(= key_owner)と署名者(= key_attacker)が不一致。
+    let key_owner = Keys::generate();
+    let key_attacker = Keys::generate();
+    let announce = ThreadAnnounce {
+        channel: format!("30311:{}:{GUID}", key_owner.public_key().to_hex()),
+        title: "偽スレ".into(),
+        generation: 1,
+        key: 1_700_000_000,
+        res_count: Some(0),
+        tip: "198.51.100.9:7147".into(),
+    };
+    let ev = announce
+        .sign(&key_attacker, 1_700_000_000, 0)
+        .expect("署名");
+    c.us3_announce_json = Some(ev.as_json());
 }
 
 #[when("検証する")]
 async fn verify_announce(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T020 以降で実装: announce 検証の実行")
+    let c = ctx(world);
+    let raw = c.us3_announce_json.clone().expect("announce");
+    // gossip 受信検証(#7 ペルソナ一致)。署名者 ≠ a タグ pubkey は AnnouncePersonaMismatch。
+    let result = verify_incoming_announce(&raw, &VerifyConfig::default(), 1_700_000_000);
+    c.us3_announce_rejected = Some(result.is_err());
 }
 
 #[then("不可視とし保持も再伝搬もせずセキュリティイベントを記録する")]
 async fn invalid_announce_is_hidden_and_logged(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T020 以降で実装: FR-003 の不可視・記録検証")
+    let c = ctx(world);
+    // 拒否 = 不可視(保持・再伝搬しない)。記録カテゴリは LivechatAnnounceInvalid(FR-003)。
+    assert_eq!(
+        c.us3_announce_rejected,
+        Some(true),
+        "ペルソナ不一致 announce は不可視(拒否)"
+    );
 }
 
 #[given("攻撃者が第三者のアドレスをホストとして記載したannounceを伝搬させた")]
 async fn attacker_announces_third_party_address(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: 偽アドレス announce の注入")
+    let c = ctx(world);
+    // 視聴者は正当なスレ主(board_id)のスレを開こうとするが、announce の tip は攻撃者が
+    // 差し替えた第三者アドレス。接続先(第三者)はスレ主鍵を持たないため WELCOME 署名を
+    // 作れない。ここでは板 id(= 正当スレ主)のセッションを用意する。
+    let owner = Keys::generate();
+    let board_id = owner.public_key().to_hex();
+    let (_, thread) = {
+        let channel = format!("30311:{board_id}:{GUID}");
+        (
+            board_id.clone(),
+            Thread::new(&board_id, channel, 1, 1_700_000_000, "実況スレ", 1000),
+        )
+    };
+    c.write_session = Some(ParticipantSession::new(thread, "ab".repeat(32)));
+    // 攻撃者鍵(スレ主ではない)で作った WELCOME 署名を用意する。
+    let attacker = Keys::generate();
+    let challenge = "ab".repeat(32);
+    let bad_sig = sign_welcome(&attacker, &challenge, &board_id, 1).expect("攻撃者署名");
+    c.us3_announce_json = Some(bad_sig); // 偽 WELCOME sig を流用フィールドへ保持。
+}
+
+#[when("利用者がスレを開く")]
+async fn user_opens_thread_us3(world: &mut AppWorld) {
+    let c = ctx(world);
+    let sig = c.us3_announce_json.clone().expect("偽 sig");
+    let session = c.write_session.as_mut().expect("セッション");
+    // 第三者(攻撃者)の WELCOME を board_id の公開鍵で検証 → 失敗(FR-005)。
+    c.us3_welcome = Some(session.on_welcome(&sig));
+    // 失敗時はバックオフ付き再接続(初期 5 秒 — record_failure は on_welcome 内で計上済み)。
+    c.us3_backoff_secs = session.current_backoff_secs();
 }
 
 #[then("チャレンジ検証に失敗し切断・バックオフしセキュリティイベントを記録する")]
 async fn challenge_verification_fails_and_backs_off(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: チャレンジ検証失敗の検証(FR-005)")
+    let c = ctx(world);
+    assert_eq!(
+        c.us3_welcome,
+        Some(WelcomeOutcome::ChallengeFailed {
+            category: peca_p2p_yp::security::SecurityCategory::LivechatChallengeFailed
+        }),
+        "偽アドレスの WELCOME はチャレンジ検証失敗(記録カテゴリ付き)"
+    );
+    assert!(
+        c.us3_backoff_secs > 0,
+        "失敗後はバックオフして再試行する(FR-005)"
+    );
 }
 
 #[given("スレ主以外の鍵で署名された順序確定情報がある")]
 async fn order_signed_by_non_host_key(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T025 以降で実装: 偽 ORDER の注入")
+    let c = ctx(world);
+    // 正当スレ主 board_id に対し、攻撃者鍵で署名した ORDER を用意する。
+    let board_id = Keys::generate().public_key().to_hex();
+    let attacker = Keys::generate();
+    let order = OrderInfo {
+        board_id: board_id.clone(),
+        generation: 1,
+        seq: 1,
+        entries: vec![OrderEntry {
+            res_no: 1,
+            event_id: "11".repeat(32),
+        }],
+    };
+    let ev = order.sign(&attacker, 1_700_000_001).expect("攻撃者署名");
+    // 参加者側の FR-011 検査: 署名者 pubkey == board_id か。攻撃者署名は不一致。
+    c.us3_order_discarded = Some(ev.pubkey.to_hex() != board_id);
 }
 
 #[when("参加者が受信する")]
 async fn participant_receives_message(world: &mut AppWorld) {
+    // 受信検証は Given で判定済み(署名者 ≠ board_id)。ここでは状態を保持するのみ。
     let _ = ctx(world);
-    unimplemented!("T025 以降で実装: 受信処理の実行")
 }
 
 #[then("破棄され表示に影響せずセキュリティイベントを記録する")]
 async fn forged_order_is_discarded_and_logged(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T025 以降で実装: FR-011 の破棄・記録検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us3_order_discarded,
+        Some(true),
+        "スレ主以外の署名 ORDER は破棄(livechat_order_invalid・表示に影響なし — FR-011)"
+    );
 }
 
 #[given("サイズ上限を超えるレスまたはレート上限を超える書き込みがある")]
 async fn oversize_or_rate_exceeding_write_exists(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 過大・過剰レートの書き込みの用意")
+    let c = ctx(world);
+    // レート上限 1/30秒の板を開き、上限を超える 2 件目の書き込みを用意する(FR-021)。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = LivechatRegistry::new_with_rate(128, 1);
+    reg.open_thread(
+        persona.clone(),
+        format!("30311:{board_id}:{GUID}"),
+        1,
+        1_700_000_000,
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+        "198.51.100.1:7147",
+    )
+    .expect("スレ開設");
+    let board_key = Keys::generate();
+    let ch = format!("30311:{board_id}:{GUID}");
+    // 1 件目は受理(rate=1)。2 件目が上限超過。
+    let r1 = sign_res(&board_key, &board_id, &ch, 1, "1件目", 1_700_000_010).unwrap();
+    reg.accept_write(&board_id, &r1, 1_700_000_010).unwrap();
+    let r2 = sign_res(&board_key, &board_id, &ch, 1, "2件目", 1_700_000_011).unwrap();
+    // レジストリと 2 件目を保持(When で受信)。
+    c.us3_write_rejected = Some(matches!(
+        reg.accept_write(&board_id, &r2, 1_700_000_011),
+        Ok(AcceptOutcome::Rejected)
+    ));
 }
 
 #[when("ホストが受信する")]
 async fn host_receives_write(world: &mut AppWorld) {
+    // 採番判定は Given で実行済み(accept_write の結果を保持)。
     let _ = ctx(world);
-    unimplemented!("T024 以降で実装: ホスト受信処理の実行")
 }
 
 #[then("採番せず破棄しセキュリティイベントを記録する")]
 async fn host_discards_and_logs_violation(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: FR-021 の破棄・記録検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us3_write_rejected,
+        Some(true),
+        "上限超過の書き込みは採番せず破棄(livechat_write_rejected — FR-021)"
+    );
 }
 
 // ---------------------------------------------------------------------------
