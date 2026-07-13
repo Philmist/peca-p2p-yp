@@ -1094,3 +1094,66 @@ fn write_rate_exceeded_is_rejected_without_numbering() {
         "同一窓内でレート上限を超えた書き込みは Rejected で破棄される"
     );
 }
+
+#[tokio::test]
+async fn forged_order_from_non_board_persona_is_discarded_and_logged() {
+    // 攻撃シナリオ: 攻撃者(スレ主ではない)が、正規の board_id を騙った ORDER(kind
+    // 21311)を偽造して参加者へ送りつける。参加者は verify_order(署名者 pubkey ==
+    // board_id)で検証するため、攻撃者の鍵で署名された ORDER は必ず破棄される(FR-011)。
+    // 破棄と同時に SecurityLog へ `livechat_order_invalid` を記録し、監査可能にする
+    // (SC-004 / T038)。確定列には一切影響しない(表示を汚染しない)。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let attacker = Keys::generate();
+    let mock = MockPeer::spawn().await;
+    mock.set_thread_response(ThreadResponse::DynamicWelcome {
+        persona: persona.clone(),
+        generation: 1,
+        board_settings: json!({}),
+        res_count: 0,
+    });
+
+    let dir = tempdir().unwrap();
+    let log = Arc::new(SecurityLog::new(dir.path().join("sec.log")).unwrap());
+    let config = config_for(&mock, &board_id, Some(Arc::clone(&log)));
+
+    // 偽 ORDER: board_id ではなく攻撃者の鍵で署名する(entries の内容自体は形式上妥当)。
+    let forged_order = OrderInfo {
+        board_id: board_id.clone(),
+        generation: 1,
+        seq: 1,
+        entries: vec![OrderEntry {
+            res_no: 1,
+            event_id: "ff".repeat(32),
+        }],
+    }
+    .sign(&attacker, 1_700_000_000)
+    .unwrap();
+
+    let handle = tokio::spawn(async move { connect_once(&config, 0).await });
+    // WELCOME 検証・joined が済む頃合いまで待ってから偽 ORDER を注入する
+    // (join_then_sync テストと同様、mock を drop して EOF で同期ループを締める)。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    mock.push_thread_frame(order_frame(&forged_order));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(mock);
+    let result = handle.await.unwrap();
+
+    match result {
+        JoinResult::Joined { confirmed } => {
+            assert!(
+                confirmed.is_empty(),
+                "偽 ORDER は破棄され確定列に一切影響しない: {confirmed:?}"
+            );
+        }
+        other => panic!("joined すべき(偽 ORDER の受信では切断しない): {other:?}"),
+    }
+
+    // livechat_order_invalid が記録される(FR-011 / SC-004 の監査要件 — T038)。
+    log.flush();
+    let content = std::fs::read_to_string(dir.path().join("sec.log")).unwrap();
+    assert!(
+        content.contains("livechat_order_invalid"),
+        "偽 ORDER の破棄が livechat_order_invalid として記録される: {content}"
+    );
+}
