@@ -828,3 +828,269 @@ fn accept_write_rejects_over_res_limit_without_broadcast() {
     // 上限超過分は配布されない(outbox に何も届かない)。
     assert!(rx.try_recv().is_err(), "上限超過は配布されない");
 }
+
+// ---------------------------------------------------------------------------
+// T035: 契約ネガティブテスト(配送) — なりすまし・不正耐性(US3)
+//
+// 「妥当に見える接続・フレームだが不正」なケースが受理・確定されないことを固定する:
+// - 第三者(攻撃者)のアドレス/鍵で応答するホストへ接続すると、チャレンジ署名検証が
+//   失敗し切断・要バックオフになる(FR-005 — announce 記載の公開鍵で検証するため、
+//   第三者が応答してもなりすませない)。
+// - WELCOME/REJECT より前にスレメッセージ(RES/ORDER 等)が届くのはプロトコル違反
+//   (thread-delivery.md §ハンドシェイク順序)。
+// - RES/ORDER の kind が期待(1311/21311)と異なるイベントは形式検証で拒否され、
+//   確定列に反映されない(封筒検証の kind チェック)。
+// - 板鍵単位のレート上限(`thread_write_rate`)超過は採番せず Rejected で破棄される
+//   (FR-021 — T036 で実装済みの LivechatRegistry::accept_write を公開 API 経由で確認)。
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn third_party_persona_welcome_fails_challenge_and_backs_off() {
+    // 攻撃シナリオ: 第三者(攻撃者)が本物のスレ主を騙って応答するホストになりすます。
+    // 参加者は announce に記載された**本物の**スレ主公開鍵(board_id)でチャレンジ署名を
+    // 検証するため、攻撃者の鍵で署名された WELCOME は必ず検証に失敗する(FR-005)。
+    let real_persona = Keys::generate();
+    let board_id = real_persona.public_key().to_hex(); // announce に記載された本物の鍵。
+    let attacker = Keys::generate(); // 接続先ホストが実際に握っている(第三者の)鍵。
+
+    let mock = MockPeer::spawn().await;
+    // ホスト(mock)は攻撃者の鍵で「正しく」署名した WELCOME を返す(攻撃者から見れば
+    // 正当な署名だが、参加者が期待する board_id とは異なる鍵)。
+    mock.set_thread_response(ThreadResponse::DynamicWelcome {
+        persona: attacker,
+        generation: 1,
+        board_settings: json!({}),
+        res_count: 0,
+    });
+
+    let dir = tempdir().unwrap();
+    let log = Arc::new(SecurityLog::new(dir.path().join("sec.log")).unwrap());
+    // config は本物の board_id を対象スレとして指定する(参加者が本来接続したいスレ)。
+    let config = config_for(&mock, &board_id, Some(Arc::clone(&log)));
+    let result = connect_once(&config, 0).await;
+    assert_eq!(
+        result,
+        JoinResult::ChallengeFailed,
+        "第三者の鍵で署名された WELCOME はチャレンジ検証に失敗する"
+    );
+
+    // livechat_challenge_failed が記録される(切断 + 要バックオフの根拠 — FR-005)。
+    log.flush();
+    let content = std::fs::read_to_string(dir.path().join("sec.log")).unwrap();
+    assert!(
+        content.contains("livechat_challenge_failed"),
+        "第三者なりすましのチャレンジ失敗が記録される: {content}"
+    );
+
+    // ChallengeFailed はバックオフ対象(WaitFrozen/GiveUp とは異なり再試行しうる)。
+    // ParticipantSession の状態機械としては record_failure が呼ばれ、次回接続まで
+    // 待機時間が生じることを確認する(バックオフの根拠は session.rs 側で単体検証済みの
+    // ため、ここでは「切断 + ログ記録」という配送契約の観測可能な結果を固定する)。
+}
+
+#[tokio::test]
+async fn thread_message_before_welcome_is_protocol_violation() {
+    // 契約: WELCOME/REJECT より前に RES/ORDER 等のスレメッセージが届くのは
+    // ハンドシェイク順序違反(thread-delivery.md)。参加者ドライバは JOIN 直後の
+    // 最初の応答として WELCOME/REJECT 以外を受け取ると、プロトコル違反として
+    // 即座に接続を諦める(Transport 扱い — 前方互換で不正終了を握り潰さない)。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let channel = format!("30311:{board_id}:{GUID}");
+    let mock = MockPeer::spawn().await;
+
+    // THREAD_JOIN への応答を設定しない(WELCOME/REJECT を返さない)。代わりに接続確立後
+    // (HELLO/HELLO_ACK 交換直後から push は有効)、参加者が THREAD_JOIN を送ったであろう
+    // 頃合いを見て RES フレームを即時注入する(WELCOME より前にスレメッセージが届く状況を
+    // 再現する。serve_thread_frame は WELCOME 後の同期専用のため使えない)。
+    let board_key = Keys::generate();
+    let premature_res = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &board_id,
+        &channel,
+        1,
+        "WELCOME 前の不正な RES",
+        1_700_000_001,
+    )
+    .unwrap();
+
+    let config = config_for(&mock, &board_id, None);
+    let handle = tokio::spawn(async move { connect_once(&config, 0).await });
+    // JOIN 送信が済む頃合いまで待ってから、WELCOME の代わりに RES を先出しする。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    mock.push_thread_frame(res_frame(&premature_res));
+
+    let result = handle.await.unwrap();
+    assert_eq!(
+        result,
+        JoinResult::Transport,
+        "WELCOME 前のスレメッセージはプロトコル違反として扱われる: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn res_message_with_mismatched_kind_is_ignored_not_confirmed() {
+    // 契約: RES フレームに kind 1311 以外のイベントが載っていた場合、封筒検証
+    // (Res::from_event の kind チェック)で拒否され、確定列に反映されない
+    // (前方互換のため切断はしないが、不正データとして無視する)。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let channel = format!("30311:{board_id}:{GUID}");
+    let mock = MockPeer::spawn().await;
+    mock.set_thread_response(ThreadResponse::DynamicWelcome {
+        persona: persona.clone(),
+        generation: 1,
+        board_settings: json!({}),
+        res_count: 1,
+    });
+
+    // kind 1311 ではなく kind 31311(announce)のイベントを RES フレームに詰める
+    // (kind 不一致 — 「妥当に見えるが不正な」フレーム)。
+    let bogus_announce = peca_p2p_yp::event::livechat::ThreadAnnounce {
+        channel: channel.clone(),
+        title: "偽装".into(),
+        generation: 1,
+        key: 1_700_000_000,
+        res_count: None,
+        tip: "198.51.100.1:7147".into(),
+    }
+    .sign(&persona, 1_700_000_000, 0)
+    .unwrap();
+    assert_eq!(bogus_announce.kind.as_u16(), 31311, "kind 不一致の前提");
+    mock.serve_thread_frame(res_frame(&bogus_announce));
+
+    let config = config_for(&mock, &board_id, None);
+    let handle = tokio::spawn(async move { connect_once(&config, 0).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drop(mock); // 同期ループを EOF で終える。
+    let result = handle.await.unwrap();
+
+    match result {
+        JoinResult::Joined { confirmed } => {
+            assert!(
+                confirmed.is_empty(),
+                "kind 不一致の RES は確定列に反映されない(拒否・無視): {confirmed:?}"
+            );
+        }
+        other => panic!("joined すべき(不正フレームで切断はしない): {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn order_message_with_mismatched_kind_is_ignored_not_confirmed() {
+    // 契約: ORDER フレームに kind 21311 以外のイベントが載っていた場合も同様に
+    // OrderInfo::from_event の kind チェックで拒否され、確定列は進まない。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let channel = format!("30311:{board_id}:{GUID}");
+    let mock = MockPeer::spawn().await;
+    mock.set_thread_response(ThreadResponse::DynamicWelcome {
+        persona: persona.clone(),
+        generation: 1,
+        board_settings: json!({}),
+        res_count: 1,
+    });
+
+    // 正当な RES を先に用意し保留プールへ載せておく(確定できる材料は揃える)。
+    let board_key = Keys::generate();
+    let res = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &board_id,
+        &channel,
+        1,
+        "本文",
+        1_700_000_001,
+    )
+    .unwrap();
+    mock.serve_thread_frame(res_frame(&res));
+
+    // ORDER フレームに kind 1311(RES)のイベントを詰める(kind 不一致)。
+    let bogus_order_slot = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &board_id,
+        &channel,
+        1,
+        "ORDER のふりをした RES",
+        1_700_000_002,
+    )
+    .unwrap();
+    assert_eq!(bogus_order_slot.kind.as_u16(), 1311, "kind 不一致の前提");
+    mock.serve_thread_frame(order_frame(&bogus_order_slot));
+
+    let config = config_for(&mock, &board_id, None);
+    let handle = tokio::spawn(async move { connect_once(&config, 0).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drop(mock);
+    let result = handle.await.unwrap();
+
+    match result {
+        JoinResult::Joined { confirmed } => {
+            assert!(
+                confirmed.is_empty(),
+                "kind 不一致の ORDER は確定列に反映されない(RES は保留のまま): {confirmed:?}"
+            );
+        }
+        other => panic!("joined すべき(不正フレームで切断はしない): {other:?}"),
+    }
+}
+
+#[test]
+fn write_rate_exceeded_is_rejected_without_numbering() {
+    // 契約: 板鍵単位の書き込みレート上限(thread_write_rate — FR-021)を超えた
+    // 書き込みは採番せず Rejected で破棄される(荒らしの連投耐性)。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    // 30 秒窓内 2 件までに制限した厳しいレートで開設する。
+    let reg = LivechatRegistry::new_with_rate(128, 2);
+    let settings = BoardSettings {
+        first_post_pow_bits: 0,
+        ..Default::default()
+    };
+    reg.open_thread(
+        persona.clone(),
+        delivery_channel(&board_id),
+        1,
+        1_700_000_000,
+        "実況スレ",
+        settings,
+        "198.51.100.1:7147",
+    )
+    .unwrap();
+
+    let board_key = Keys::generate();
+    // 同一時刻(同一窓内)で 1・2 件目は受理される。
+    for i in 0..2u64 {
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &delivery_channel(&board_id),
+            1,
+            "本文",
+            1_700_000_010 + i,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+                AcceptOutcome::Numbered { .. }
+            ),
+            "レート上限内の {i} 件目は受理される"
+        );
+    }
+
+    // 同一窓内での 3 件目はレート超過で Rejected(採番されない = res_no は進まない)。
+    let over = sign_res(
+        &board_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        1,
+        "レート超過の投稿",
+        1_700_000_012,
+    )
+    .unwrap();
+    assert_eq!(
+        reg.accept_write(&board_id, &over, 1_700_000_010).unwrap(),
+        AcceptOutcome::Rejected,
+        "同一窓内でレート上限を超えた書き込みは Rejected で破棄される"
+    );
+}
