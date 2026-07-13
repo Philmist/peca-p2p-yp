@@ -21,6 +21,13 @@
 //! - **「スレを開く」操作は本タスクではスタブ**: 実接続(`crate::livechat::participant`)
 //!   の起動は非同期 TCP ハンドシェイクを伴い、結果の保持・ポーリング方式の設計が
 //!   US1 の一覧/閲覧 API より優先度が低いため、シグネチャのみ用意し 501 を返す。
+//!
+//! ## US4(T045)の追加分
+//!
+//! - [`board_compat_url`]: 互換 API 板 URL(コピー用)を返す純粋関数。モデレーション
+//!   (NG/BAN/ローテーション)の HTTP エンドポイントは `AppState` 配線が未完(T024 の
+//!   宿題)のため本タスクでは追加しない — ドメイン層([`crate::livechat::moderation`] /
+//!   [`crate::livechat::registry::LivechatRegistry`])はテスト経由で直接検証する。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -76,6 +83,16 @@ pub fn render_local_rules_html(markdown: &str) -> String {
 fn is_http_or_https(url: &CowStr<'_>) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// 互換 API 板 URL(T045)。`http://127.0.0.1:7183/<board_id>/` — コピー用の表示値。
+///
+/// 互換 API(FR-026 — loopback 限定)は既定ポート 7183 の固定値を用いる
+/// (contracts/compat-api.md)。モデレーション HTTP エンドポイントは AppState 配線が
+/// 未完(T024 の宿題)のため、本タスクでは独立した純粋関数として追加するに留め、
+/// `ThreadSummary`/`AppState` へは組み込まない(既存の破壊を避ける)。
+pub fn board_compat_url(board_id: &str) -> String {
+    format!("http://127.0.0.1:7183/{board_id}/")
 }
 
 // ---------------------------------------------------------------------------
@@ -516,5 +533,16 @@ mod tests {
         let state = state_with_directory(None);
         let resp = join_thread(State(state), Path("ab".repeat(32))).await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // --- T045: 互換 API 板 URL ---------------------------------------------
+
+    #[test]
+    fn board_compat_url_uses_loopback_and_default_port() {
+        let board_id = "ab".repeat(32);
+        assert_eq!(
+            board_compat_url(&board_id),
+            format!("http://127.0.0.1:7183/{board_id}/")
+        );
     }
 }

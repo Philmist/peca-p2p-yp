@@ -158,6 +158,11 @@ impl LivechatHostNode {
         &self.hub
     }
 
+    /// ホストレジストリ(US4 — BAN/PoW 等のドメイン層検証用アクセサ)。
+    pub fn registry(&self) -> &Arc<LivechatRegistry> {
+        &self.registry
+    }
+
     /// 現在 established なスレ参加者を含む接続数 `(inbound, outbound)`。
     pub fn established_counts(&self) -> (usize, usize) {
         self.hub.established_counts()

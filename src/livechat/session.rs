@@ -228,6 +228,11 @@ impl ParticipantSession {
         &self.thread.res
     }
 
+    /// NG 判定を適用した可視レス列(T043 — FR-020。[`Thread::visible_res`] への薄い委譲)。
+    pub fn visible_confirmed(&self, is_ng: impl Fn(&str) -> bool) -> Vec<&Res> {
+        self.thread.visible_res(is_ng)
+    }
+
     /// 対象スレの読み取り(状態・世代の参照用)。
     pub fn thread(&self) -> &Thread {
         &self.thread
@@ -380,7 +385,8 @@ impl ParticipantSession {
     /// 署名済みイベントを**自分の未確定投稿**として `pending`(送信中)へ加え、送出すべき
     /// `RES` メッセージを返す(FR-008 — 送信中表示)。ホストの ORDER で確定すると
     /// [`Self::apply_order`] が pending から除去し確定列へ移す。`created_at` は署名時刻、
-    /// `pow_bits` は初見板鍵の PoW(通常は 0。初回書き込み PoW は US4/T044)。
+    /// `pow_bits` は初見板鍵の PoW(通常は 0。呼び出し側は [`first_post_pow_bits`] で
+    /// 「この鍵で初めて書くか」に応じた値を求めて渡す — T044)。
     ///
     /// 形式違反(本文長・行数・名前長・チャンネル/board_id 不正)は
     /// [`LivechatBuildError`] を返し、pending へは加えない。
@@ -477,6 +483,21 @@ pub fn res_from_event(env: &ResEnvelope, event: &Event) -> Res {
         &event.pubkey.to_hex(),
         event.created_at.as_secs() as i64,
     )
+}
+
+/// 初回書き込みに要求される PoW ビット数を返す(T044 — research R6)。
+///
+/// 新規生成・ローテーション直後の板鍵の初回書き込みは板設定の `first_post_pow_bits` を、
+/// 既知(投稿実績あり)の板鍵は 0(通常しきい値)を使う。判定はクライアント側の
+/// 「この鍵で初めて書くか」に基づく(ホスト側の `known_board_keys` と対応 —
+/// [`crate::livechat::registry::LivechatRegistry::accept_write`])。[`Self::compose_write`] の
+/// `pow_bits` 引数に渡す値を決めるための純粋ヘルパ。
+pub fn first_post_pow_bits(settings: &BoardSettings, is_first_post: bool) -> u8 {
+    if is_first_post {
+        settings.first_post_pow_bits
+    } else {
+        0
+    }
 }
 
 /// 受信した `SETTINGS`(`board_settings` JSON)を検証して [`BoardSettings`] へ復元する
@@ -1132,5 +1153,25 @@ mod tests {
         });
         let settings = parse_and_validate_settings(&json).unwrap();
         assert_eq!(settings.title, "タイトル制御", "制御文字が除去される");
+    }
+
+    // --- T044: 初回書き込み PoW ビット数の選択(research R6)-------------------
+
+    #[test]
+    fn first_post_pow_bits_uses_setting_for_first_post() {
+        let settings = BoardSettings {
+            first_post_pow_bits: 12,
+            ..Default::default()
+        };
+        assert_eq!(first_post_pow_bits(&settings, true), 12);
+    }
+
+    #[test]
+    fn first_post_pow_bits_is_zero_for_known_key() {
+        let settings = BoardSettings {
+            first_post_pow_bits: 12,
+            ..Default::default()
+        };
+        assert_eq!(first_post_pow_bits(&settings, false), 0);
     }
 }

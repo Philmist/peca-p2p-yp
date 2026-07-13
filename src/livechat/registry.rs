@@ -66,6 +66,11 @@ struct HostEntry {
     known_board_keys: HashSet<String>,
     /// 板鍵ごとの書き込みレート窓(FR-021 — `thread_write_rate`)。30 秒窓内のレス数を数える。
     write_windows: HashMap<String, WriteRateWindow>,
+    /// BAN 済み板鍵集合(T042 — thread-events.md 検証 5)。完全一致のみで判定する(FR-018)。
+    banned_keys: HashSet<String>,
+    /// ConnBan 済み接続元アドレス集合(T042 — FR-019)。HELLO 後 CLOSE で切断する
+    /// (理由非開示 — thread-delivery.md §防御)。
+    conn_banned: HashSet<String>,
 }
 
 /// スレ seed(確定レス投入)・接続受理の失敗理由。`Display` は内部情報を漏らさない。
@@ -203,6 +208,8 @@ impl LivechatRegistry {
                 outboxes: HashMap::new(),
                 known_board_keys: HashSet::new(),
                 write_windows: HashMap::new(),
+                banned_keys: HashSet::new(),
+                conn_banned: HashSet::new(),
             },
         );
         Ok(())
@@ -211,6 +218,64 @@ impl LivechatRegistry {
     /// 開設中の board_id 一覧(status・診断用)。
     pub fn board_ids(&self) -> Vec<String> {
         lock(&self.hosts).keys().cloned().collect()
+    }
+
+    // ----------------------------------------------------------- T042: BAN
+
+    /// 板鍵を BAN する(スレ主 — 採番拒否。thread-events.md 検証 5)。
+    /// 未知 board は `false`(何もしない)。
+    pub fn ban_board_key(&self, board_id: &str, board_key: &str) -> bool {
+        let mut hosts = lock(&self.hosts);
+        let Some(entry) = hosts.get_mut(board_id) else {
+            return false;
+        };
+        entry.banned_keys.insert(board_key.to_string());
+        true
+    }
+
+    /// 板鍵の BAN を解除する。未知 board は `false`。
+    pub fn unban_board_key(&self, board_id: &str, board_key: &str) -> bool {
+        let mut hosts = lock(&self.hosts);
+        let Some(entry) = hosts.get_mut(board_id) else {
+            return false;
+        };
+        entry.banned_keys.remove(board_key);
+        true
+    }
+
+    /// 接続元アドレスを ConnBan する(スレ主 — 接続拒否。FR-019)。未知 board は `false`。
+    pub fn ban_connection(&self, board_id: &str, addr: &str) -> bool {
+        let mut hosts = lock(&self.hosts);
+        let Some(entry) = hosts.get_mut(board_id) else {
+            return false;
+        };
+        entry.conn_banned.insert(addr.to_string());
+        true
+    }
+
+    /// 接続元アドレスの ConnBan を解除する。未知 board は `false`。
+    pub fn unban_connection(&self, board_id: &str, addr: &str) -> bool {
+        let mut hosts = lock(&self.hosts);
+        let Some(entry) = hosts.get_mut(board_id) else {
+            return false;
+        };
+        entry.conn_banned.remove(addr);
+        true
+    }
+
+    /// 指定接続元アドレスが ConnBan 済みか(完全一致)。未知 board は `false`。
+    pub fn is_conn_banned(&self, board_id: &str, addr: &str) -> bool {
+        lock(&self.hosts)
+            .get(board_id)
+            .is_some_and(|e| e.conn_banned.contains(addr))
+    }
+
+    /// BAN 済み板鍵一覧(UI/一覧用)。未知 board は空。
+    pub fn banned_board_keys(&self, board_id: &str) -> Vec<String> {
+        lock(&self.hosts)
+            .get(board_id)
+            .map(|e| e.banned_keys.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// 開設中の全スレの announce(kind 31311)を署名して返す(T019 — 60 秒間隔の定期発行)。
@@ -436,18 +501,20 @@ impl LivechatRegistry {
     ///    採番せず [`AcceptOutcome::Duplicate`](再送 × 切断で二重採番が起きるのを防ぐ — O1)。
     /// 3. **上限(NoOverLimit / T3 — `RoomInActive`)**: 次 res_no が res_limit を超えるなら
     ///    採番せず [`AcceptOutcome::Rejected`](次スレ移行は US5/T047)。
-    /// 4. **PoW(thread-events.md 検証 6 — FR-021)**: 初見板鍵は `first_post_pow_bits` を満たす
+    /// 4. **BAN(thread-events.md 検証 5 — spec Edge Case / T042)**: 板鍵が BAN 済みなら
+    ///    採番せず [`AcceptOutcome::Rejected`](理由は応答で開示しない — FR-006)。
+    /// 5. **PoW(thread-events.md 検証 6 — FR-021)**: 初見板鍵は `first_post_pow_bits` を満たす
     ///    こと(既知は通常しきい値)。不足は [`AcceptOutcome::Rejected`]。
-    /// 5. **レート(thread-events.md 検証 7 — FR-021)**: 板鍵単位 `thread_write_rate` / 30 秒窓。
+    /// 6. **レート(thread-events.md 検証 7 — FR-021)**: 板鍵単位 `thread_write_rate` / 30 秒窓。
     ///    超過は [`AcceptOutcome::Rejected`](接続単位 `thread_msg_rate` は配線側 runtime)。
-    /// 6. **採番(単点性 — Principle V)**: [`Thread::confirm`] で res_no を 1 つ割り当てる
+    /// 7. **採番(単点性 — Principle V)**: [`Thread::confirm`] で res_no を 1 つ割り当てる
     ///    (T3 を強制)。ORDER(kind 21311・seq 連番)をスレ主鍵で署名する。
-    /// 7. **配布(`chan[p]` への Append)**: RES + ORDER を **全接続参加者(送信者含む)** の
+    /// 8. **配布(`chan[p]` への Append)**: RES + ORDER を **全接続参加者(送信者含む)** の
     ///    outbox へ seq 順に送る。切断済み outbox への送信失敗は無視する(unregister は配線側)。
     ///
     /// 署名検証・形式は呼び出し前に [`Self::verify_incoming_res`] 等で済ませてある前提
-    /// (モデル境界 — ADR-0014 §2)。BAN(採番拒否)は US4/T042。本メソッドは検証通過後の
-    /// **採番判定 + PoW/レート**をモデル化する。`created_at` はレート窓・ORDER 署名の時刻源。
+    /// (モデル境界 — ADR-0014 §2)。本メソッドは検証通過後の**採番判定 + BAN/PoW/レート**を
+    /// モデル化する。`created_at` はレート窓・ORDER 署名の時刻源。
     pub fn accept_write(
         &self,
         board_id: &str,
@@ -478,7 +545,13 @@ impl LivechatRegistry {
         }
 
         let board_key = res_event.pubkey.to_hex();
-        // 3.5 PoW(thread-events.md 検証 6 — FR-021 / research R6)。**初見板鍵**(採番実績なし)は
+        // 3.5 BAN(thread-events.md 検証 5 — spec Edge Case / T042)。BAN 済み板鍵は採番せず
+        //     Rejected。記録は配線側が livechat_write_rejected として行うが、応答で理由は
+        //     開示しない(FR-006)。完全鍵照合のみ(短縮 ID 非適用 — FR-018)。
+        if entry.banned_keys.contains(&board_key) {
+            return Ok(AcceptOutcome::Rejected);
+        }
+        // 3.6 PoW(thread-events.md 検証 6 — FR-021 / research R6)。**初見板鍵**(採番実績なし)は
         //     `first_post_pow_bits` を満たすこと。既知板鍵は通常しきい値(0)。初回書き込みへ
         //     計算コストを課し、使い捨て板鍵の大量生成による荒らしを抑止する。
         let is_first_post = !entry.known_board_keys.contains(&board_key);
@@ -488,7 +561,7 @@ impl LivechatRegistry {
                 return Ok(AcceptOutcome::Rejected);
             }
         }
-        // 3.6 レート(thread-events.md 検証 7 — FR-021)。**板鍵単位**の書き込みレート
+        // 3.7 レート(thread-events.md 検証 7 — FR-021)。**板鍵単位**の書き込みレート
         //     (`thread_write_rate` / 30 秒窓)。窓を跨いだらリセットし、窓内で上限に達していれば
         //     採番せず破棄する(接続単位の `thread_msg_rate` は配線側 runtime が担う)。
         {
@@ -1224,6 +1297,67 @@ mod tests {
     }
 
     #[test]
+    fn rotated_board_key_is_treated_as_first_post_again() {
+        // T044: 板鍵ローテーション(= ホストから見て未知の新しい Keys)は、既存鍵が
+        // 既知でも「新しい鍵にとっては初見」なので再び PoW が要求される機序を確認する
+        // (accept_write_requires_pow_for_first_post と同じ機序を「ローテーション後」の
+        // 文脈で確認する回帰テスト)。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = LivechatRegistry::new_with_rate(128, 10_000);
+        let settings = BoardSettings {
+            first_post_pow_bits: 8,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let ch = channel_of(&board_id);
+
+        // 旧鍵で PoW 付き初回書き込みを済ませ、既知板鍵にする。
+        let old_key = Keys::generate();
+        let pow_old = sign_res_pow(&old_key, &board_id, &ch, "旧鍵初回", 1_700_000_011, 8);
+        assert!(matches!(
+            reg.accept_write(&board_id, &pow_old, 1_700_000_011)
+                .unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+
+        // ローテーション相当 = 新しい Keys(ホストから見て未知の板鍵)。
+        let new_key = Keys::generate();
+        let no_pow_new = sign_res(&new_key, &board_id, &ch, 1, "新鍵初回", 1_700_000_012).unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &no_pow_new, 1_700_000_012)
+                .unwrap(),
+            AcceptOutcome::Rejected,
+            "ローテーション直後の新鍵は PoW なしだと拒否される"
+        );
+
+        // PoW 付きなら新鍵でも Numbered。
+        let pow_new = sign_res_pow(&new_key, &board_id, &ch, "新鍵初回", 1_700_000_013, 8);
+        assert!(matches!(
+            reg.accept_write(&board_id, &pow_new, 1_700_000_013)
+                .unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+        // 新鍵の 2 回目は PoW 不要(既知になった)。
+        let second_new =
+            sign_res(&new_key, &board_id, &ch, 1, "新鍵二回目", 1_700_000_014).unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &second_new, 1_700_000_014)
+                .unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+    }
+
+    #[test]
     fn accept_write_enforces_board_key_rate() {
         let p = persona();
         let board_id = p.public_key().to_hex();
@@ -1351,5 +1485,148 @@ mod tests {
         );
         // ただし settings 側は新値を保持(次スレ作成が採用する)。
         assert_eq!(entry.host.settings.res_limit, 200);
+    }
+
+    // --- T042: ホスト側 BAN(thread-events.md 検証 5 / FR-006 / FR-019)-------
+
+    #[test]
+    fn accept_write_rejects_banned_board_key() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let banned_key_hex = board_key.public_key().to_hex();
+        assert!(reg.ban_board_key(&board_id, &banned_key_hex));
+
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "BAN 済み鍵からの投稿",
+            1_700_000_010,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+            AcceptOutcome::Rejected,
+            "BAN 済み板鍵は採番されない"
+        );
+    }
+
+    #[test]
+    fn accept_write_does_not_broadcast_banned_key_res() {
+        // 配布(outbox)も発生しない = 他参加者へ一切届かない(FR-019)。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx);
+
+        let board_key = Keys::generate();
+        reg.ban_board_key(&board_id, &board_key.public_key().to_hex());
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "BAN 済み",
+            1_700_000_010,
+        )
+        .unwrap();
+        reg.accept_write(&board_id, &res, 1_700_000_010).unwrap();
+        assert!(rx.try_recv().is_err(), "BAN 済み鍵の書き込みは配布されない");
+    }
+
+    #[test]
+    fn accept_write_allows_non_banned_key() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let banned = Keys::generate();
+        reg.ban_board_key(&board_id, &banned.public_key().to_hex());
+
+        // BAN されていない別鍵は通常どおり採番される。
+        let ok_key = Keys::generate();
+        let res = sign_res(
+            &ok_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "通常の投稿",
+            1_700_000_010,
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+    }
+
+    #[test]
+    fn unban_board_key_restores_write_access() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let key_hex = board_key.public_key().to_hex();
+        reg.ban_board_key(&board_id, &key_hex);
+        assert!(reg.unban_board_key(&board_id, &key_hex));
+
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "解除後の投稿",
+            1_700_000_010,
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+    }
+
+    #[test]
+    fn ban_operations_on_unknown_board_return_false() {
+        let reg = LivechatRegistry::new(128);
+        assert!(!reg.ban_board_key("unknown", "key"));
+        assert!(!reg.unban_board_key("unknown", "key"));
+        assert!(!reg.ban_connection("unknown", "addr"));
+        assert!(!reg.unban_connection("unknown", "addr"));
+        assert!(!reg.is_conn_banned("unknown", "addr"));
+        assert!(reg.banned_board_keys("unknown").is_empty());
+    }
+
+    #[test]
+    fn conn_ban_applies_and_lifts() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        assert!(!reg.is_conn_banned(&board_id, "203.0.113.5:7147"));
+        assert!(reg.ban_connection(&board_id, "203.0.113.5:7147"));
+        assert!(reg.is_conn_banned(&board_id, "203.0.113.5:7147"));
+        // 別アドレスには影響しない。
+        assert!(!reg.is_conn_banned(&board_id, "203.0.113.6:7147"));
+
+        assert!(reg.unban_connection(&board_id, "203.0.113.5:7147"));
+        assert!(!reg.is_conn_banned(&board_id, "203.0.113.5:7147"));
+    }
+
+    #[test]
+    fn banned_board_keys_lists_current_bans() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let k1 = Keys::generate().public_key().to_hex();
+        let k2 = Keys::generate().public_key().to_hex();
+        reg.ban_board_key(&board_id, &k1);
+        reg.ban_board_key(&board_id, &k2);
+        let mut listed = reg.banned_board_keys(&board_id);
+        listed.sort();
+        let mut expected = vec![k1, k2];
+        expected.sort();
+        assert_eq!(listed, expected);
     }
 }

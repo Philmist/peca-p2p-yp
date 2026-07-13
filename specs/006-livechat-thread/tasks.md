@@ -135,15 +135,15 @@
 
 ### Tests for User Story 4
 
-- [ ] T040 [P] [US4] 契約テスト(モデレーション): BAN 鍵の静黙拒否(理由非開示)・PoW 不足の拒否・完全鍵照合(短縮 ID が同じ別鍵には非適用 — FR-018)を tests/contract/thread_delivery.rs に追加し失敗を確認
+- [X] T040 [P] [US4] 契約テスト(モデレーション): BAN 鍵の静黙拒否(理由非開示)・PoW 不足の拒否・完全鍵照合(短縮 ID が同じ別鍵には非適用 — FR-018)を tests/contract/thread_delivery.rs に追加し失敗を確認
 
 ### Implementation for User Story 4
 
-- [ ] T041 [US4] NG/BAN の永続化を実装: `livechat_moderation` テーブル CRUD(kind = Ng/Ban/ConnBan・target は完全鍵または接続元・板単位スコープ・ネットワーク非送出 = 不変条件 M1)— src/livechat/moderation.rs + src/store/mod.rs
-- [ ] T042 [US4] ホスト側 BAN を実装: 板鍵 BAN は採番拒否(`livechat_write_rejected` を記録するが応答で理由を開示しない — spec Edge Case)、ConnBan は HELLO 後に CLOSE で切断(理由非開示)、接続単位の切断操作(FR-019)— src/livechat/host.rs
-- [ ] T043 [US4] 視聴者側 NG を実装: 板鍵単位のローカル非表示・レス番号の欠番維持(FR-020。互換 API の dat には非適用 — contracts/compat-api.md)— src/livechat/thread.rs
-- [ ] T044 [US4] 板鍵ローテーションと初回 PoW を実装: 明示操作での鍵再生成(行ごと置換・旧鍵破棄 — FR-017)、ホスト側は初見板鍵に `first_post_pow_bits`(NIP-13)を要求し既知鍵は通常しきい値、クライアント側は送信前に nonce をローカル計算(research R6)— src/livechat/board.rs / src/livechat/host.rs / src/livechat/session.rs
-- [ ] T045 [US4] NG/BAN・ローテーションのローカル API/UI を src/web/livechat.rs に追加し、US4 の cucumber ステップ + 統合テスト(BAN 採番拒否・NG 欠番・ローテーション PoW)を tests/steps/livechat.rs / tests/integration/livechat.rs に実装して全パス
+- [X] T041 [US4] NG/BAN の永続化を実装: `livechat_moderation` テーブル CRUD(kind = Ng/Ban/ConnBan・target は完全鍵または接続元・板単位スコープ・ネットワーク非送出 = 不変条件 M1)— src/livechat/moderation.rs + src/store/mod.rs
+- [X] T042 [US4] ホスト側 BAN を実装: 板鍵 BAN は採番拒否(`livechat_write_rejected` を記録するが応答で理由を開示しない — spec Edge Case)、ConnBan は HELLO 後に CLOSE で切断(理由非開示)、接続単位の切断操作(FR-019)— src/livechat/host.rs
+- [X] T043 [US4] 視聴者側 NG を実装: 板鍵単位のローカル非表示・レス番号の欠番維持(FR-020。互換 API の dat には非適用 — contracts/compat-api.md)— src/livechat/thread.rs
+- [X] T044 [US4] 板鍵ローテーションと初回 PoW を実装: 明示操作での鍵再生成(行ごと置換・旧鍵破棄 — FR-017)、ホスト側は初見板鍵に `first_post_pow_bits`(NIP-13)を要求し既知鍵は通常しきい値、クライアント側は送信前に nonce をローカル計算(research R6)— src/livechat/board.rs / src/livechat/host.rs / src/livechat/session.rs
+- [X] T045 [US4] NG/BAN・ローテーションのローカル API/UI を src/web/livechat.rs に追加し、US4 の cucumber ステップ + 統合テスト(BAN 採番拒否・NG 欠番・ローテーション PoW)を tests/steps/livechat.rs / tests/integration/livechat.rs に実装して全パス
 
 **Checkpoint**: US4 完了 — 荒らし耐性のある運用が可能
 

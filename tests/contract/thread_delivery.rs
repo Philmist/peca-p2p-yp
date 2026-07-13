@@ -1157,3 +1157,122 @@ async fn forged_order_from_non_board_persona_is_discarded_and_logged() {
         "偽 ORDER の破棄が livechat_order_invalid として記録される: {content}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T040: US4 契約テスト(モデレーション — BAN・PoW・完全鍵照合)
+//
+// registry_with_open_thread は first_post_pow_bits=0 で開設するため BAN 検証には
+// そのまま使えるが、PoW 検証は専用の設定で別途開設する。BAN テストは理由非開示
+// (応答は Rejected のみ・エラーメッセージに鍵情報を含まない)と配布(outbox)非発生の
+// 両方を確認する。
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::livechat::moderation::Moderation;
+use peca_p2p_yp::store::Store;
+
+#[test]
+fn banned_board_key_is_silently_rejected() {
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = registry_with_open_thread(&persona);
+    let board_key = Keys::generate();
+    let banned_key_hex = board_key.public_key().to_hex();
+
+    assert!(reg.ban_board_key(&board_id, &banned_key_hex));
+
+    // 配布を観測するため参加者を 1 名登録する。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    reg.register_participant(&board_id, "peer-1", tx);
+
+    let res = sign_res(
+        &board_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        1,
+        "BAN 済み鍵からの投稿",
+        1_700_000_010,
+    )
+    .unwrap();
+    let outcome = reg.accept_write(&board_id, &res, 1_700_000_010).unwrap();
+    // 理由非開示: Rejected のみが返る(エラー内容・鍵情報を含む詳細は返さない)。
+    assert_eq!(
+        outcome,
+        AcceptOutcome::Rejected,
+        "BAN 済み板鍵は採番されず Rejected のみを返す"
+    );
+    // 配布(outbox)も発生しない = 他の参加者には一切届かない(FR-019)。
+    assert!(
+        rx.try_recv().is_err(),
+        "BAN 済み鍵の書き込みは他の参加者へ配布されない"
+    );
+}
+
+#[test]
+fn insufficient_pow_first_post_is_rejected() {
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    // first_post_pow_bits=8 で開設(PoW/レートは本テストの主題なので上限は緩める)。
+    let reg = LivechatRegistry::new_with_rate(128, 10_000);
+    let settings = BoardSettings {
+        first_post_pow_bits: 8,
+        ..Default::default()
+    };
+    reg.open_thread(
+        persona.clone(),
+        delivery_channel(&board_id),
+        1,
+        1_700_000_000,
+        "実況スレ",
+        settings,
+        "198.51.100.1:7147",
+    )
+    .unwrap();
+
+    let board_key = Keys::generate();
+    let ch = delivery_channel(&board_id);
+
+    // PoW なしの初見板鍵は Rejected。
+    let no_pow = sign_res(&board_key, &board_id, &ch, 1, "初回", 1_700_000_010).unwrap();
+    assert_eq!(
+        reg.accept_write(&board_id, &no_pow, 1_700_000_010).unwrap(),
+        AcceptOutcome::Rejected,
+        "PoW 不足の初回書き込みは Rejected"
+    );
+
+    // PoW 8 付きの初回書き込みは Numbered。
+    let pow = peca_p2p_yp::event::livechat::Res {
+        channel: ch.clone(),
+        board_id: board_id.clone(),
+        generation: 1,
+        name: None,
+        mail: None,
+        body: "初回".to_string(),
+    }
+    .sign(&board_key, 1_700_000_011, 8)
+    .unwrap();
+    assert!(matches!(
+        reg.accept_write(&board_id, &pow, 1_700_000_011).unwrap(),
+        AcceptOutcome::Numbered { .. }
+    ));
+}
+
+#[test]
+fn full_key_match_does_not_apply_to_short_id_collision() {
+    // FR-018: 表示用の短縮 ID(先頭 8 文字)が同じでも、完全鍵が異なれば非適用。
+    // Moderation は文字列完全一致で判定するため、実鍵である必要はない(テスト用に
+    // 直接構築した 64hex 文字列でよい)。
+    let store = std::sync::Arc::new(Store::open_in_memory().unwrap());
+    let moderation = Moderation::new(store);
+    let board_id = "ab".repeat(32);
+    let key_a = "11223344".to_string() + &"a".repeat(56);
+    let key_b = "11223344".to_string() + &"b".repeat(56);
+    assert_eq!(&key_a[..8], &key_b[..8], "テスト前提: 短縮 ID 表示は一致");
+    assert_ne!(key_a, key_b, "テスト前提: 完全鍵は異なる");
+
+    moderation.ban_key(&board_id, &key_a).unwrap();
+    assert!(moderation.is_banned(&board_id, &key_a));
+    assert!(
+        !moderation.is_banned(&board_id, &key_b),
+        "短縮 ID が同じ別鍵には BAN が適用されない(完全鍵照合 — FR-018)"
+    );
+}

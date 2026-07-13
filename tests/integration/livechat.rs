@@ -383,3 +383,153 @@ async fn burst_writes_all_confirmed_without_gaps() {
         other => panic!("バースト書き込みが確定すべき: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// US4: モデレーション(BAN・NG・ローテーション後の初回 PoW)
+// ---------------------------------------------------------------------------
+
+/// BAN 済み板鍵からの書き込みは、実ノード経由でも採番されない(FR-019)。
+///
+/// `connect_write_collect` で実際に TCP 接続・THREAD_JOIN・RES 送信まで行い、ホスト側の
+/// registry が BAN 済み板鍵を Rejected として扱う(採番せず配布もしない)ことを確認する。
+/// `expect_total=0` で待ち、一定時間内に確定が届かないことを見る。
+#[tokio::test]
+async fn banned_board_key_write_is_never_numbered_over_real_connection() {
+    let host = LivechatHostNode::spawn(0x1101).await;
+    host.open_thread("実況スレ", no_pow_settings());
+
+    let board_key = Keys::generate();
+    assert!(
+        host.registry()
+            .ban_board_key(&host.board_id(), &board_key.public_key().to_hex()),
+        "BAN 登録に成功するべき"
+    );
+
+    let config = viewer_config(&host);
+    // 確定を 0 件期待して短いアイドルで打ち切る(採番されないことの確認)。
+    let result = connect_write_collect(
+        &config,
+        &board_key,
+        &["BAN 済み鍵からの投稿"],
+        0,
+        Duration::from_millis(500),
+    )
+    .await;
+
+    match result {
+        JoinResult::Joined { confirmed } => {
+            assert!(
+                confirmed.is_empty(),
+                "BAN 済み板鍵の書き込みは採番されない: {confirmed:?}"
+            );
+        }
+        other => panic!("joined すべき(BAN は接続自体は拒否しない): {other:?}"),
+    }
+}
+
+/// NG はローカル判定のみで、ホスト側の確定列・採番には一切影響しない(FR-020)。
+///
+/// ホストは通常どおり 3 レスを確定するが、視聴者ローカルの NG 判定(`Moderation` +
+/// `Thread::visible_res`)を適用すると、対象レスのみ非表示になり、他のレスの res_no は
+/// 詰められない(欠番として維持される)。
+#[tokio::test]
+async fn ng_hides_locally_without_affecting_host_numbering() {
+    let host = LivechatHostNode::spawn(0x1102).await;
+    host.open_thread("実況スレ", no_pow_settings());
+
+    let key_a = Keys::generate();
+    let key_ng = Keys::generate();
+    host.seed_res(&key_a, "一つ目", 1_700_000_001);
+    host.seed_res(&key_ng, "NG 対象", 1_700_000_002);
+    host.seed_res(&key_a, "三つ目", 1_700_000_003);
+
+    let config = viewer_config(&host);
+    let result = connect_once(&config, 0).await;
+    let confirmed = match result {
+        JoinResult::Joined { confirmed } => confirmed,
+        other => panic!("joined すべき: {other:?}"),
+    };
+    assert_eq!(
+        confirmed.len(),
+        3,
+        "ホスト側は 3 レスとも確定している(NG の影響を受けない)"
+    );
+
+    // 視聴者ローカルで NG を適用する(ホストへは一切送出しない — 不変条件 M1)。
+    let store = std::sync::Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap());
+    let moderation = peca_p2p_yp::livechat::moderation::Moderation::new(store);
+    let board_id = host.board_id();
+    moderation
+        .add_ng(&board_id, &key_ng.public_key().to_hex())
+        .expect("NG 登録");
+
+    let visible_nos: Vec<u16> = confirmed
+        .iter()
+        .filter(|r| !moderation.is_ng(&board_id, &r.board_key))
+        .filter_map(|r| r.res_no)
+        .collect();
+    assert_eq!(
+        visible_nos,
+        vec![1, 3],
+        "NG 対象(res_no=2)はローカルで非表示・欠番のまま維持される"
+    );
+}
+
+/// ローテーション後(= ホストにとって未見)の板鍵は初回書き込みに PoW を要求される(T044)。
+///
+/// PoW なしでの書き込みは採番されず、PoW 付きなら採番される(実ノード経由での確認)。
+#[tokio::test]
+async fn rotated_key_requires_pow_for_first_write_over_real_connection() {
+    let host = LivechatHostNode::spawn(0x1103).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 8,
+            ..Default::default()
+        },
+    );
+
+    // ローテーション相当 = ホストにとって未見の新しい板鍵。PoW なしでは採番されない。
+    let rotated_key = Keys::generate();
+    let no_pow_result = connect_write_collect(
+        &viewer_config(&host),
+        &rotated_key,
+        &["PoW なし初回"],
+        0,
+        Duration::from_millis(500),
+    )
+    .await;
+    match no_pow_result {
+        JoinResult::Joined { confirmed } => {
+            assert!(
+                confirmed.is_empty(),
+                "PoW なしの初回書き込みは採番されない: {confirmed:?}"
+            );
+        }
+        other => panic!("joined すべき: {other:?}"),
+    }
+
+    // registry を直接叩いて PoW 付きなら採番されることを確認する(実接続の送信ヘルパは
+    // PoW を計算しないため、ここはドメイン層で完結させる — T044 の主眼は PoW 判定自体)。
+    let pow_res = peca_p2p_yp::event::livechat::Res {
+        channel: host.channel(),
+        board_id: host.board_id(),
+        generation: 1,
+        name: None,
+        mail: None,
+        body: "PoW 付き初回".to_string(),
+    }
+    .sign(&rotated_key, unix_now(), 8)
+    .expect("PoW 付きレス署名");
+    let outcome = host
+        .registry()
+        .accept_write(&host.board_id(), &pow_res, unix_now())
+        .expect("accept_write");
+    assert!(
+        matches!(
+            outcome,
+            peca_p2p_yp::livechat::registry::AcceptOutcome::Numbered { .. }
+        ),
+        "PoW を満たせば採番される: {outcome:?}"
+    );
+}

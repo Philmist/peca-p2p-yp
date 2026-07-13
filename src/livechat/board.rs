@@ -103,6 +103,11 @@ impl BoardKeyManager {
     /// 板鍵をローテーションする(明示操作 — FR-017)。
     ///
     /// 新しい鍵ペアを生成して行ごと置換する(旧鍵は破棄され、復元できない)。
+    ///
+    /// ローテーション後の新鍵は、ホスト側から見て**未見(採番実績なし)**の板鍵になる
+    /// ([`crate::livechat::registry::LivechatRegistry`] の `known_board_keys` に未登録)。
+    /// このため次の書き込みは初回扱いとなり、板設定の `first_post_pow_bits` を満たす
+    /// PoW が要求される(T044 — [`crate::livechat::session::first_post_pow_bits`] 参照)。
     pub fn rotate(&self, board_id: &str) -> Result<Keys, BoardKeyError> {
         self.generate(board_id)
     }

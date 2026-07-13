@@ -445,6 +445,15 @@ impl Thread {
             .filter_map(|n| self.resolve_anchor(n).map(|r| (n, r)))
             .collect()
     }
+
+    /// NG 判定(board_key 完全一致)で確定列から非表示レスを除いた可視列を返す(T043 — FR-020)。
+    ///
+    /// **除外しても res_no は詰めない**(NG による欠番は表示上のみ・採番は不変 — 不変条件 T3 の
+    /// 帰結。互換 API の dat には非適用 — contracts/compat-api.md)。`is_ng` は視聴者ローカルの
+    /// 判定(例: [`crate::livechat::moderation::Moderation::is_ng`])を渡す。
+    pub fn visible_res(&self, is_ng: impl Fn(&str) -> bool) -> Vec<&Res> {
+        self.res.iter().filter(|r| !is_ng(&r.board_key)).collect()
+    }
 }
 
 /// 本文中のアンカー `>>n` の参照先 res_no を出現順に抽出する(T031 — FR-009)。
@@ -820,5 +829,61 @@ mod tests {
         assert_eq!(resolved[0].1.event_id, id1);
         assert_eq!(resolved[1].0, 2);
         assert_eq!(resolved[1].1.event_id, id2);
+    }
+
+    // --- T043: NG によるローカル非表示・欠番維持(FR-020)---------------------
+
+    fn sample_res_with_key(event_id: &str, board_key: &str) -> Res {
+        Res {
+            event_id: event_id.to_string(),
+            board_key: board_key.to_string(),
+            name: None,
+            mail: None,
+            body: "本文".to_string(),
+            created_at: 1_700_000_000,
+            res_no: None,
+            pending: false,
+        }
+    }
+
+    #[test]
+    fn visible_res_hides_ng_key_but_keeps_res_no_gap() {
+        let mut thread = sample_thread(10);
+        let key_a = "aa".repeat(32);
+        let key_b = "bb".repeat(32);
+        thread
+            .confirm(sample_res_with_key(&"11".repeat(32), &key_a), 1)
+            .unwrap();
+        thread
+            .confirm(sample_res_with_key(&"22".repeat(32), &key_b), 2)
+            .unwrap();
+        thread
+            .confirm(sample_res_with_key(&"33".repeat(32), &key_a), 3)
+            .unwrap();
+
+        // key_b を NG にすると、可視列は res_no 1・3 のみ(2 は欠番のまま除外される)。
+        let visible = thread.visible_res(|k| k == key_b);
+        let visible_nos: Vec<u16> = visible.iter().filter_map(|r| r.res_no).collect();
+        assert_eq!(
+            visible_nos,
+            vec![1, 3],
+            "NG 対象は除外され res_no は詰めない"
+        );
+
+        // 全体の確定列自体は変わらない(NG は表示上のみ・採番は不変 — T3)。
+        assert_eq!(thread.res.len(), 3);
+    }
+
+    #[test]
+    fn visible_res_without_ng_returns_all() {
+        let mut thread = sample_thread(10);
+        thread
+            .confirm(
+                sample_res_with_key(&"11".repeat(32), "aa".repeat(32).as_str()),
+                1,
+            )
+            .unwrap();
+        let visible = thread.visible_res(|_| false);
+        assert_eq!(visible.len(), 1);
     }
 }

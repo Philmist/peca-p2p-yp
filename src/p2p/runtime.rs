@@ -886,11 +886,14 @@ impl P2pRuntime {
     /// `thread_board` は本接続が join 済みの board_id(登録済みなら `Some`)。処理結果として
     /// 参加者へ送出すべきフレームを **outbox 経由**で流し、接続継続可否を返す:
     ///
-    /// - **THREAD_JOIN**: registry で受理判定 + 同期フレームを生成して送出。受理なら participant
-    ///   を登録し `thread_board` を記録して接続維持。REJECT なら送出後に切断(能動 CLOSE)。
+    /// - **THREAD_JOIN**: **ConnBan(T042)** — 対象 board で本接続元アドレスが ConnBan
+    ///   済みなら、WELCOME/REJECT を一切返さず即切断する(理由非開示 — thread-delivery.md
+    ///   §防御)。非 ConnBan は registry で受理判定 + 同期フレームを生成して送出。受理なら
+    ///   participant を登録し `thread_board` を記録して接続維持。REJECT なら送出後に切断
+    ///   (能動 CLOSE)。
     /// - **RESEND_REQ**: join 済みなら registry から範囲を再送。未 join は不正フレームで切断。
-    /// - **RES**(参→ホ 書き込み): US1 は読み取りのみのため採番せず黙って受理(前方互換で
-    ///   切断しない)。採番・配布は US2(T030)。
+    /// - **RES**(参→ホ 書き込み): 検証通過分は registry の採番シーケンサ(T030)へ渡す。
+    ///   BAN 済み板鍵(T042)・PoW/レート不足は採番せず破棄する(応答で理由を開示しない)。
     /// - スレ機能無効(registry なし)の THREAD_JOIN は定型 `unknown_thread` REJECT + 切断。
     ///
     /// 継続可否(`true` = 維持)。`false` のとき pump は CLOSE(going_away)を送って切断する。
@@ -925,6 +928,14 @@ impl P2pRuntime {
                 challenge,
                 since_seq,
             } => {
+                // ConnBan(T042 — FR-019)。WELCOME/REJECT を返さず即切断する(理由非開示 —
+                // thread-delivery.md §防御「HELLO 後 CLOSE で切断・理由は開示しない」)。
+                let join_board_id = thread.split_once(':').map(|(b, _)| b).unwrap_or("");
+                if registry.is_conn_banned(join_board_id, addr) {
+                    self.security
+                        .log(SecurityCategory::LivechatWriteRejected, addr, "conn banned");
+                    return false;
+                }
                 let outcome = registry.handle_join(&thread, &challenge, since_seq);
                 for frame in outcome.frames {
                     if outbox_tx.send(frame).is_err() {

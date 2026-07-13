@@ -79,6 +79,23 @@ pub struct LivechatWorld {
     us3_order_discarded: Option<bool>,
     /// 過大/過剰書き込みがホストで拒否されたか(true=採番せず破棄)。
     us3_write_rejected: Option<bool>,
+    // --- US4 状態 ---
+    /// BAN/NG 対象の板鍵(scenario ごとに生成)。
+    us4_target_key: Option<Keys>,
+    /// BAN 済み板鍵からの書き込みの採番結果。
+    us4_ban_outcome: Option<AcceptOutcome>,
+    /// NG 判定を模したローカルモデレーション(Moderation ドメイン層)。
+    us4_moderation: Option<peca_p2p_yp::livechat::moderation::Moderation>,
+    /// NG 適用前の確定 Thread(視聴者側の可視化検証に使う)。
+    us4_thread: Option<Thread>,
+    /// NG 適用後の可視 res_no 列。
+    us4_visible_res_nos: Vec<u16>,
+    /// 新規/ローテーション板鍵の初回書き込み採番結果。
+    us4_first_post_outcome: Option<AcceptOutcome>,
+    /// 短縮 ID 衝突検証用: BAN 対象鍵と別鍵(短縮 ID は同じだが完全鍵は異なる)。
+    us4_collision_pair: Option<(String, String)>,
+    /// 短縮 ID 衝突検証: 別鍵への BAN 適用有無。
+    us4_collision_banned: Option<bool>,
 }
 
 impl std::fmt::Debug for LivechatWorld {
@@ -93,6 +110,20 @@ impl std::fmt::Debug for LivechatWorld {
 
 fn ctx(world: &mut AppWorld) -> &mut LivechatWorld {
     world.livechat.get_or_insert_with(LivechatWorld::default)
+}
+
+/// NG 検証用の確定レス(US4 — event_id と board_key のみ指定できる簡易ビルダ)。
+fn ng_test_res(event_id: &str, board_key: &str) -> Res {
+    Res {
+        event_id: event_id.to_string(),
+        board_key: board_key.to_string(),
+        name: None,
+        mail: None,
+        body: "本文".to_string(),
+        created_at: 1_700_000_000,
+        res_no: None,
+        pending: false,
+    }
 }
 
 /// 視聴者用の ParticipantConfig をホストから組む(板鍵不要 — 閲覧は署名のみ)。
@@ -796,74 +827,229 @@ async fn host_discards_and_logs_violation(world: &mut AppWorld) {
 
 #[given("スレ主が特定の板鍵をBAN済みである")]
 async fn host_has_banned_a_board_key(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: BAN 設定の前提")
+    let host = LivechatHostNode::spawn(0xA010).await;
+    // BAN/PoW の契約検証と同様、PoW を挟まず開設する(BAN 自体の判定が主題)。
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let target = Keys::generate();
+    assert!(
+        host.registry()
+            .ban_board_key(&host.board_id(), &target.public_key().to_hex()),
+        "BAN 登録に成功するべき"
+    );
+    let c = ctx(world);
+    c.host = Some(host);
+    c.us4_target_key = Some(target);
 }
 
 #[when("その鍵で署名されたレスが届く")]
 async fn res_signed_by_banned_key_arrives(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: BAN 鍵からの書き込み注入")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    let target = c.us4_target_key.as_ref().expect("BAN 対象鍵").clone();
+    let res = peca_p2p_yp::livechat::registry::sign_res(
+        &target,
+        &host.board_id(),
+        &host.channel(),
+        1,
+        "BAN 済み鍵からの投稿",
+        unix_now(),
+    )
+    .expect("レス署名");
+    let outcome = host
+        .registry()
+        .accept_write(&host.board_id(), &res, unix_now())
+        .expect("accept_write");
+    c.us4_ban_outcome = Some(outcome);
 }
 
 #[then("採番されず他の参加者には一切配布されない")]
 async fn banned_res_is_never_numbered_or_distributed(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: FR-019 の採番拒否検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us4_ban_outcome,
+        Some(AcceptOutcome::Rejected),
+        "BAN 済み板鍵からの書き込みは採番されず Rejected(FR-019)"
+    );
 }
 
 #[given("視聴者が特定の板鍵をNG済みである")]
 async fn viewer_has_ng_a_board_key(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: NG 設定の前提")
+    let target = Keys::generate();
+    let store = std::sync::Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap());
+    let moderation = peca_p2p_yp::livechat::moderation::Moderation::new(store);
+    let board_id = "ab".repeat(32);
+    moderation
+        .add_ng(&board_id, &target.public_key().to_hex())
+        .expect("NG 登録");
+    let c = ctx(world);
+    c.us4_target_key = Some(target);
+    c.us4_moderation = Some(moderation);
+    // NG 判定は板スコープに対して行うため、後続ステップ用に board_id を Thread へ持たせる。
+    c.us4_thread = Some(Thread::new(
+        &board_id,
+        format!("30311:{board_id}:{GUID}"),
+        1,
+        1_700_000_000,
+        "実況スレ",
+        1000,
+    ));
 }
 
 #[when("その鍵のレスが確定配布される")]
 async fn res_from_ng_key_is_distributed(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: NG 対象レスの確定配布")
+    let c = ctx(world);
+    let target = c.us4_target_key.as_ref().expect("NG 対象鍵").clone();
+    let thread = c.us4_thread.as_mut().expect("Thread");
+    // NG 対象鍵のレス(2 番目)を含む 3 レスを確定させる(res_no 1,2,3)。
+    let other_key = "cc".repeat(32);
+    thread
+        .confirm(ng_test_res(&"11".repeat(32), &other_key), 1)
+        .unwrap();
+    thread
+        .confirm(
+            ng_test_res(&"22".repeat(32), &target.public_key().to_hex()),
+            2,
+        )
+        .unwrap();
+    thread
+        .confirm(ng_test_res(&"33".repeat(32), &other_key), 3)
+        .unwrap();
+
+    let moderation = c.us4_moderation.as_ref().expect("Moderation");
+    let board_id = thread.board_id.clone();
+    let visible = thread.visible_res(|k| moderation.is_ng(&board_id, k));
+    c.us4_visible_res_nos = visible.iter().filter_map(|r| r.res_no).collect();
 }
 
 #[then("その視聴者の画面でのみ非表示になりレス番号は欠番として維持される")]
 async fn ng_res_hidden_locally_with_number_preserved(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: FR-020 のローカル非表示・欠番維持検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us4_visible_res_nos,
+        vec![1, 3],
+        "NG 対象(res_no=2)は非表示になるが、欠番として res_no は詰めない(FR-020)"
+    );
 }
 
 #[given("利用者が板鍵をローテーションしたまたは新規参加した")]
 async fn user_rotated_or_created_board_key(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T017 以降で実装: 板鍵ローテーション/新規生成")
+    let host = LivechatHostNode::spawn(0xA011).await;
+    // first_post_pow_bits を明示的に設定した板を開設する(既定より低くして PoW 計算の
+    // テストコストを抑える。0 ではない = PoW 要求があることが検証の前提)。
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 8,
+            ..Default::default()
+        },
+    );
+    // ローテーション/新規参加 = ホストにとって未見の板鍵。
+    let new_key = Keys::generate();
+    let c = ctx(world);
+    c.host = Some(host);
+    c.us4_target_key = Some(new_key);
 }
 
 #[when("新しい鍵で初回の書き込みをする")]
 async fn first_write_with_new_key(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: 新規板鍵での初回書き込み")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    let new_key = c.us4_target_key.as_ref().expect("新規鍵").clone();
+    // PoW を計算せずに送る(通常しきい値のみでは初回書き込みとして不足のはず)。
+    let res = peca_p2p_yp::livechat::registry::sign_res(
+        &new_key,
+        &host.board_id(),
+        &host.channel(),
+        1,
+        "初回の書き込み",
+        unix_now(),
+    )
+    .expect("レス署名");
+    let outcome = host
+        .registry()
+        .accept_write(&host.board_id(), &res, unix_now())
+        .expect("accept_write");
+    c.us4_first_post_outcome = Some(outcome);
 }
 
 #[then("通常より高い計算コストPoWを満たさない限り採番されない")]
 async fn first_write_requires_higher_pow(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T024 以降で実装: first_post_pow_bits 検証(FR-017・research R6)")
+    let c = ctx(world);
+    assert_eq!(
+        c.us4_first_post_outcome,
+        Some(AcceptOutcome::Rejected),
+        "PoW を満たさない初回書き込みは採番されない(FR-017・research R6)"
+    );
+
+    // 対比: PoW を満たして送れば採番される(同じ機序の確認)。
+    let host = c.host.as_ref().expect("ホスト");
+    let new_key = c.us4_target_key.as_ref().expect("新規鍵").clone();
+    let pow_res = peca_p2p_yp::event::livechat::Res {
+        channel: host.channel(),
+        board_id: host.board_id(),
+        generation: 1,
+        name: None,
+        mail: None,
+        body: "PoW 付き初回".to_string(),
+    }
+    .sign(&new_key, unix_now(), 8)
+    .expect("PoW 付きレス署名");
+    let pow_outcome = host
+        .registry()
+        .accept_write(&host.board_id(), &pow_res, unix_now())
+        .expect("accept_write");
+    assert!(
+        matches!(pow_outcome, AcceptOutcome::Numbered { .. }),
+        "PoW を満たせば採番される: {pow_outcome:?}"
+    );
 }
 
 #[given("NG/BAN対象の板鍵と短縮ID表示が同じ別の鍵がある")]
 async fn different_key_shares_short_id_display(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: 短縮 ID 衝突ケースの用意")
+    let store = std::sync::Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap());
+    let moderation = peca_p2p_yp::livechat::moderation::Moderation::new(store);
+    let board_id = "ab".repeat(32);
+    // 短縮 ID(先頭 8 文字)は同じだが完全鍵は異なる 2 本の 64hex 文字列を直接構築する
+    // (Moderation は文字列完全一致で判定するため実鍵である必要はない)。
+    let banned_key = "11223344".to_string() + &"a".repeat(56);
+    let other_key = "11223344".to_string() + &"b".repeat(56);
+    assert_eq!(
+        &banned_key[..8],
+        &other_key[..8],
+        "短縮 ID 表示は一致する前提"
+    );
+    assert_ne!(banned_key, other_key, "完全鍵は異なる前提");
+    moderation
+        .ban_key(&board_id, &banned_key)
+        .expect("BAN 登録");
+
+    let c = ctx(world);
+    c.us4_moderation = Some(moderation);
+    c.us4_collision_pair = Some((board_id, other_key));
 }
 
 #[when("その別の鍵のレスが届く")]
 async fn res_from_different_key_arrives(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: 別鍵からの書き込み")
+    let c = ctx(world);
+    let moderation = c.us4_moderation.as_ref().expect("Moderation");
+    let (board_id, other_key) = c.us4_collision_pair.as_ref().expect("衝突鍵ペア");
+    c.us4_collision_banned = Some(moderation.is_banned(board_id, other_key));
 }
 
 #[then("NG/BANは適用されない")]
 async fn ng_ban_not_applied_to_different_key(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T026 以降で実装: FR-018 の完全鍵照合検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us4_collision_banned,
+        Some(false),
+        "短縮 ID が同じ別鍵には NG/BAN が適用されない(完全鍵照合 — FR-018)"
+    );
 }
 
 // ---------------------------------------------------------------------------
