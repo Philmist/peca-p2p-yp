@@ -198,7 +198,7 @@
 - [X] T059 [P] ドメイン文書の更新: CONTEXT.md に livechat モジュール・互換 API・kind 3 種の追加を反映(docs/agents/domain.md の単一コンテキスト方針に従う)
 - [X] T060 ADR-0014 の最終化: TLC 検査結果・実装中に生じた設計逸脱・SJIS 仮説の状態を docs/adr/0014-livechat-thread.md へ反映 【§5 実装で確定した設計判断・逸脱(D2 決着・板スコープ引き継ぎ・Last-Modified 単調化・T069 互換 API リモート対応・tip 導出)+ §6 SJIS 仮説の状態(契約テスト済み・実機 T062 未了)を追記】
 - [X] T061 quickstart §1〜§5 の全検証を実行: `cargo fmt -- --check` / `cargo clippy --all-targets` / `cargo test` / `cargo test --test cucumber` / `cargo audit` / gitleaks をすべてパスさせる(specs/006-livechat-thread/quickstart.md §完了判定) 【2026-07-14 実行: fmt clean・clippy --all-targets clean・cargo test 561 lib + 全統合/契約 green・cucumber 60/60・cargo audit exit 0(instant unmaintained は既存の許容警告)・gitleaks リークなし】
-- [ ] T062 SC-007 実機確認(利用者の協力が必要): 利用者所有の実況ツール一式を `http://127.0.0.1:7183/<board_id>/` に向け、quickstart §5 の 8 観点(hex 板名の登録可否・SJIS/数値文字参照描画・Range/304 の噛み合い・dat 落ち解釈・SETTING.TXT キー突合・head.txt 表示・確認画面なし書き込み・固定 ID の NG 機能)を確認し、結果を specs/006-livechat-thread/research.md の R5 へ追記。不成立項目は追加タスク化
+- [X] T062 SC-007 実機確認(利用者の協力が必要): 利用者所有の実況ツール一式を `http://127.0.0.1:7183/<board_id>/` に向け、quickstart §5 の 8 観点(hex 板名の登録可否・SJIS/数値文字参照描画・Range/304 の噛み合い・dat 落ち解釈・SETTING.TXT キー突合・head.txt 表示・確認画面なし書き込み・固定 ID の NG 機能)を確認し、結果を specs/006-livechat-thread/research.md の R5 へ追記。不成立項目は追加タスク化 【2026-07-14 実機確認: 現行専ブラで本互換 API と互換動作するものはほぼ存在せず(多くはローカルサーバー板 URL を無視。JaneXeno のみ `127.0.0.1:7183` 誘導可)、その JaneXeno でも SETTING.TXT 確認は困難・head.txt 表示は不可能。残る 6 観点は確認済み・成立、SJIS 既定は反証なく維持。未検証 2 観点は現行専ブラの制約に起因し実装側不成立ではないため追加タスク化せず、結果を R5 実機確認結果へ追記。専ブラのローカル板 URL 誘導前提の追加要件は別 spec へ切り出し】
 
 ---
 
@@ -287,6 +287,6 @@ T063/T065 は他の操作系の前提となる。
 **Purpose**: /speckit-converge(2026-07-14 再実行)の所見。Phase 10 の 8 タスク
 (T063〜T070)はすべて実装・配線済みで、機能ギャップは解消されている。残るのは
 Phase 10 実装で陳腐化したドキュメントコメントの是正 1 件のみ(LOW)。
-T062(SC-007 実機確認)は既存タスクとして未完のまま残っている(利用者協力待ち)。
+T062(SC-007 実機確認)は 2026-07-14 に実機確認を完了(現行専ブラで互換動作するものはほぼ存在せず。詳細は research.md R5 実機確認結果)。
 
 - [X] T071 src/web/livechat.rs の冒頭モジュール doc を現状へ更新する: 「main.rs の起動配線箇所に TODO コメントあり・別担当が配線する」「『スレを開く』操作はスタブで 501 を返す」「書き込み・継続受信ループは US2」「モデレーションの HTTP エンドポイントは追加しない」の各記述は T063〜T067 で解消済みの実装と矛盾しており、保守者を誤導する。実装済みの供給元配線(main.rs の LivechatAdapter)・join/write/設定/NG/BAN/ConnBan/ローテーション/next/close の各エンドポイントを反映した記述へ書き換える per Constitution III(コードは読みやすく保守可能 — MUST) (partial)
