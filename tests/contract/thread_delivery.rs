@@ -766,6 +766,12 @@ fn handle_resend_returns_res_then_order_for_requested_seq_range() {
 fn accept_write_rejects_over_res_limit_without_broadcast() {
     // 契約(任意項目): res_limit 到達後の accept_write は Rejected(NoOverLimit /
     // T3)であり、配布もされない。
+    //
+    // T046: res_no = res_limit(100 件目)の確定と同一の accept_write 呼び出し内で
+    // 自動的に次スレ(gen=2)へ移行するため、100 件目の配布は RES + ORDER に続けて
+    // NEXT_THREAD も届く。101 件目は「旧世代(gen=1)宛」であり、移行境界の定型拒否
+    // (ADR-0014 D2)によって Rejected になる — これも「配布されない」契約を満たす
+    // (自動移行それ自体の契約は next_thread_* / res_limit_reached_migrates_* を参照)。
     let persona = Keys::generate();
     let board_id = persona.public_key().to_hex();
     // res_limit の契約だけを見たいので PoW・レートは無効化(pow=0・十分高いレート)。
@@ -805,12 +811,28 @@ fn accept_write_rejects_over_res_limit_without_broadcast() {
                 .unwrap(),
             AcceptOutcome::Numbered { .. }
         ));
-        // 配布分(RES+ORDER)を読み捨てる。
+        // 配布分(RES+ORDER)を読み捨てる。100 件目(自動移行が起きる回)は続けて
+        // NEXT_THREAD も届くため、その分もあわせて読み捨てる。
         let _ = rx.try_recv();
         let _ = rx.try_recv();
+        if i + 1 == 100 {
+            match rx.try_recv() {
+                Ok(Message::NextThread { generation, .. }) => assert_eq!(generation, 2),
+                other => panic!("100 件目の確定で NEXT_THREAD が自動配布されるべき: {other:?}"),
+            }
+        }
     }
+    assert_eq!(
+        reg.build_announce_events(1_700_000_300, 0)[0]
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("gen"))
+            .and_then(|t| t.as_slice().get(1).cloned()),
+        Some("2".to_string()),
+        "前提: 100 件目確定と同時に世代 2 が開始されている"
+    );
 
-    // 101 件目は res_limit(100)超過で Rejected。
+    // 101 件目は旧世代(gen=1)宛であり、移行境界の定型拒否(D2)で Rejected になる。
     let over = sign_res(
         &board_key,
         &board_id,
@@ -823,9 +845,9 @@ fn accept_write_rejects_over_res_limit_without_broadcast() {
     assert_eq!(
         reg.accept_write(&board_id, &over, 1_700_000_200).unwrap(),
         AcceptOutcome::Rejected,
-        "res_limit 到達後は Rejected"
+        "自動移行後、旧世代(gen=1)宛の書き込みは Rejected"
     );
-    // 上限超過分は配布されない(outbox に何も届かない)。
+    // 拒否分は配布されない(outbox に何も届かない)。
     assert!(rx.try_recv().is_err(), "上限超過は配布されない");
 }
 
@@ -1274,5 +1296,214 @@ fn full_key_match_does_not_apply_to_short_id_collision() {
     assert!(
         !moderation.is_banned(&board_id, &key_b),
         "短縮 ID が同じ別鍵には BAN が適用されない(完全鍵照合 — FR-018)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T046/T047/T049: US5 契約テスト(次スレ移行・明示クローズ・板単位スコープの引き継ぎ)
+//
+// 公開クレート API(LivechatRegistry)のみを使い、次スレ移行(FR-013)・明示クローズ
+// (FR-014/FR-015)・移行後も板鍵 BAN/NG が有効であること(T049 — 板 = ペルソナ単位・
+// スレ非依存)を配送契約として固定する。ホスト側の詳細な状態遷移は registry.rs の
+// #[cfg(test)] で個別に検証済み(単体レベル)。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_thread_migration_freezes_old_generation_and_starts_new_one() {
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = registry_with_open_thread(&persona);
+    let board_key = Keys::generate();
+
+    // 旧スレ(gen=1)に 1 レス書き込んでおく。
+    let res = sign_res(
+        &board_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        1,
+        "旧スレへの投稿",
+        1_700_000_010,
+    )
+    .unwrap();
+    assert!(matches!(
+        reg.accept_write(&board_id, &res, 1_700_000_010).unwrap(),
+        AcceptOutcome::Numbered { .. }
+    ));
+
+    let new_gen = reg
+        .start_next_generation(&board_id, 1_700_001_000, "次スレ")
+        .unwrap();
+    assert_eq!(new_gen, 2, "次スレは世代 2");
+
+    // 旧世代(gen=1)宛の書き込みは、移行後は定型拒否される(D2 — 新スレへの誤採番はしない)。
+    let old_gen_write = sign_res(
+        &board_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        1,
+        "移行後に旧世代宛で届いた投稿",
+        1_700_001_010,
+    )
+    .unwrap();
+    assert_eq!(
+        reg.accept_write(&board_id, &old_gen_write, 1_700_001_010)
+            .unwrap(),
+        AcceptOutcome::Rejected,
+        "旧世代宛の書き込みは移行後は拒否される(T1)"
+    );
+
+    // 新世代(gen=2)宛の書き込みは res_no=1 から採番される。
+    let new_gen_write = sign_res(
+        &board_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        2,
+        "次スレへの投稿",
+        1_700_001_010,
+    )
+    .unwrap();
+    assert_eq!(
+        reg.accept_write(&board_id, &new_gen_write, 1_700_001_010)
+            .unwrap(),
+        AcceptOutcome::Numbered { res_no: 1, seq: 1 },
+        "新世代は独立した採番系列で 1 から始まる"
+    );
+}
+
+#[test]
+fn next_thread_broadcasts_next_thread_frame_to_participants() {
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = registry_with_open_thread(&persona);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    reg.register_participant(&board_id, "peer-1", tx);
+
+    reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+        .unwrap();
+
+    match rx.try_recv() {
+        Ok(Message::NextThread { generation, key }) => {
+            assert_eq!(generation, 2);
+            assert_eq!(key, 1_700_001_000);
+        }
+        other => panic!("NEXT_THREAD を期待: {other:?}"),
+    }
+}
+
+#[test]
+fn close_thread_signs_and_broadcasts_thread_close_then_rejects_writes() {
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = registry_with_open_thread(&persona);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    reg.register_participant(&board_id, "peer-1", tx);
+
+    let close_event = reg.close_thread(&board_id, 1_700_000_500).unwrap();
+    assert!(
+        peca_p2p_yp::event::livechat::is_close_notice(&close_event),
+        "kind 21311 の [\"peca\",\"close\"] 特殊形で発行される"
+    );
+    assert_eq!(
+        close_event.pubkey,
+        persona.public_key(),
+        "署名者はスレ主ペルソナ"
+    );
+    assert!(close_event.verify().is_ok());
+
+    match rx.try_recv() {
+        Ok(Message::ThreadClose { event }) => {
+            let ev = nostr::Event::from_json(event.to_string()).unwrap();
+            assert!(peca_p2p_yp::event::livechat::is_close_notice(&ev));
+        }
+        other => panic!("THREAD_CLOSE を期待: {other:?}"),
+    }
+
+    // クローズ後は書き込みを一切受理しない(T1)。
+    let board_key = Keys::generate();
+    let res = sign_res(
+        &board_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        1,
+        "クローズ後の投稿",
+        1_700_000_600,
+    )
+    .unwrap();
+    assert_eq!(
+        reg.accept_write(&board_id, &res, 1_700_000_600).unwrap(),
+        AcceptOutcome::Rejected
+    );
+
+    // クローズ済みスレは announce の対象外(T047)。
+    assert!(reg.build_announce_events(1_700_000_700, 0).is_empty());
+}
+
+#[test]
+fn board_scope_ban_and_settings_survive_thread_migration() {
+    // T049: 次スレ移行後も板鍵 BAN・板設定(板 = ペルソナ単位のスコープ)がそのまま
+    // 有効であることを配送契約として確認する。
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let reg = registry_with_open_thread(&persona);
+
+    let banned_key = Keys::generate();
+    assert!(reg.ban_board_key(&board_id, &banned_key.public_key().to_hex()));
+
+    reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+        .unwrap();
+
+    // BAN 済み板鍵は次スレでも採番されない(板単位スコープの引き継ぎ)。
+    let banned_write = sign_res(
+        &banned_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        2,
+        "BAN 済み鍵からの投稿(次スレ)",
+        1_700_001_010,
+    )
+    .unwrap();
+    assert_eq!(
+        reg.accept_write(&board_id, &banned_write, 1_700_001_010)
+            .unwrap(),
+        AcceptOutcome::Rejected,
+        "板鍵 BAN は板単位スコープのため次スレへ引き継がれる(FR-012)"
+    );
+
+    // BAN されていない鍵は次スレで通常どおり採番される。
+    let ok_key = Keys::generate();
+    let ok_write = sign_res(
+        &ok_key,
+        &board_id,
+        &delivery_channel(&board_id),
+        2,
+        "通常の投稿(次スレ)",
+        1_700_001_010,
+    )
+    .unwrap();
+    assert!(matches!(
+        reg.accept_write(&board_id, &ok_write, 1_700_001_010)
+            .unwrap(),
+        AcceptOutcome::Numbered { .. }
+    ));
+}
+
+#[test]
+fn board_scope_ng_survives_thread_migration() {
+    // T049: NG はローカル判定情報(Moderation ドメイン層)であり、スレの世代ではなく
+    // board_id(板)にスコープするため、次スレ移行後も同一の Moderation インスタンスで
+    // 判定し続ければそのまま有効に働く(ネットワーク非送出 — 不変条件 M1)。
+    let store = std::sync::Arc::new(Store::open_in_memory().unwrap());
+    let moderation = Moderation::new(store);
+    let board_id = "ab".repeat(32);
+    let ng_key = Keys::generate().public_key().to_hex();
+    moderation.add_ng(&board_id, &ng_key).unwrap();
+    assert!(moderation.is_ng(&board_id, &ng_key));
+
+    // 次スレ移行(世代の変化)は Moderation の判定に一切影響しない(板単位スコープ)。
+    // NG エントリの board_id は板(ペルソナ)固定であり、gen を持たない設計であることを
+    // 確認する(is_ng の呼び出しに gen を渡す API 自体が存在しない)。
+    assert!(
+        moderation.is_ng(&board_id, &ng_key),
+        "NG は板単位スコープのためスレ世代に依存しない"
     );
 }

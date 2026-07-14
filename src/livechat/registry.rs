@@ -34,7 +34,7 @@ use crate::event::livechat::{
 };
 use crate::p2p::frame::Message as WireMessage;
 
-use super::host::{HostThread, JoinDecision, SyncItem, board_settings_json};
+use super::host::{HostThread, JoinDecision, Participant, SyncItem, board_settings_json};
 use super::thread::{BoardSettings, BoardSettingsError, Res, Thread, ThreadError};
 
 /// ポイズン時も内部値を回収してロックを返す(パニックしない)。
@@ -220,6 +220,13 @@ impl LivechatRegistry {
         lock(&self.hosts).keys().cloned().collect()
     }
 
+    /// 指定 board の現行スレ世代(自動移行の成立確認・診断用)。未知 board は `None`。
+    pub fn board_generation(&self, board_id: &str) -> Option<u32> {
+        lock(&self.hosts)
+            .get(board_id)
+            .map(|e| e.host.thread.generation)
+    }
+
     // ----------------------------------------------------------- T042: BAN
 
     /// 板鍵を BAN する(スレ主 — 採番拒否。thread-events.md 検証 5)。
@@ -285,10 +292,17 @@ impl LivechatRegistry {
     /// 実際の gossip 発行([`crate::p2p::hub::GossipHub::publish_local`])は配線側(main の
     /// 定期タスク)が行う — 本メソッドは「発行すべき Event を作る」ところまで(署名失敗の
     /// board は黙って飛ばす)。
+    ///
+    /// **クローズ済みスレは対象外**(T047 — announce の発行停止)。Frozen(凍結中)は
+    /// 対象に含める(閲覧は継続するため一覧への掲載自体は続ける — announce 鮮度切れで
+    /// 一覧から除去されるのは呼び出し側 gossip の鮮度規則に委ねる)。
     pub fn build_announce_events(&self, created_at: u64, pow_bits: u8) -> Vec<Event> {
         let hosts = lock(&self.hosts);
         let mut events = Vec::new();
         for entry in hosts.values() {
+            if matches!(entry.host.thread.state, super::thread::ThreadState::Closed) {
+                continue;
+            }
             let announce = livechat::ThreadAnnounce {
                 channel: entry.host.thread.channel.clone(),
                 title: entry.host.thread.title.clone(),
@@ -500,7 +514,8 @@ impl LivechatRegistry {
     /// 2. **重複排除(設計制約 D1 — `w.id \notin AssignedIds`)**: event_id が板単位で既採番なら
     ///    採番せず [`AcceptOutcome::Duplicate`](再送 × 切断で二重採番が起きるのを防ぐ — O1)。
     /// 3. **上限(NoOverLimit / T3 — `RoomInActive`)**: 次 res_no が res_limit を超えるなら
-    ///    採番せず [`AcceptOutcome::Rejected`](次スレ移行は US5/T047)。
+    ///    採番せず [`AcceptOutcome::Rejected`](res_limit ちょうどに達する採番自体は許可し、
+    ///    確定後に手順 9 で次スレへ自動移行する — T046)。
     /// 4. **BAN(thread-events.md 検証 5 — spec Edge Case / T042)**: 板鍵が BAN 済みなら
     ///    採番せず [`AcceptOutcome::Rejected`](理由は応答で開示しない — FR-006)。
     /// 5. **PoW(thread-events.md 検証 6 — FR-021)**: 初見板鍵は `first_post_pow_bits` を満たす
@@ -511,6 +526,12 @@ impl LivechatRegistry {
     ///    (T3 を強制)。ORDER(kind 21311・seq 連番)をスレ主鍵で署名する。
     /// 8. **配布(`chan[p]` への Append)**: RES + ORDER を **全接続参加者(送信者含む)** の
     ///    outbox へ seq 順に送る。切断済み outbox への送信失敗は無視する(unregister は配線側)。
+    /// 9. **上限到達時の自動次スレ移行(T046 — FR-013)**: 直前の確定で `res_no == res_limit`
+    ///    に達したら、**配布と同じロック内**で
+    ///    [`Self::migrate_to_next_generation_locked`] を呼び、旧スレを Frozen 化 + 新世代を
+    ///    開始して `NEXT_THREAD` を配布する。同一ロック内で行うことで、移行境界(res_limit
+    ///    到達の採番と次スレ開始の間)に他の書き込みが割り込む余地をなくす(移行境界の
+    ///    二重採番なし — PlusCal モデルの検査前提)。
     ///
     /// 署名検証・形式は呼び出し前に [`Self::verify_incoming_res`] 等で済ませてある前提
     /// (モデル境界 — ADR-0014 §2)。本メソッドは検証通過後の**採番判定 + BAN/PoW/レート**を
@@ -527,6 +548,17 @@ impl LivechatRegistry {
         let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
 
         // 1. 対象スレ一致 + 状態(T1 — phase = active)。
+        //
+        // **移行境界の設計判断(ADR-0014 §4 D2 / docs/formal/livechat_sequencer.tla の
+        // 「破棄」遷移に対応 — `w.gen < activeGen` は常に定型拒否を選ぶ)**: PlusCal モデルは
+        // 「新スレへ採番」「定型拒否」の両方が安全(AssignedOnce 等の不変条件を保つ)ことを
+        // 検査済みだが、実装では**常に定型拒否**を選ぶ。理由: 書き込みイベントは署名済みで
+        // thread タグ(board_id・gen)を書き換えられないため、「新スレへ採番」を選ぶと
+        // 採番先スレの世代とイベント内 thread タグの gen が食い違う。参加者側の ORDER 検証
+        // (session.rs `apply_order` — thread-events.md §参加者側検証)はスレ主一致に加え
+        // 対象スレの世代一致も見るため、この食い違いは参加者側で「別スレの ORDER」として
+        // 拒否されかねず、かえって表示不一致のリスクを生む。常に定型拒否なら参加者は
+        // NEXT_THREAD 受信後に再送すればよいだけで済み、より単純かつ安全側に倒せる。
         if envelope.board_id != entry.host.thread.board_id
             || envelope.generation != entry.host.thread.generation
             || entry.host.thread.check_writable().is_err()
@@ -633,6 +665,16 @@ impl LivechatRegistry {
             let _ = tx.send(order_msg.clone());
         }
 
+        // 5.5 上限到達時の自動次スレ移行(T046 — FR-013 の「res_no = res_limit 確定後」
+        //     トリガー)。RES+ORDER の配布と同一ロック内で行う(移行境界の原子性)。
+        //     新スレの key は本書き込みの created_at、title は現行スレの title を引き継ぐ
+        //     (配信者の明示操作トリガー時に呼ぶ start_next_generation/web trait の
+        //     next_thread(board_id) が title 引数を持たないのと一貫させる)。
+        if res_no == entry.host.thread.res_limit {
+            let title = entry.host.thread.title.clone();
+            let _ = Self::migrate_to_next_generation_locked(board_id, entry, created_at, title);
+        }
+
         Ok(AcceptOutcome::Numbered {
             res_no,
             seq: order.seq,
@@ -679,6 +721,164 @@ impl LivechatRegistry {
             let _ = tx.send(msg.clone());
         }
         Ok(board_settings)
+    }
+
+    // ------------------------------------------------------- T046: 次スレ移行
+
+    /// 次スレへ移行する(T046 — FR-012/FR-013・配信者の明示操作トリガー)。
+    ///
+    /// 公開 API(次スレ操作 API 相当)からの呼び出し口。上限到達トリガーは
+    /// [`Self::accept_write`] が採番確定直後に**同一ロック内**で
+    /// [`Self::migrate_to_next_generation_locked`] を呼ぶため、本メソッドとは別経路になる
+    /// (両者とも同じ内部ヘルパーへ収束させ、移行手順の重複を避ける)。
+    ///
+    /// 未知 board は [`RegistryError::UnknownBoard`]。旧スレが既に非 Active(Frozen/Closed)
+    /// なら移行しない([`RegistryError::Confirm`] で `T1` 違反を明示)。
+    pub fn start_next_generation(
+        &self,
+        board_id: &str,
+        new_key: u64,
+        title: impl Into<String>,
+    ) -> Result<u32, RegistryError> {
+        let mut hosts = lock(&self.hosts);
+        let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
+        Self::migrate_to_next_generation_locked(board_id, entry, new_key, title.into())
+    }
+
+    /// 次スレ移行の実処理(T046 — [`Self::start_next_generation`] と
+    /// [`Self::accept_write`] の上限到達検出の**両方から呼ばれる内部ヘルパー**)。
+    ///
+    /// **PlusCal モデル(docs/formal/livechat_sequencer.tla)の「次スレ移行」遷移に対応**。
+    /// トリガーは res_no = res_limit 確定後 **または** 配信者の明示操作(次スレ操作 API)の
+    /// いずれか — モデルは両方を「Active 中の任意時点で移行しうる」に抽象化しており(モデル
+    /// ヘッダコメント参照)、実装も呼び出し元がどちらでも本ヘルパーへ収束させることで
+    /// 移行手順(freeze → 新世代作成 → NEXT_THREAD 配布)の実装を一箇所に保つ。
+    ///
+    /// **原子性**: `accept_write` から呼ぶ場合、採番確定([`Thread::confirm`])から
+    /// 移行完了までを**同一の `hosts` ロック内**で行う(呼び出し元が `MutexGuard` 越しの
+    /// `entry` を渡すため、ロックを跨がない)。これにより「res_no = res_limit の確定」と
+    /// 「移行(Frozen 化 + NEXT_THREAD 配布)」の間に他の書き込みが割り込む余地がなく、
+    /// 移行境界の二重採番(PlusCal モデルの検査前提)を構造的に防ぐ。
+    ///
+    /// 手順(モデルの `frozenLen[activeGen] := Len(log[activeGen])` → `chan` への `next` 追加 →
+    /// `activeGen := ng` に対応):
+    ///
+    /// 1. **旧スレを Frozen に**(`Thread::freeze` — 不変条件 T1。以後 [`Self::accept_write`] は
+    ///    旧世代宛を定型拒否する。書き込み不可・閲覧は継続)。
+    /// 2. **新 `HostThread` を作る**(`gen + 1`・新 `key`(スレ作成秒)・`res_limit` は
+    ///    **現在の板設定**の値を採用する — FR-023「res_limit は次スレから」の適用点)。
+    /// 3. **板スコープの状態は引き継ぐ**(T049 — 板鍵 BAN・ConnBan・板設定・**既知板鍵
+    ///    (`known_board_keys`)・書き込みレート窓(`write_windows`)は板 = ペルソナ単位の
+    ///    スコープでありスレ(世代)に依存しないため、次スレ移行後も保持する**。research R6 は
+    ///    「板鍵が当該**板**で未知(初見)なら first_post_pow_bits を要求」と規定しており、
+    ///    世代単位の判定ではない — 移行のたびに既知板鍵を初見扱いへ戻すと、移行済みの
+    ///    書き込み者全員へ不要な PoW 再計算を強いてしまう。`assigned_ids`・`res_events`・
+    ///    `order_events` は世代固有(採番実績そのもの)のためリセットする)。
+    /// 4. **`NEXT_THREAD` を全接続参加者へ配布**(`chan[p]` への Append)。参加者は受信して
+    ///    `knownGen` を更新し、以後の書き込みは新世代宛になる。
+    fn migrate_to_next_generation_locked(
+        board_id: &str,
+        entry: &mut HostEntry,
+        new_key: u64,
+        title: String,
+    ) -> Result<u32, RegistryError> {
+        // 1. 旧スレを Frozen に(T1 — Active でなければ移行しない)。
+        entry
+            .host
+            .thread
+            .freeze()
+            .map_err(|_| RegistryError::Confirm(ThreadError::NotActive))?;
+
+        // 2. 新 HostThread を作る(res_limit は現在の板設定 — FR-023「次スレから」)。
+        let new_generation = entry.host.thread.generation + 1;
+        let channel = entry.host.thread.channel.clone();
+        let settings = entry.host.settings.clone();
+        let new_thread = Thread::new(
+            board_id,
+            channel,
+            new_generation,
+            new_key,
+            title,
+            settings.res_limit,
+        );
+        let new_host = HostThread::new(new_thread, settings);
+        let old_participants: Vec<Participant> = entry.host.participants().to_vec();
+        entry.host = new_host;
+        // 旧スレの参加者登録(接続維持中)は新スレへそのまま引き継ぐ(接続自体は継続し、
+        // 対象スレだけが切り替わる — outbox は不変)。
+        for p in &old_participants {
+            entry.host.register_participant(p.peer_id.clone());
+        }
+
+        // 3. 世代固有の状態のみリセットする(板スコープの BAN/ConnBan/settings/既知板鍵/
+        //    レート窓は引き継ぐ — T049 / research R6)。
+        entry.res_events.clear();
+        entry.order_events.clear();
+        entry.assigned_ids.clear();
+
+        // 4. NEXT_THREAD を全接続参加者へ配布。
+        let msg = WireMessage::NextThread {
+            generation: new_generation,
+            key: new_key,
+        };
+        for tx in entry.outboxes.values() {
+            let _ = tx.send(msg.clone());
+        }
+        Ok(new_generation)
+    }
+
+    // --------------------------------------------------------- T047: 明示クローズ
+
+    /// スレを明示クローズする(T047 — FR-014/FR-015)。
+    ///
+    /// **PlusCal モデルの「明示クローズ」遷移に対応**(`phase := "closed"` →
+    /// `pending := {}` → `chan` への `close` 追加)。以後 [`Self::accept_write`] は
+    /// `check_writable` が非 Active を検出して常に定型拒否する(T1)。
+    ///
+    /// 手順:
+    /// 1. **スレ主署名付き THREAD_CLOSE を生成**([`ThreadClose::sign`] — kind 21311 の
+    ///    `["peca","close"]` 特殊形。署名鍵はスレ主ペルソナ = `entry.persona`)。
+    /// 2. **`Thread::close`** で終端状態へ遷移(不変条件 T1。Closed は再遷移不可)。
+    /// 3. **`THREAD_CLOSE` を全接続参加者へ配布**。受信側([`crate::livechat::session`])は
+    ///    スレデータを削除する(揮発 — FR-015)。announce の発行停止は呼び出し側
+    ///    ([`Self::build_announce_events`] は Closed スレを対象外にする)が担う。
+    ///
+    /// クローズ済みイベントを返す(呼び出し側が announce 停止・ログ等に使う)。未知 board は
+    /// [`RegistryError::UnknownBoard`]、署名構築失敗は [`RegistryError::Build`]。
+    pub fn close_thread(&self, board_id: &str, created_at: u64) -> Result<Event, RegistryError> {
+        let mut hosts = lock(&self.hosts);
+        let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
+
+        let close = livechat::ThreadClose {
+            board_id: board_id.to_string(),
+            generation: entry.host.thread.generation,
+        };
+        let close_event = close
+            .sign(&entry.persona, created_at)
+            .map_err(RegistryError::Build)?;
+
+        entry
+            .host
+            .thread
+            .close()
+            .map_err(|_| RegistryError::Confirm(ThreadError::NotActive))?;
+
+        let msg = WireMessage::ThreadClose {
+            event: serde_json::to_value(&close_event).unwrap_or(serde_json::Value::Null),
+        };
+        for tx in entry.outboxes.values() {
+            let _ = tx.send(msg.clone());
+        }
+        Ok(close_event)
+    }
+
+    /// スレがクローズ済みか(announce 発行停止の判定 — T047)。未知 board は `true`
+    /// (announce を出さない安全側)。
+    pub fn is_closed(&self, board_id: &str) -> bool {
+        lock(&self.hosts)
+            .get(board_id)
+            .map(|e| matches!(e.host.thread.state, super::thread::ThreadState::Closed))
+            .unwrap_or(true)
     }
 
     /// 参加者を登録する(WELCOME 送出成功後に配線側が呼ぶ)。
@@ -1156,7 +1356,10 @@ mod tests {
                 AcceptOutcome::Numbered { .. }
             ));
         }
-        // 101 件目は上限超過で Rejected(NoOverLimit / T3)。
+        // 100 件目の確定と同時に自動的に次スレ(gen=2)へ移行しているため(T046)、
+        // 旧世代(gen=1)宛の 101 件目は移行境界の定型拒否(ADR-0014 D2)で Rejected になる
+        // (NoOverLimit 到達そのものではなく世代不一致が理由 — 自動移行の検証は
+        // res_limit_reached_migrates_automatically_after_final_confirm を参照)。
         let over = sign_res(
             &board_key,
             &board_id,
@@ -1169,6 +1372,105 @@ mod tests {
         assert_eq!(
             reg.accept_write(&board_id, &over, 1_700_000_200).unwrap(),
             AcceptOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn res_limit_reached_migrates_automatically_after_final_confirm() {
+        // T046: 「res_no = res_limit 確定後」トリガーの自動移行。tasks.md の要件どおり、
+        // 明示操作(start_next_generation の手動呼び出し)なしで、上限到達の採番確定と
+        // 同一の accept_write 呼び出し内で次スレが開始されることを確認する。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = LivechatRegistry::new_with_rate(128, 10_000);
+        let settings = BoardSettings {
+            res_limit: crate::livechat::thread::RES_LIMIT_MIN,
+            first_post_pow_bits: 0,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx);
+
+        let board_key = Keys::generate();
+        let limit = crate::livechat::thread::RES_LIMIT_MIN as u64;
+        for i in 0..limit {
+            let res = sign_res(
+                &board_key,
+                &board_id,
+                &channel_of(&board_id),
+                1,
+                &format!("r{i}"),
+                1_700_000_010 + i,
+            )
+            .unwrap();
+            let outcome = reg
+                .accept_write(&board_id, &res, 1_700_000_010 + i)
+                .unwrap();
+            assert!(
+                matches!(outcome, AcceptOutcome::Numbered { .. }),
+                "書き込み {i} は採番されるべき: {outcome:?}"
+            );
+            // 各書き込みで RES + ORDER を読み捨てる。最後の 1 件(上限到達)だけ
+            // 続けて NEXT_THREAD も配布されるので、その分は後段でまとめて確認する。
+            let _ = rx.try_recv();
+            let _ = rx.try_recv();
+        }
+
+        // 上限到達の確定と同一呼び出し内で次スレが自動的に開始されている。
+        // NEXT_THREAD が最後の RES/ORDER に続けて配布されていることを確認する。
+        match rx.try_recv() {
+            Ok(WireMessage::NextThread { generation, .. }) => {
+                assert_eq!(
+                    generation, 2,
+                    "res_limit 到達確定と同時に世代 2 へ自動移行する"
+                )
+            }
+            other => panic!("NEXT_THREAD が自動配布されるべき: {other:?}"),
+        }
+
+        // 旧世代(gen=1)宛の追加書き込みは拒否される(手動 start_next_generation なしで
+        // 既に Frozen 化されている)。
+        let old_gen_write = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "移行後の旧世代宛",
+            1_700_000_500,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &old_gen_write, 1_700_000_500)
+                .unwrap(),
+            AcceptOutcome::Rejected,
+            "自動移行後は旧世代宛が拒否される"
+        );
+
+        // 新世代(gen=2)宛の書き込みは res_no=1 から採番される(手動呼び出しなしで有効)。
+        let new_gen_write = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            2,
+            "自動移行後の新スレへの投稿",
+            1_700_000_500,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &new_gen_write, 1_700_000_500)
+                .unwrap(),
+            AcceptOutcome::Numbered { res_no: 1, seq: 1 },
+            "手動呼び出しなしで開始された新スレへ正しく採番される"
         );
     }
 
@@ -1628,5 +1930,398 @@ mod tests {
         let mut expected = vec![k1, k2];
         expected.sort();
         assert_eq!(listed, expected);
+    }
+
+    // --- T046: 次スレ移行(FR-012/FR-013)-------------------------------------
+
+    #[test]
+    fn start_next_generation_freezes_old_and_activates_new() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+
+        let new_gen = reg
+            .start_next_generation(&board_id, 1_700_001_000, "実況スレ その2")
+            .unwrap();
+        assert_eq!(new_gen, 2, "世代は 1 → 2 へ単調増加");
+
+        let hosts = lock(&reg.hosts);
+        let entry = hosts.get(&board_id).unwrap();
+        assert_eq!(entry.host.thread.generation, 2, "新スレが Active");
+        assert_eq!(
+            entry.host.thread.state,
+            crate::livechat::thread::ThreadState::Active
+        );
+        assert_eq!(entry.host.thread.key, 1_700_001_000);
+        assert_eq!(entry.host.thread.title, "実況スレ その2");
+    }
+
+    #[test]
+    fn start_next_generation_broadcasts_next_thread_to_participants() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx);
+
+        reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+            .unwrap();
+
+        match rx.try_recv() {
+            Ok(WireMessage::NextThread { generation, key }) => {
+                assert_eq!(generation, 2);
+                assert_eq!(key, 1_700_001_000);
+            }
+            other => panic!("NEXT_THREAD を期待: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_generation_write_is_rejected_after_migration() {
+        // 移行境界の設計判断(ADR-0014 D2): 旧世代宛の書き込みは常に定型拒否。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+
+        // 旧世代(gen=1)向けの署名済みレスを作っておく(署名後は書き換え不可)。
+        let old_gen_res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "移行前に署名した書き込み",
+            1_700_000_900,
+        )
+        .unwrap();
+
+        reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+            .unwrap();
+
+        // 移行後に届いた旧世代(gen=1)宛の書き込みは定型拒否(新スレへの誤採番はしない)。
+        assert_eq!(
+            reg.accept_write(&board_id, &old_gen_res, 1_700_001_010)
+                .unwrap(),
+            AcceptOutcome::Rejected,
+            "旧世代宛の書き込みは新世代へ誤採番せず拒否する"
+        );
+
+        // 新世代(gen=2)宛の書き込みは通常どおり採番される。
+        let new_gen_res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            2,
+            "次スレへの書き込み",
+            1_700_001_010,
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &new_gen_res, 1_700_001_010)
+                .unwrap(),
+            AcceptOutcome::Numbered { res_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn start_next_generation_preserves_participants_across_migration() {
+        // 移行後も接続(outbox)は維持され、新世代の配布を受け取れる。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx);
+
+        reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+            .unwrap();
+        let _ = rx.try_recv(); // NEXT_THREAD を読み捨てる
+
+        let board_key = Keys::generate();
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            2,
+            "新スレへの書き込み",
+            1_700_001_010,
+        )
+        .unwrap();
+        reg.accept_write(&board_id, &res, 1_700_001_010).unwrap();
+
+        // 引き継がれた接続が新スレの RES + ORDER を受け取れる。
+        assert!(matches!(rx.try_recv(), Ok(WireMessage::Res { .. })));
+        assert!(matches!(rx.try_recv(), Ok(WireMessage::Order { .. })));
+    }
+
+    #[test]
+    fn start_next_generation_resets_numbering_but_keeps_board_scope() {
+        // T049: 板単位スコープ(BAN・板設定・既知板鍵・レート窓)は次スレへ引き継がれるが、
+        // 世代固有の採番実績(assigned_ids・res_events・order_events)はリセットされ、
+        // 新世代の res_no は 1 から再開する。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let board_key = Keys::generate();
+        let banned = Keys::generate();
+
+        // 旧スレで板鍵を BAN し、別の板鍵で 1 レス採番しておく(既知板鍵化)。
+        reg.ban_board_key(&board_id, &banned.public_key().to_hex());
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "旧スレへの投稿",
+            1_700_000_900,
+        )
+        .unwrap();
+        reg.accept_write(&board_id, &res, 1_700_000_900).unwrap();
+
+        reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+            .unwrap();
+
+        // 板単位スコープ(BAN)は引き継がれる。
+        let banned_res = sign_res(
+            &banned,
+            &board_id,
+            &channel_of(&board_id),
+            2,
+            "BAN 済み鍵からの投稿(次スレ)",
+            1_700_001_010,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &banned_res, 1_700_001_010)
+                .unwrap(),
+            AcceptOutcome::Rejected,
+            "板鍵 BAN は次スレへ引き継がれる(FR-012 板単位スコープ)"
+        );
+
+        // 世代固有の状態(採番実績)はリセットされ、新世代の res_no は 1 から始まる。
+        let new_res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            2,
+            "新スレへの投稿",
+            1_700_001_010,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &new_res, 1_700_001_010)
+                .unwrap(),
+            AcceptOutcome::Numbered { res_no: 1, seq: 1 },
+            "新世代の採番は res_no=1 から再開する"
+        );
+    }
+
+    #[test]
+    fn start_next_generation_keeps_known_board_keys_without_repeat_pow() {
+        // research R6: 「板鍵が当該板で未知(初見)なら first_post_pow_bits を要求」は板
+        // スコープの判定であり世代単位ではない。既知板鍵(旧スレで採番実績あり)は次スレ
+        // 移行後も PoW なしで書き込めることを確認する(T049 — known_board_keys の引き継ぎ)。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = LivechatRegistry::new_with_rate(128, 10_000);
+        let settings = BoardSettings {
+            first_post_pow_bits: 8,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let board_key = Keys::generate();
+        let ch = channel_of(&board_id);
+
+        // 旧スレで PoW 付き初回書き込みを済ませ、既知板鍵にする。
+        let pow_first = crate::event::livechat::Res {
+            channel: ch.clone(),
+            board_id: board_id.clone(),
+            generation: 1,
+            name: None,
+            mail: None,
+            body: "旧スレ初回(PoW 付き)".to_string(),
+        }
+        .sign(&board_key, 1_700_000_900, 8)
+        .unwrap();
+        assert!(matches!(
+            reg.accept_write(&board_id, &pow_first, 1_700_000_900)
+                .unwrap(),
+            AcceptOutcome::Numbered { .. }
+        ));
+
+        reg.start_next_generation(&board_id, 1_700_001_000, "次スレ")
+            .unwrap();
+
+        // 次スレでの書き込みは PoW なしでも採番される(既知板鍵は板スコープで引き継がれる)。
+        let no_pow_next = sign_res(
+            &board_key,
+            &board_id,
+            &ch,
+            2,
+            "次スレへの投稿(PoW なし)",
+            1_700_001_010,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &no_pow_next, 1_700_001_010)
+                .unwrap(),
+            AcceptOutcome::Numbered { res_no: 1, seq: 1 },
+            "既知板鍵は次スレ移行後も PoW を再要求されない(research R6 は板スコープ)"
+        );
+
+        // 対照: ホストにとって本当に未見の新規鍵は、次スレでも初回 PoW が必要。
+        let unseen_key = Keys::generate();
+        let no_pow_unseen = sign_res(
+            &unseen_key,
+            &board_id,
+            &ch,
+            2,
+            "次スレでの初見鍵(PoW なし)",
+            1_700_001_020,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &no_pow_unseen, 1_700_001_020)
+                .unwrap(),
+            AcceptOutcome::Rejected,
+            "本当に未見の板鍵は次スレでも初回 PoW が必要"
+        );
+    }
+
+    #[test]
+    fn start_next_generation_unknown_board_errors() {
+        let reg = LivechatRegistry::new(128);
+        assert!(matches!(
+            reg.start_next_generation("unknown", 1_700_000_000, "x"),
+            Err(RegistryError::UnknownBoard)
+        ));
+    }
+
+    #[test]
+    fn start_next_generation_rejects_when_not_active() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        reg.close_thread(&board_id, 1_700_000_500).unwrap();
+        assert!(matches!(
+            reg.start_next_generation(&board_id, 1_700_001_000, "x"),
+            Err(RegistryError::Confirm(ThreadError::NotActive))
+        ));
+    }
+
+    // --- T047: 明示クローズ(FR-014/FR-015)-----------------------------------
+
+    #[test]
+    fn close_thread_signs_close_event_and_transitions_to_closed() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+
+        let event = reg.close_thread(&board_id, 1_700_000_500).unwrap();
+        assert_eq!(event.kind.as_u16(), crate::event::livechat::ORDER_KIND);
+        assert!(
+            crate::event::livechat::is_close_notice(&event),
+            "close タグ付きイベントを発行する"
+        );
+        assert_eq!(event.pubkey, p.public_key(), "署名者はスレ主ペルソナ");
+        assert!(event.verify().is_ok());
+
+        assert!(reg.is_closed(&board_id));
+    }
+
+    #[test]
+    fn close_thread_broadcasts_to_participants() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register_participant(&board_id, "peer-1", tx);
+
+        reg.close_thread(&board_id, 1_700_000_500).unwrap();
+
+        match rx.try_recv() {
+            Ok(WireMessage::ThreadClose { event }) => {
+                use nostr::JsonUtil;
+                let ev = nostr::Event::from_json(event.to_string()).unwrap();
+                assert!(crate::event::livechat::is_close_notice(&ev));
+            }
+            other => panic!("THREAD_CLOSE を期待: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_thread_rejects_further_writes() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        reg.close_thread(&board_id, 1_700_000_500).unwrap();
+
+        let board_key = Keys::generate();
+        let res = sign_res(
+            &board_key,
+            &board_id,
+            &channel_of(&board_id),
+            1,
+            "クローズ後の投稿",
+            1_700_000_600,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.accept_write(&board_id, &res, 1_700_000_600).unwrap(),
+            AcceptOutcome::Rejected,
+            "クローズ後は採番されない(T1)"
+        );
+    }
+
+    #[test]
+    fn closed_thread_excluded_from_announce_events() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        assert_eq!(reg.build_announce_events(1_700_000_000, 0).len(), 1);
+
+        reg.close_thread(&board_id, 1_700_000_500).unwrap();
+        assert!(
+            reg.build_announce_events(1_700_000_600, 0).is_empty(),
+            "クローズ済みスレの announce は発行しない(T047)"
+        );
+    }
+
+    #[test]
+    fn close_thread_unknown_board_errors() {
+        let reg = LivechatRegistry::new(128);
+        assert!(matches!(
+            reg.close_thread("unknown", 1_700_000_000),
+            Err(RegistryError::UnknownBoard)
+        ));
+    }
+
+    #[test]
+    fn close_thread_twice_errors_on_second_call() {
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        reg.close_thread(&board_id, 1_700_000_500).unwrap();
+        assert!(matches!(
+            reg.close_thread(&board_id, 1_700_000_600),
+            Err(RegistryError::Confirm(ThreadError::NotActive))
+        ));
+    }
+
+    #[test]
+    fn is_closed_true_for_unknown_board() {
+        let reg = LivechatRegistry::new(128);
+        assert!(
+            reg.is_closed("unknown"),
+            "未知 board は安全側(true)として扱う"
+        );
     }
 }

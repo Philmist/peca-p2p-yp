@@ -197,11 +197,26 @@ pub struct ThreadDetail {
 /// `web/announced.rs` の `AnnouncedProvider` と同じ注入パターン。**本モジュールはトレイト
 /// 定義のみを持ち、具体的な実装(レジストリ・gossip ハブを束ねる適合層)は別担当が
 /// `src/main.rs` で配線する**(モジュール doc 参照)。
+///
+/// T046/T047(US5)で `next_thread`/`close_thread` を追加した(自板のみが操作対象 — 他ノード
+/// 板の操作は本ノードの権限外なので `false`/`None` を返す実装でよい)。
 pub trait LivechatDirectory: Send + Sync {
     /// 見えている全スレの一覧(自板 + 他ノード板)。
     fn threads(&self) -> Vec<ThreadSummary>;
     /// 指定 board_id のスレ詳細(板設定 + 確定レス一覧)。未知 board_id は `None`。
     fn thread(&self, board_id: &str) -> Option<ThreadDetail>;
+    /// 次スレ操作(T046 — FR-013)。自板の Active スレを Frozen にし新世代を開始する。
+    /// 新世代の番号を返す。未知 board_id・他ノード板・非 Active は `None`。
+    ///
+    /// `title` 引数を持たない: 配線側の実装は
+    /// [`crate::livechat::registry::LivechatRegistry::start_next_generation`] を呼ぶ際、
+    /// **現行スレの title をそのまま引き継ぐ**こと(res_limit 到達時の自動移行 —
+    /// `LivechatRegistry::accept_write` 内の自動呼び出し — と挙動を一貫させるため。
+    /// 自動移行側も現行スレの title を引き継ぐ実装になっている)。
+    fn next_thread(&self, board_id: &str) -> Option<u32>;
+    /// クローズ操作(T047 — FR-014)。自板の Active/Frozen スレを明示クローズする。
+    /// 成功なら `true`。未知 board_id・他ノード板・既 Closed は `false`。
+    fn close_thread(&self, board_id: &str) -> bool;
 }
 
 /// `/api/v1/livechat` エンドポイント群のサブルーター。[`super::api_router`] が `.merge` する。
@@ -212,6 +227,14 @@ pub(crate) fn routes() -> Router<AppState> {
         .route(
             "/livechat/threads/{board_id}/join",
             axum::routing::post(join_thread),
+        )
+        .route(
+            "/livechat/threads/{board_id}/next",
+            axum::routing::post(next_thread),
+        )
+        .route(
+            "/livechat/threads/{board_id}/close",
+            axum::routing::post(close_thread),
         )
 }
 
@@ -248,6 +271,44 @@ async fn get_thread(State(state): State<AppState>, Path(board_id): Path<String>)
 /// 起動・結果保持はまだ配線していないため、シグネチャのみ用意し 501 を返す。
 async fn join_thread(State(_state): State<AppState>, Path(_board_id): Path<String>) -> Response {
     error_response(StatusCode::NOT_IMPLEMENTED, "not_implemented")
+}
+
+/// 次スレ操作・クローズ操作の応答本体(T046/T047)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct NextThreadResponse {
+    /// 新しく開始した世代番号。
+    generation: u32,
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/next` — 次スレ操作(T046 — FR-013)。
+///
+/// 配信者の明示操作を起点に次スレへ移行する(res_limit 到達時の自動移行はホスト側
+/// [`crate::livechat::host`]/[`crate::livechat::registry`] が別途行う)。供給元未配線・
+/// 未知 board_id・他ノード板・非 Active スレは `not_found`(内部情報を開示しない)。
+async fn next_thread(State(state): State<AppState>, Path(board_id): Path<String>) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return error_response(StatusCode::NOT_FOUND, "not_found");
+    };
+    match directory.next_thread(&board_id) {
+        Some(generation) => Json(NextThreadResponse { generation }).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/close` — クローズ操作(T047 — FR-014)。
+///
+/// 配信者の明示操作でスレをクローズする(スレ主署名付き THREAD_CLOSE の配布はレジストリ側 —
+/// [`crate::livechat::registry::LivechatRegistry::close_thread`])。供給元未配線・未知
+/// board_id・他ノード板・既 Closed は `not_found`。
+async fn close_thread(State(state): State<AppState>, Path(board_id): Path<String>) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return error_response(StatusCode::NOT_FOUND, "not_found");
+    };
+    if directory.close_thread(&board_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error_response(StatusCode::NOT_FOUND, "not_found")
+    }
 }
 
 #[cfg(test)]
@@ -415,8 +476,13 @@ mod tests {
 
     // --- T024: LivechatDirectory 経由のハンドラ疎通 -----------------------------
 
+    #[derive(Default)]
     struct FakeDirectory {
         threads: Vec<ThreadSummary>,
+        /// 次スレ操作を許可する board_id(T046 のハンドラ疎通テスト用)。
+        next_ok_board: Option<String>,
+        /// クローズ操作を許可する board_id(T047 のハンドラ疎通テスト用)。
+        close_ok_board: Option<String>,
     }
 
     impl LivechatDirectory for FakeDirectory {
@@ -438,6 +504,18 @@ mod tests {
             } else {
                 None
             }
+        }
+
+        fn next_thread(&self, board_id: &str) -> Option<u32> {
+            if self.next_ok_board.as_deref() == Some(board_id) {
+                Some(2)
+            } else {
+                None
+            }
+        }
+
+        fn close_thread(&self, board_id: &str) -> bool {
+            self.close_ok_board.as_deref() == Some(board_id)
         }
     }
 
@@ -486,6 +564,7 @@ mod tests {
     async fn list_threads_returns_directory_summaries() {
         let directory = FakeDirectory {
             threads: vec![sample_summary()],
+            ..Default::default()
         };
         let resp = list_threads(State(state_with_directory(Some(directory)))).await;
         let json = body_json(resp).await;
@@ -503,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_thread_returns_settings_and_res_for_known_board() {
-        let directory = FakeDirectory { threads: vec![] };
+        let directory = FakeDirectory::default();
         let state = state_with_directory(Some(directory));
         let resp = get_thread(State(state), Path("ab".repeat(32))).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -516,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_thread_returns_not_found_for_unknown_board() {
-        let directory = FakeDirectory { threads: vec![] };
+        let directory = FakeDirectory::default();
         let state = state_with_directory(Some(directory));
         let resp = get_thread(State(state), Path("ff".repeat(32))).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -533,6 +612,64 @@ mod tests {
         let state = state_with_directory(None);
         let resp = join_thread(State(state), Path("ab".repeat(32))).await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // --- T046: 次スレ操作 API ------------------------------------------------
+
+    #[tokio::test]
+    async fn next_thread_returns_new_generation_for_allowed_board() {
+        let board_id = "ab".repeat(32);
+        let directory = FakeDirectory {
+            next_ok_board: Some(board_id.clone()),
+            ..Default::default()
+        };
+        let state = state_with_directory(Some(directory));
+        let resp = next_thread(State(state), Path(board_id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["generation"], 2);
+    }
+
+    #[tokio::test]
+    async fn next_thread_returns_not_found_for_unknown_board() {
+        let directory = FakeDirectory::default();
+        let state = state_with_directory(Some(directory));
+        let resp = next_thread(State(state), Path("ff".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn next_thread_returns_not_found_when_unwired() {
+        let resp = next_thread(State(state_with_directory(None)), Path("ab".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- T047: クローズ操作 API ----------------------------------------------
+
+    #[tokio::test]
+    async fn close_thread_returns_no_content_for_allowed_board() {
+        let board_id = "ab".repeat(32);
+        let directory = FakeDirectory {
+            close_ok_board: Some(board_id.clone()),
+            ..Default::default()
+        };
+        let state = state_with_directory(Some(directory));
+        let resp = close_thread(State(state), Path(board_id)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn close_thread_returns_not_found_for_unknown_board() {
+        let directory = FakeDirectory::default();
+        let state = state_with_directory(Some(directory));
+        let resp = close_thread(State(state), Path("ff".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn close_thread_returns_not_found_when_unwired() {
+        let resp = close_thread(State(state_with_directory(None)), Path("ab".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // --- T045: 互換 API 板 URL ---------------------------------------------

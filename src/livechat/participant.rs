@@ -47,6 +47,9 @@ pub enum JoinResult {
     },
     /// トランスポート/プロトコルのエラー(接続失敗・切断・不正フレーム)。
     Transport,
+    /// `THREAD_CLOSE` を受信してスレデータを削除した(T047 — FR-014/FR-015)。
+    /// 再接続は行わない(スレそのものが終端したため — [`RejectHandling::GiveUp`] と同格)。
+    Closed,
 }
 
 /// 参加者ドライバの依存(接続先・対象スレ・観測用ログ)。
@@ -173,6 +176,17 @@ where
             }
             // SETTINGS/その他ホスト→参 メッセージは US1 では観測対象外(前方互換で無視)。
             Message::Settings { .. } => {}
+            Message::NextThread { generation, key } => {
+                // T046: 次スレ移行。旧スレは Frozen(表示済みデータは保持)、以後の同期は
+                // 新世代宛(seq は新世代で 1 から再開 — O2 は世代ごとに独立した連番)。
+                session.apply_next_thread(generation, key, config.res_limit);
+                pending.clear(); // 旧世代宛の保留プールは新世代の ORDER と対応しないため破棄。
+            }
+            Message::ThreadClose { .. } => {
+                // T047: 明示クローズ。スレデータを削除して終了する(FR-014/FR-015)。
+                session.apply_close();
+                return JoinResult::Closed;
+            }
             // gossip 混在・不正フレームはホスト側が切断する。参加者側は EOF で抜ける。
             _ => {}
         }
@@ -365,6 +379,8 @@ pub async fn run_with_backoff(
                 RejectHandling::GiveUp => return result,
                 RejectHandling::Backoff | RejectHandling::WaitFrozen => {}
             },
+            // T047: スレがクローズ済み。再接続しても復帰しないため GiveUp と同格に扱う。
+            JoinResult::Closed => return result,
             JoinResult::ChallengeFailed | JoinResult::Transport => {}
         }
         last = result;
@@ -376,6 +392,194 @@ pub async fn run_with_backoff(
         attempt += 1;
     }
     last
+}
+
+// ---------------------------------------------------------------------------
+// T048: 凍結・復帰(継続受信 + 切断検知 + since_seq 差分同期での再接続)
+// ---------------------------------------------------------------------------
+
+/// 継続受信中に生じうる終端理由(T048 — 凍結・クローズ・スレ機能上のエラー)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// TCP 断・PING 無応答等で接続が失われた(Frozen へ遷移済み — FR-014)。
+    /// 呼び出し側は取得済みレスの閲覧を継続しつつバックオフ再接続すべき。
+    Disconnected,
+    /// `THREAD_CLOSE` を受信してスレデータを削除した(T047)。以後は再接続しない。
+    Closed,
+}
+
+/// 既に joined 済みの [`ParticipantSession`] を使って継続受信する(T048)。
+///
+/// `drive` の初回同期(アイドル打ち切りで確定分を返す — US1)とは異なり、本関数は
+/// **アイドル打ち切りをしない**: フレームが来る限り受信を続け、EOF/I/O エラー時に
+/// のみ終了する。これにより「ホストが同期完了後も継続配信する」(US2)接続を、
+/// 予期しない切断(Frozen)が起きるまで維持できる。
+///
+/// - `RES`/`ORDER`/`SETTINGS` は `drive` と同じ処理(封筒検証 → 確定反映)。
+/// - `NEXT_THREAD` は [`ParticipantSession::apply_next_thread`] で次世代へ切り替える(T046)。
+/// - `THREAD_CLOSE` は [`ParticipantSession::apply_close`] でデータ削除し
+///   [`StreamEnd::Closed`] を返す(T047)。
+/// - EOF/I/O エラーは [`ParticipantSession::on_disconnect`] で Frozen へ遷移し
+///   [`StreamEnd::Disconnected`] を返す(T048)。
+pub async fn stream_until_disconnect<R, W>(
+    config: &ParticipantConfig,
+    session: &mut ParticipantSession,
+    mut reader: R,
+    mut writer: W,
+) -> StreamEnd
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut pending: std::collections::HashMap<String, Res> = std::collections::HashMap::new();
+    loop {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(f)) => f,
+            // EOF・I/O エラーは通知なき切断(瞬断・障害) — Frozen へ(FR-014)。
+            Ok(None) | Err(_) => {
+                session.on_disconnect();
+                return StreamEnd::Disconnected;
+            }
+        };
+        match frame.message {
+            Message::Res { event } => {
+                if let Some(res) = verify_res(&event) {
+                    pending.insert(res.event_id.clone(), res);
+                }
+            }
+            Message::Order { event } => match verify_order(&event, &config.board_id) {
+                Some(order) => {
+                    let resolve = |eid: &str| pending.get(eid).cloned();
+                    match session.apply_order(&order, resolve) {
+                        Ok(()) => {}
+                        Err(SyncError::SeqGap { .. }) => {
+                            let req = Message::ResendReq {
+                                from_seq: session.since_seq() + 1,
+                                to_seq: order.seq,
+                            };
+                            let _ = write_frame(&mut writer, &req).await;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                None => self_log(config, SecurityCategory::LivechatOrderInvalid),
+            },
+            Message::Settings { .. } => {}
+            Message::NextThread { generation, key } => {
+                session.apply_next_thread(generation, key, config.res_limit);
+                pending.clear();
+            }
+            Message::ThreadClose { .. } => {
+                session.apply_close();
+                return StreamEnd::Closed;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// ハンドシェイクのみ行い、joined 済みセッションと分割ソケットを返す(T048 — 再接続用)。
+///
+/// [`handshake_join`] の薄いラッパ。呼び出し側([`run_forever`])が
+/// [`stream_until_disconnect`] と組み合わせて「接続 → 継続受信 → 切断 → 再接続」の
+/// ループを回すために公開する。
+async fn connect_and_handshake(
+    config: &ParticipantConfig,
+    since_seq: u32,
+) -> Result<
+    (
+        ParticipantSession,
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
+    ),
+    JoinResult,
+> {
+    let stream = TcpStream::connect(&config.host_addr)
+        .await
+        .map_err(|_| JoinResult::Transport)?;
+    let (mut reader, mut writer) = stream.into_split();
+    let session = handshake_join(config, since_seq, &mut reader, &mut writer).await?;
+    Ok((session, reader, writer))
+}
+
+/// 明示操作(スレを開く)を起点に、接続 → 継続受信 → 凍結 → バックオフ再接続 を繰り返す
+/// (T048 — FR-014)。
+///
+/// 初回は `since_seq=0` で接続し、以後は [`ParticipantSession::since_seq`] を引き継いで
+/// 再接続する(**同一 gen が継続していれば** `since_seq` からの差分同期で Active へ復帰する
+/// — spec「凍結中の再接続はバックオフ付きで試行され、ホスト再開後の実況は次スレとして
+/// 扱われる」)。`THREAD_REJECT(unknown_thread)`(旧スレが消滅・別世代化した場合)を受けたら
+/// 再接続を諦める([`RejectHandling::GiveUp`] と同格)。
+///
+/// `max_attempts` に達するか、[`StreamEnd::Closed`](T047)・
+/// [`RejectHandling::GiveUp`](旧スレ消滅)に到達したら終了する。戻り値は最終セッション
+/// (呼び出し側が確定列・状態を読む)。
+pub async fn run_forever(
+    config: &ParticipantConfig,
+    max_attempts: u32,
+    sleep_scale: f64,
+) -> (Option<ParticipantSession>, JoinResult) {
+    let mut attempt = 0u32;
+    let mut since_seq = 0u32;
+    let mut last_session: Option<ParticipantSession> = None;
+
+    while attempt < max_attempts {
+        let (mut session, reader, writer) = match connect_and_handshake(config, since_seq).await {
+            Ok(parts) => parts,
+            Err(
+                result @ JoinResult::Rejected {
+                    handling: RejectHandling::GiveUp,
+                    ..
+                },
+            ) => {
+                return (last_session, result);
+            }
+            Err(result @ JoinResult::Closed) => {
+                return (last_session, result);
+            }
+            Err(result) => {
+                // Transport/ChallengeFailed/Backoff/WaitFrozen 系はバックオフして再試行する。
+                let delay =
+                    crate::livechat::session::backoff_delay_secs(attempt) as f64 * sleep_scale;
+                if delay > 0.0 {
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                }
+                attempt += 1;
+                last_session = None;
+                if attempt >= max_attempts {
+                    return (last_session, result);
+                }
+                continue;
+            }
+        };
+
+        // 接続に成功したので試行回数をリセットし、継続受信へ入る。
+        attempt = 0;
+        let end = stream_until_disconnect(config, &mut session, reader, writer).await;
+        since_seq = session.since_seq();
+        match end {
+            StreamEnd::Closed => {
+                return (Some(session), JoinResult::Closed);
+            }
+            StreamEnd::Disconnected => {
+                // Frozen 済み(session.on_disconnect 済み)。バックオフして再接続する。
+                last_session = Some(session);
+                let delay =
+                    crate::livechat::session::backoff_delay_secs(attempt) as f64 * sleep_scale;
+                if delay > 0.0 {
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                }
+                attempt += 1;
+            }
+        }
+    }
+
+    (
+        last_session,
+        JoinResult::Joined {
+            confirmed: Vec::new(),
+        },
+    )
 }
 
 /// 受信 RES(kind 1311)の封筒署名 + 形式を検証してドメイン Res を作る。

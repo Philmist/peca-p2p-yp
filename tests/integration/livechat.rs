@@ -19,7 +19,7 @@ mod mock_peer;
 
 use std::time::Duration;
 
-use nostr::Keys;
+use nostr::{JsonUtil, Keys};
 
 use livechat_host::LivechatHostNode;
 use mock_peer::TestNode;
@@ -531,5 +531,400 @@ async fn rotated_key_requires_pow_for_first_write_over_real_connection() {
             peca_p2p_yp::livechat::registry::AcceptOutcome::Numbered { .. }
         ),
         "PoW を満たせば採番される: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// US5: スレのライフサイクル(次スレ移行・凍結/復帰・明示クローズ・途中参加)
+// ---------------------------------------------------------------------------
+
+/// レス上限到達で次スレへ移行し、旧スレは書き込み不可・新規書き込みは次スレへ採番される
+/// (FR-012/FR-013)。実ノード経由(TCP 接続)で確認する。
+#[tokio::test]
+async fn res_limit_reached_migrates_to_next_thread_over_real_connection() {
+    let host = LivechatHostNode::spawn(0x1201).await;
+    // res_limit を小さくして上限到達を素早く再現する。
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            res_limit: peca_p2p_yp::livechat::thread::RES_LIMIT_MIN,
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let board_key = Keys::generate();
+
+    // res_limit(下限 100)まで書き込みで埋める。thread_write_rate 既定(30 秒窓 4 レス)を
+    // 超えないよう、各書き込みの created_at を 30 秒ずつずらして窓をリセットさせる
+    // (このテストの主眼は移行境界の挙動であり、レート制限自体は別テストの対象)。
+    //
+    // T046: res_no = res_limit の確定と同一の accept_write 呼び出し内で、明示操作なしに
+    // 自動的に次スレへ移行する(FR-013)。手動 start_next_generation は呼ばない。
+    let base = unix_now();
+    for i in 0..peca_p2p_yp::livechat::thread::RES_LIMIT_MIN as u64 {
+        let created_at = base + i * 30;
+        let res = peca_p2p_yp::livechat::registry::sign_res(
+            &board_key,
+            &host.board_id(),
+            &host.channel(),
+            1,
+            &format!("レス{i}"),
+            created_at,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.registry()
+                .accept_write(&host.board_id(), &res, created_at)
+                .unwrap(),
+            peca_p2p_yp::livechat::registry::AcceptOutcome::Numbered { .. }
+        ));
+    }
+
+    // 上限到達の確定と同時に、明示操作なしで世代 2 へ自動移行しているべき(T046)。
+    let new_gen = host
+        .registry()
+        .board_generation(&host.board_id())
+        .expect("開設済みの板");
+    assert_eq!(
+        new_gen, 2,
+        "res_no = res_limit 確定と同時に自動的に次スレへ移行しているべき"
+    );
+
+    // 旧スレ(gen=1)宛の書き込みは移行後は拒否される。
+    let old_gen_res = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &host.board_id(),
+        &host.channel(),
+        1,
+        "移行後の旧世代宛",
+        unix_now(),
+    )
+    .unwrap();
+    assert_eq!(
+        host.registry()
+            .accept_write(&host.board_id(), &old_gen_res, unix_now())
+            .unwrap(),
+        peca_p2p_yp::livechat::registry::AcceptOutcome::Rejected,
+        "旧スレは書き込み不可(FR-012)"
+    );
+
+    // 新スレ(gen=2)宛の書き込みは res_no=1 から採番される。
+    let new_gen_res = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &host.board_id(),
+        &host.channel(),
+        2,
+        "次スレへの投稿",
+        unix_now(),
+    )
+    .unwrap();
+    assert_eq!(
+        host.registry()
+            .accept_write(&host.board_id(), &new_gen_res, unix_now())
+            .unwrap(),
+        peca_p2p_yp::livechat::registry::AcceptOutcome::Numbered { res_no: 1, seq: 1 },
+        "新規書き込みは次スレに採番される"
+    );
+}
+
+/// 明示クローズ → 参加者はスレデータを削除する(FR-014/FR-015)。実ノード経由で確認する。
+#[tokio::test]
+async fn explicit_close_deletes_participant_thread_data_over_real_connection() {
+    let host = LivechatHostNode::spawn(0x1202).await;
+    host.open_thread("実況スレ", no_pow_settings());
+    let board_key = Keys::generate();
+    host.seed_res(&board_key, "クローズ前のレス", unix_now());
+
+    let config = viewer_config(&host);
+    let stream = tokio::net::TcpStream::connect(&config.host_addr)
+        .await
+        .expect("connect");
+    let (reader, writer) = stream.into_split();
+
+    // ハンドシェイクを直接駆動し、joined 済みセッションで継続受信する
+    // (participant::stream_until_disconnect — T048 のドライバを使う)。
+    let challenge = peca_p2p_yp::livechat::session::generate_challenge();
+    let thread = peca_p2p_yp::livechat::thread::Thread::new(
+        &config.board_id,
+        &config.channel,
+        1,
+        1_700_000_000,
+        "実況スレ",
+        1000,
+    );
+    let mut session = peca_p2p_yp::livechat::session::ParticipantSession::new(thread, challenge);
+
+    use peca_p2p_yp::p2p::frame::{Hello, Message, read_frame, write_frame};
+    let (mut reader, mut writer) = (reader, writer);
+    write_frame(
+        &mut writer,
+        &Message::Hello(Hello {
+            version: 1,
+            listen_port: 0,
+            features: vec!["livechat1".into()],
+            nonce: 0xA202,
+            ts: unix_now() as i64,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap().unwrap().message,
+        Message::HelloAck(_)
+    ));
+    write_frame(&mut writer, &session.join_message())
+        .await
+        .unwrap();
+    let welcome = read_frame(&mut reader).await.unwrap().unwrap().message;
+    let Message::ThreadWelcome { sig, .. } = welcome else {
+        panic!("WELCOME を期待: {welcome:?}");
+    };
+    assert_eq!(
+        session.on_welcome(&sig),
+        peca_p2p_yp::livechat::session::WelcomeOutcome::Accepted
+    );
+
+    // ホストが明示クローズする。
+    host.registry()
+        .close_thread(&host.board_id(), unix_now())
+        .expect("close_thread");
+
+    // 参加者は THREAD_CLOSE を受けてスレデータを削除する。
+    let end = peca_p2p_yp::livechat::participant::stream_until_disconnect(
+        &config,
+        &mut session,
+        reader,
+        writer,
+    )
+    .await;
+    assert_eq!(
+        end,
+        peca_p2p_yp::livechat::participant::StreamEnd::Closed,
+        "THREAD_CLOSE を受信して終了する"
+    );
+    assert!(
+        session.confirmed().is_empty(),
+        "スレデータが削除される(FR-015)"
+    );
+    assert_eq!(
+        session.thread_state(),
+        peca_p2p_yp::livechat::thread::ThreadState::Closed
+    );
+}
+
+/// ホストとの通知なき切断(kill 相当)はスレを凍結する。取得済みレスの閲覧は継続し、
+/// 書き込みはできない(FR-014)。
+#[tokio::test]
+async fn host_disconnect_without_close_freezes_thread() {
+    let host = LivechatHostNode::spawn(0x1203).await;
+    host.open_thread("実況スレ", no_pow_settings());
+    let board_key = Keys::generate();
+    host.seed_res(&board_key, "凍結前のレス", unix_now());
+
+    let config = viewer_config(&host);
+    let stream = tokio::net::TcpStream::connect(&config.host_addr)
+        .await
+        .expect("connect");
+    let (reader, writer) = stream.into_split();
+
+    let challenge = peca_p2p_yp::livechat::session::generate_challenge();
+    let thread = peca_p2p_yp::livechat::thread::Thread::new(
+        &config.board_id,
+        &config.channel,
+        1,
+        1_700_000_000,
+        "実況スレ",
+        1000,
+    );
+    let mut session = peca_p2p_yp::livechat::session::ParticipantSession::new(thread, challenge);
+
+    use peca_p2p_yp::p2p::frame::{Hello, Message, read_frame, write_frame};
+    let (mut reader, mut writer) = (reader, writer);
+    write_frame(
+        &mut writer,
+        &Message::Hello(Hello {
+            version: 1,
+            listen_port: 0,
+            features: vec!["livechat1".into()],
+            nonce: 0xA203,
+            ts: unix_now() as i64,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap().unwrap().message,
+        Message::HelloAck(_)
+    ));
+    write_frame(&mut writer, &session.join_message())
+        .await
+        .unwrap();
+    let welcome = read_frame(&mut reader).await.unwrap().unwrap().message;
+    let Message::ThreadWelcome { sig, .. } = welcome else {
+        panic!("WELCOME を期待: {welcome:?}");
+    };
+    assert_eq!(
+        session.on_welcome(&sig),
+        peca_p2p_yp::livechat::session::WelcomeOutcome::Accepted
+    );
+
+    // ホストを能動的に kill する(明示クローズなしの切断 = 通知なき切断)。
+    drop(host);
+
+    let end = peca_p2p_yp::livechat::participant::stream_until_disconnect(
+        &config,
+        &mut session,
+        reader,
+        writer,
+    )
+    .await;
+    assert_eq!(
+        end,
+        peca_p2p_yp::livechat::participant::StreamEnd::Disconnected,
+        "通知なき切断は Disconnected として扱われる"
+    );
+    assert_eq!(
+        session.thread_state(),
+        peca_p2p_yp::livechat::thread::ThreadState::Frozen,
+        "凍結される(FR-014)"
+    );
+    assert!(
+        !session.confirmed().is_empty(),
+        "取得済みレスの閲覧は継続できる"
+    );
+}
+
+/// 500 レス進行済みのスレへ途中参加すると、全レスが確定順序どおりに取得・表示される。
+#[tokio::test]
+async fn late_joiner_syncs_all_existing_res_in_order() {
+    let host = LivechatHostNode::spawn(0x1204).await;
+    host.open_thread("実況スレ", no_pow_settings());
+    let board_key = Keys::generate();
+    for i in 0..500u64 {
+        host.seed_res(&board_key, &format!("レス{i}"), 1_700_000_000 + i);
+    }
+
+    let config = viewer_config(&host);
+    let result = connect_once(&config, 0).await;
+    match result {
+        JoinResult::Joined { confirmed } => {
+            assert_eq!(confirmed.len(), 500, "500 レスすべてが同期される");
+            let res_nos: Vec<u16> = confirmed.iter().filter_map(|r| r.res_no).collect();
+            let expected: Vec<u16> = (1..=500).collect();
+            assert_eq!(res_nos, expected, "確定順序どおりの res_no で取得される");
+        }
+        other => panic!("joined すべき: {other:?}"),
+    }
+}
+
+/// SC-003: 4000 レス済みスレへの途中参加が 15 秒以内に全ログ同期を終える(負荷プロファイル)。
+///
+/// 既存 SC-001 の扱い(#[ignore] 付き負荷プロファイル)に合わせる — 通常の `cargo test` では
+/// 走らず、`cargo test -- --ignored` で明示的に実行する。
+///
+/// `connect_once`([`drive`])はアイドル打ち切り(500ms)で「初回同期のバッチ」を打ち切る
+/// US1 向けの設計のため、4000 件同期には短すぎる。本テストはハンドシェイクを直接駆動し、
+/// 確定数が 4000 に達するまで受信を続ける(継続受信ループ相当)ことで、SC-003 が求める
+/// 「15 秒以内に全ログ同期」を実測する。
+#[tokio::test]
+#[ignore]
+async fn sc003_late_joiner_syncs_4000_res_within_15_seconds() {
+    let host = LivechatHostNode::spawn(0x1205).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            res_limit: peca_p2p_yp::livechat::thread::RES_LIMIT_MAX,
+            ..no_pow_settings()
+        },
+    );
+    let board_key = Keys::generate();
+    for i in 0..4000u64 {
+        host.seed_res(&board_key, &format!("レス{i}"), 1_700_000_000 + i);
+    }
+
+    let config = viewer_config(&host);
+    let stream = tokio::net::TcpStream::connect(&config.host_addr)
+        .await
+        .expect("connect");
+    let (mut reader, mut writer) = stream.into_split();
+
+    use peca_p2p_yp::p2p::frame::{Hello, Message, read_frame, write_frame};
+    let start = std::time::Instant::now();
+    write_frame(
+        &mut writer,
+        &Message::Hello(Hello {
+            version: 1,
+            listen_port: 0,
+            features: vec!["livechat1".into()],
+            nonce: 0xA205,
+            ts: unix_now() as i64,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap().unwrap().message,
+        Message::HelloAck(_)
+    ));
+
+    let challenge = peca_p2p_yp::livechat::session::generate_challenge();
+    let thread = peca_p2p_yp::livechat::thread::Thread::new(
+        &config.board_id,
+        &config.channel,
+        1,
+        1_700_000_000,
+        "実況スレ",
+        peca_p2p_yp::livechat::thread::RES_LIMIT_MAX,
+    );
+    let mut session = peca_p2p_yp::livechat::session::ParticipantSession::new(thread, challenge);
+    write_frame(&mut writer, &session.join_message())
+        .await
+        .unwrap();
+    let welcome = read_frame(&mut reader).await.unwrap().unwrap().message;
+    let Message::ThreadWelcome { sig, .. } = welcome else {
+        panic!("WELCOME を期待: {welcome:?}");
+    };
+    assert_eq!(
+        session.on_welcome(&sig),
+        peca_p2p_yp::livechat::session::WelcomeOutcome::Accepted
+    );
+
+    // 確定数が 4000 に達するまで受信を続ける(全ログ同期の完了検知)。
+    let mut pending: std::collections::HashMap<String, peca_p2p_yp::livechat::thread::Res> =
+        std::collections::HashMap::new();
+    while session.confirmed().len() < 4000 {
+        let frame = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut reader))
+            .await
+            .expect("15 秒以内に同期フレームが届くべき(SC-003)")
+            .unwrap()
+            .expect("接続が維持されているべき");
+        match frame.message {
+            Message::Res { event } => {
+                let raw = event.to_string();
+                let ev = nostr::Event::from_json(&raw).unwrap();
+                let env = peca_p2p_yp::event::livechat::Res::from_event(&ev).unwrap();
+                let res = peca_p2p_yp::livechat::session::res_from_event(&env, &ev);
+                pending.insert(res.event_id.clone(), res);
+            }
+            Message::Order { event } => {
+                let raw = event.to_string();
+                let ev = nostr::Event::from_json(&raw).unwrap();
+                let order = peca_p2p_yp::event::livechat::OrderInfo::from_event(&ev).unwrap();
+                let resolve = |eid: &str| pending.get(eid).cloned();
+                session.apply_order(&order, resolve).expect("apply_order");
+            }
+            _ => {}
+        }
+    }
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        session.confirmed().len(),
+        4000,
+        "4000 レスすべてが同期される"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(15),
+        "SC-003: 4000 レス同期は 15 秒以内に完了すべき(実測 {elapsed:?})"
     );
 }

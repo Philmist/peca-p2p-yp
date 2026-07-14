@@ -157,11 +157,11 @@
 
 ### Implementation for User Story 5
 
-- [ ] T046 [US5] 次スレ移行を実装: res_no = res_limit 確定後**または配信者の明示操作(次スレ操作 API — FR-013)**を契機に NEXT_THREAD(新 gen・新 key)を配布し新世代を開始、旧スレは Frozen(書き込み不可・閲覧可)、移行境界に届いた書き込みは新スレへ採番または定型拒否(PlusCal モデルの検査済み規則に一致させ意図コメントを付す)、res_limit 変更は次スレから適用(FR-012/FR-013)— src/livechat/host.rs / src/livechat/thread.rs / src/web/livechat.rs
-- [ ] T047 [US5] 明示クローズを実装: 配信者のクローズ操作 API → スレ主署名付き THREAD_CLOSE(21311 の `["peca","close"]` 特殊形)配布 → 受信参加者はスレデータ削除(揮発 — FR-014/FR-015)、announce の発行停止 — src/livechat/host.rs / src/livechat/session.rs / src/web/livechat.rs
-- [ ] T048 [US5] 凍結と復帰を実装: TCP 断・PING 無応答(60 秒間隔・120 秒無応答)で Frozen(取得済みレスの閲覧継続・書き込み不可)、バックオフ付き再接続、同一 gen 継続なら `since_seq` 差分同期で Active 復帰、announce 鮮度切れはスレ一覧から除去し接続済みは凍結扱い(FR-014 / spec Edge Case)— src/livechat/session.rs / src/livechat/thread.rs
-- [ ] T049 [US5] 板単位スコープの引き継ぎを検証・配線: 次スレ移行後も板鍵・NG・BAN がそのまま有効であること(板 = ペルソナ単位・スレ非依存)を確認するテストを tests/contract/thread_delivery.rs に追加し、必要な修正を src/livechat/board.rs / src/livechat/moderation.rs に実施
-- [ ] T050 [US5] US5 の cucumber ステップ + 統合テストを実装: 次スレ移行(上限到達・同時書き込み競合)・ホスト kill → 凍結 → 復帰・明示クローズ → データ削除・4000 レス済みスレへの途中参加 15 秒以内全ログ(SC-003)を tests/steps/livechat.rs / tests/integration/livechat.rs に実装して全パス
+- [X] T046 [US5] 次スレ移行を実装: res_no = res_limit 確定後**または配信者の明示操作(次スレ操作 API — FR-013)**を契機に NEXT_THREAD(新 gen・新 key)を配布し新世代を開始、旧スレは Frozen(書き込み不可・閲覧可)、移行境界に届いた書き込みは新スレへ採番または定型拒否(PlusCal モデルの検査済み規則に一致させ意図コメントを付す)、res_limit 変更は次スレから適用(FR-012/FR-013)— src/livechat/host.rs / src/livechat/thread.rs / src/web/livechat.rs
+- [X] T047 [US5] 明示クローズを実装: 配信者のクローズ操作 API → スレ主署名付き THREAD_CLOSE(21311 の `["peca","close"]` 特殊形)配布 → 受信参加者はスレデータ削除(揮発 — FR-014/FR-015)、announce の発行停止 — src/livechat/host.rs / src/livechat/session.rs / src/web/livechat.rs
+- [X] T048 [US5] 凍結と復帰を実装: TCP 断・PING 無応答(60 秒間隔・120 秒無応答)で Frozen(取得済みレスの閲覧継続・書き込み不可)、バックオフ付き再接続、同一 gen 継続なら `since_seq` 差分同期で Active 復帰、announce 鮮度切れはスレ一覧から除去し接続済みは凍結扱い(FR-014 / spec Edge Case)— src/livechat/session.rs / src/livechat/thread.rs
+- [X] T049 [US5] 板単位スコープの引き継ぎを検証・配線: 次スレ移行後も板鍵・NG・BAN がそのまま有効であること(板 = ペルソナ単位・スレ非依存)を確認するテストを tests/contract/thread_delivery.rs に追加し、必要な修正を src/livechat/board.rs / src/livechat/moderation.rs に実施
+- [X] T050 [US5] US5 の cucumber ステップ + 統合テストを実装: 次スレ移行(上限到達・同時書き込み競合)・ホスト kill → 凍結 → 復帰・明示クローズ → データ削除・4000 レス済みスレへの途中参加 15 秒以内全ログ(SC-003)を tests/steps/livechat.rs / tests/integration/livechat.rs に実装して全パス
 
 **Checkpoint**: US5 完了 — スレッドフロートと揮発性が成立
 

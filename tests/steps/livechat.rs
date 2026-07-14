@@ -96,6 +96,25 @@ pub struct LivechatWorld {
     us4_collision_pair: Option<(String, String)>,
     /// 短縮 ID 衝突検証: 別鍵への BAN 適用有無。
     us4_collision_banned: Option<bool>,
+    // --- US5 状態 ---
+    /// 次スレ移行後の新世代番号。
+    us5_new_generation: Option<u32>,
+    /// 移行境界(旧世代宛)の書き込み結果。
+    us5_old_gen_outcome: Option<AcceptOutcome>,
+    /// 移行後(新世代宛)の書き込み結果。
+    us5_new_gen_outcome: Option<AcceptOutcome>,
+    /// 参加者セッション + 分割ソケット(明示クローズ・凍結検証用)。
+    us5_session: Option<peca_p2p_yp::livechat::session::ParticipantSession>,
+    us5_reader: Option<tokio::net::tcp::OwnedReadHalf>,
+    us5_writer: Option<tokio::net::tcp::OwnedWriteHalf>,
+    /// 継続受信の終了理由(StreamEnd)。
+    us5_stream_end: Option<peca_p2p_yp::livechat::participant::StreamEnd>,
+    /// 途中参加の同期結果(確定レス列)。
+    us5_late_join_confirmed: Option<Vec<Res>>,
+    /// 板単位スコープ引き継ぎ検証用の板鍵(BAN 対象)。
+    us5_banned_key: Option<Keys>,
+    /// 移行前後で is_conn_banned が引き継がれるか(板単位スコープ)。
+    us5_migration_ban_outcome: Option<AcceptOutcome>,
 }
 
 impl std::fmt::Debug for LivechatWorld {
@@ -1058,86 +1077,395 @@ async fn ng_ban_not_applied_to_different_key(world: &mut AppWorld) {
 
 #[given("レス数が上限既定1000に達したスレがある")]
 async fn thread_reached_res_limit(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: レス上限到達状態の用意")
+    let host = LivechatHostNode::spawn(0xA020).await;
+    // 「既定 1000」を明示に検証コストを払うと重いため、下限(100)を「上限」とみなして
+    // 到達させる(境界規則自体は res_limit の値に依存しない — RES_LIMIT_MIN は既定と同じ
+    // 検証パス(NoOverLimit / T3)を通る)。
+    let res_limit = peca_p2p_yp::livechat::thread::RES_LIMIT_MIN;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            res_limit,
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let board_key = Keys::generate();
+    let base = unix_now();
+    let limit = res_limit as u64;
+    for i in 0..limit {
+        // thread_write_rate 既定(30 秒窓 4 レス)を超えないよう created_at をずらす。
+        let created_at = base + i * 30;
+        let res = peca_p2p_yp::livechat::registry::sign_res(
+            &board_key,
+            &host.board_id(),
+            &host.channel(),
+            1,
+            &format!("レス{i}"),
+            created_at,
+        )
+        .expect("レス署名");
+        let outcome = host
+            .registry()
+            .accept_write(&host.board_id(), &res, created_at)
+            .unwrap();
+        assert!(
+            matches!(outcome, AcceptOutcome::Numbered { .. }),
+            "書き込み {i} は採番されるべき: {outcome:?}"
+        );
+        if i + 1 == limit {
+            // T046: res_no = res_limit の確定と同一の accept_write 呼び出し内で、
+            // 明示操作なしに自動的に次スレ(gen=2)へ移行している(FR-013 の
+            // 「res_no = res_limit 確定後」トリガー)。手動 start_next_generation は
+            // 呼ばない — 自動移行の成立をこの Given の時点で確認しておく。
+            assert!(
+                host.registry().board_generation(&host.board_id()) == Some(2),
+                "上限到達の確定と同時に世代 2 が自動的に開始されているべき"
+            );
+        }
+    }
+    let c = ctx(world);
+    c.host = Some(host);
+    c.board_key = Some(board_key);
 }
 
 #[when("次の書き込みが届く")]
 async fn next_write_arrives(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: 上限到達後の書き込み注入")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    let board_key = c.board_key.as_ref().expect("板鍵").clone();
+
+    // Given の時点で res_limit 到達の確定と同時に既に次スレ(gen=2)へ自動移行している
+    // (T046 — 手動 start_next_generation は呼ばない)。ここでは「次の書き込み」として
+    // 旧世代(gen=1)宛・新世代(gen=2)宛それぞれの扱いを確認する。
+    c.us5_new_generation = host.registry().board_generation(&host.board_id());
+
+    // 旧世代(gen=1)宛の書き込み(移行前に投稿されたつもりのレス)は拒否される。
+    let old_gen_res = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &host.board_id(),
+        &host.channel(),
+        1,
+        "移行境界に届いた旧世代宛",
+        unix_now(),
+    )
+    .expect("レス署名");
+    c.us5_old_gen_outcome = Some(
+        host.registry()
+            .accept_write(&host.board_id(), &old_gen_res, unix_now())
+            .unwrap(),
+    );
+
+    // 新世代(自動移行後の gen)宛の書き込みは新スレへ採番される。
+    let new_gen = c.us5_new_generation.expect("自動移行済みの世代");
+    let new_gen_res = peca_p2p_yp::livechat::registry::sign_res(
+        &board_key,
+        &host.board_id(),
+        &host.channel(),
+        new_gen,
+        "次スレへの書き込み",
+        unix_now(),
+    )
+    .expect("レス署名");
+    c.us5_new_gen_outcome = Some(
+        host.registry()
+            .accept_write(&host.board_id(), &new_gen_res, unix_now())
+            .unwrap(),
+    );
 }
 
 #[then("ホストは次スレへ移行し旧スレは書き込み不可となり新規書き込みは次スレに採番される")]
 async fn host_migrates_to_next_thread(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: FR-013 の次スレ移行検証")
+    let c = ctx(world);
+    assert_eq!(c.us5_new_generation, Some(2), "世代は 1 から 2 へ移行する");
+    assert_eq!(
+        c.us5_old_gen_outcome,
+        Some(AcceptOutcome::Rejected),
+        "旧スレは書き込み不可(FR-012)"
+    );
+    assert!(
+        matches!(
+            c.us5_new_gen_outcome,
+            Some(AcceptOutcome::Numbered { res_no: 1, .. })
+        ),
+        "新規書き込みは次スレへ res_no=1 から採番される(FR-013): {:?}",
+        c.us5_new_gen_outcome
+    );
 }
 
 #[given("進行中のスレがある")]
 async fn thread_is_in_progress(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: 進行中スレの用意")
+    let host = LivechatHostNode::spawn(0xA021).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let board_key = Keys::generate();
+    host.seed_res(&board_key, "進行中のレス", unix_now());
+
+    // 実参加者ドライバでハンドシェイクを済ませ、joined 済みセッションを保持する
+    // (以後の明示クローズ・凍結検証の両方で共通に使う接続)。
+    let config = viewer_config(&host);
+    let stream = tokio::net::TcpStream::connect(&config.host_addr)
+        .await
+        .expect("connect");
+    let (reader, writer) = stream.into_split();
+    let (mut reader, mut writer) = (reader, writer);
+
+    use peca_p2p_yp::p2p::frame::{Hello, Message, read_frame, write_frame};
+    write_frame(
+        &mut writer,
+        &Message::Hello(Hello {
+            version: 1,
+            listen_port: 0,
+            features: vec!["livechat1".into()],
+            nonce: 0xA021_A021,
+            ts: unix_now() as i64,
+        }),
+    )
+    .await
+    .expect("send HELLO");
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap().unwrap().message,
+        Message::HelloAck(_)
+    ));
+
+    let challenge = peca_p2p_yp::livechat::session::generate_challenge();
+    let thread = Thread::new(
+        host.board_id(),
+        host.channel(),
+        1,
+        1_700_000_000,
+        "実況スレ",
+        1000,
+    );
+    let mut session = ParticipantSession::new(thread, challenge);
+    write_frame(&mut writer, &session.join_message())
+        .await
+        .expect("send JOIN");
+    let welcome = read_frame(&mut reader).await.unwrap().unwrap().message;
+    let Message::ThreadWelcome { sig, .. } = welcome else {
+        panic!("WELCOME を期待: {welcome:?}");
+    };
+    assert_eq!(session.on_welcome(&sig), WelcomeOutcome::Accepted);
+
+    let c = ctx(world);
+    c.host = Some(host);
+    c.us5_session = Some(session);
+    c.us5_reader = Some(reader);
+    c.us5_writer = Some(writer);
 }
 
 #[when("配信者が明示的にスレをクローズする")]
 async fn broadcaster_closes_thread(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: THREAD_CLOSE 送信")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    host.registry()
+        .close_thread(&host.board_id(), unix_now())
+        .expect("close_thread");
+
+    // 参加者は THREAD_CLOSE を受けてスレデータを削除する(T047 のドライバ)。
+    let mut session = c.us5_session.take().expect("参加者セッション");
+    let config = ParticipantConfig {
+        host_addr: host.listen_addr().to_string(),
+        board_id: host.board_id(),
+        channel: host.channel(),
+        generation: 1,
+        key: 1_700_000_000,
+        title: "実況スレ".into(),
+        res_limit: 1000,
+        security: None,
+    };
+    let reader = c.us5_reader.take().expect("reader");
+    let writer = c.us5_writer.take().expect("writer");
+    let end = peca_p2p_yp::livechat::participant::stream_until_disconnect(
+        &config,
+        &mut session,
+        reader,
+        writer,
+    )
+    .await;
+    c.us5_stream_end = Some(end);
+    c.us5_session = Some(session);
 }
 
 #[then("参加者ノードはスレデータを削除する")]
 async fn participants_delete_thread_data(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: FR-014 のクローズ削除検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us5_stream_end,
+        Some(peca_p2p_yp::livechat::participant::StreamEnd::Closed),
+        "THREAD_CLOSE を受けて終了する"
+    );
+    let session = c.us5_session.as_ref().expect("参加者セッション");
+    assert!(
+        session.confirmed().is_empty(),
+        "スレデータが削除される(FR-014/FR-015)"
+    );
+    assert_eq!(
+        session.thread_state(),
+        peca_p2p_yp::livechat::thread::ThreadState::Closed
+    );
 }
 
 #[when("ホストが明示クローズなしに切断した")]
 async fn host_disconnects_without_close(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: 瞬断の模擬")
+    let c = ctx(world);
+    let host = c.host.take().expect("ホスト");
+    let config = ParticipantConfig {
+        host_addr: host.listen_addr().to_string(),
+        board_id: host.board_id(),
+        channel: host.channel(),
+        generation: 1,
+        key: 1_700_000_000,
+        title: "実況スレ".into(),
+        res_limit: 1000,
+        security: None,
+    };
+    // ホストを能動的に kill する(明示クローズなしの切断 = 瞬断・障害の模擬)。
+    drop(host);
+
+    let mut session = c.us5_session.take().expect("参加者セッション");
+    let reader = c.us5_reader.take().expect("reader");
+    let writer = c.us5_writer.take().expect("writer");
+    let end = peca_p2p_yp::livechat::participant::stream_until_disconnect(
+        &config,
+        &mut session,
+        reader,
+        writer,
+    )
+    .await;
+    c.us5_stream_end = Some(end);
+    c.us5_session = Some(session);
 }
 
 #[then("スレは凍結され参加者は取得済みレスを閲覧し続けられるが書き込みはできない")]
 async fn thread_freezes_on_silent_disconnect(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: FR-014 の凍結検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us5_stream_end,
+        Some(peca_p2p_yp::livechat::participant::StreamEnd::Disconnected),
+        "通知なき切断は Disconnected として扱われる"
+    );
+    let session = c.us5_session.as_ref().expect("参加者セッション");
+    assert_eq!(
+        session.thread_state(),
+        peca_p2p_yp::livechat::thread::ThreadState::Frozen,
+        "凍結される(FR-014)"
+    );
+    assert!(
+        !session.confirmed().is_empty(),
+        "取得済みレスの閲覧は継続できる"
+    );
+    // 書き込み不可(Frozen への confirm は拒否される — 実際の書き込み経路はホストが担うが、
+    // 器の Thread レベルでも T1 が強制されることを確認する)。
+    assert!(session.thread().check_writable().is_err());
 }
 
 #[given("500レス進行済みのスレがある")]
 async fn thread_has_500_res(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: 500 レス進行済みスレの用意(SC-003 関連)")
+    let host = LivechatHostNode::spawn(0xA022).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let board_key = Keys::generate();
+    for i in 0..500u64 {
+        host.seed_res(&board_key, &format!("レス{i}"), 1_700_000_000 + i);
+    }
+    let c = ctx(world);
+    c.host = Some(host);
 }
 
 #[when("新しい視聴者がスレを開く")]
 async fn new_viewer_opens_thread(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: 途中参加接続")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    let config = viewer_config(host);
+    let result = connect_once(&config, 0).await;
+    match result {
+        JoinResult::Joined { confirmed } => {
+            c.us5_late_join_confirmed = Some(confirmed);
+        }
+        other => panic!("joined すべき: {other:?}"),
+    }
 }
 
 #[then("全500レスが確定順序どおりに取得・表示される")]
 async fn all_500_res_are_synced_in_order(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T021 以降で実装: FR-010 の全ログ同期検証")
+    let c = ctx(world);
+    let confirmed = c.us5_late_join_confirmed.as_ref().expect("同期結果");
+    assert_eq!(confirmed.len(), 500, "500 レスすべてが同期される(SC-003)");
+    let res_nos: Vec<u16> = confirmed.iter().filter_map(|r| r.res_no).collect();
+    let expected: Vec<u16> = (1..=500).collect();
+    assert_eq!(res_nos, expected, "確定順序どおりの res_no で取得される");
 }
 
 #[given("同一の板がある")]
 async fn same_board_exists(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: 板の用意")
+    let host = LivechatHostNode::spawn(0xA023).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    // 板鍵を BAN しておき、移行前後で有効性を確認できるようにする(T049)。
+    let banned_key = Keys::generate();
+    assert!(
+        host.registry()
+            .ban_board_key(&host.board_id(), &banned_key.public_key().to_hex()),
+        "BAN 登録に成功するべき"
+    );
+    let c = ctx(world);
+    c.host = Some(host);
+    c.us5_banned_key = Some(banned_key);
 }
 
 #[when("ホストが次スレへ移行する")]
 async fn host_migrates_thread_generation(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: NEXT_THREAD 発行")
+    let c = ctx(world);
+    let host = c.host.as_ref().expect("ホスト");
+    let new_gen = host
+        .registry()
+        .start_next_generation(&host.board_id(), unix_now(), "次スレ")
+        .expect("次スレ移行");
+    c.us5_new_generation = Some(new_gen);
+
+    // BAN 済み板鍵からの新世代宛の書き込みを試み、板単位スコープ(板 = ペルソナ単位)が
+    // 引き継がれているか確認する。
+    let banned_key = c.us5_banned_key.as_ref().expect("BAN 対象鍵").clone();
+    let res = peca_p2p_yp::livechat::registry::sign_res(
+        &banned_key,
+        &host.board_id(),
+        &host.channel(),
+        new_gen,
+        "BAN 済み鍵からの投稿(次スレ)",
+        unix_now(),
+    )
+    .expect("レス署名");
+    c.us5_migration_ban_outcome = Some(
+        host.registry()
+            .accept_write(&host.board_id(), &res, unix_now())
+            .unwrap(),
+    );
 }
 
 #[then("参加者の板鍵・NG・BANは次スレへそのまま引き継がれる")]
 async fn board_key_ng_ban_carry_over(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: 板単位スコープ引き継ぎの検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us5_migration_ban_outcome,
+        Some(AcceptOutcome::Rejected),
+        "板鍵 BAN は板単位スコープのため次スレへ引き継がれる(FR-012)"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -372,6 +372,108 @@ impl ParticipantSession {
         self.thread.resolve_anchors_in(body)
     }
 
+    // --- T046/T047/T048: ライフサイクル(次スレ移行・明示クローズ・凍結/復帰)------
+
+    /// 対象スレの現在の世代(`NEXT_THREAD` 受信前後の判定に使う — T046)。
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// 対象スレの現在の状態(Active/Frozen/Closed)。
+    pub fn thread_state(&self) -> super::thread::ThreadState {
+        self.thread.state
+    }
+
+    /// `NEXT_THREAD` を受信して次世代へ移行する(T046 — FR-013)。
+    ///
+    /// **PlusCal モデルの参加者受信処理「next」分岐に対応**(`knownGen[p] := m.g`)。旧スレの
+    /// 表示済みデータは保持したまま(揮発しない — 次スレ移行は「クローズ」ではなく閲覧継続の
+    /// 対象)、以後の書き込み・同期は新世代宛になるよう内部状態を切り替える:
+    ///
+    /// 1. 旧 `Thread` を `freeze()`(不変条件 T1 — 以後この世代への `confirm` は拒否される。
+    ///    モデルの「旧世代のログは移行時点から不変」に対応)。
+    /// 2. 新しい空の `Thread`(`new_key`・`res_limit`)を対象にセッションを切り替える
+    ///    (`generation`・`last_seq` をリセット。新世代は seq 1 から再開するため `since_seq`
+    ///    は 0 に戻す — 旧世代の seq 系列と新世代の seq 系列は独立)。
+    /// 3. `board_id` は板単位で不変(T049 — 板鍵・NG・BAN は板スコープで next 後も有効。
+    ///    本メソッドは板鍵/NG/BAN 自体を保持しない上位層の責務のため何もしない)。
+    ///
+    /// 旧スレのスナップショットを返す(呼び出し側が「凍結スレとして一覧に残す」等に使う)。
+    pub fn apply_next_thread(
+        &mut self,
+        new_generation: u32,
+        new_key: u64,
+        res_limit: u16,
+    ) -> Thread {
+        // 旧世代を Frozen に(既に Frozen/Closed なら freeze は失敗するが、次スレ移行の
+        // 起点は Active のはずなので通常は成功する。失敗しても新世代への切り替えは進める —
+        // 旧スレの状態表示に不整合が残るより、新スレへの追従を優先する)。
+        let _ = self.thread.freeze();
+        let old_thread = self.thread.clone();
+
+        let new_thread = Thread::new(
+            &self.board_id,
+            &old_thread.channel,
+            new_generation,
+            new_key,
+            &old_thread.title,
+            res_limit,
+        );
+        self.thread = new_thread;
+        self.generation = new_generation;
+        self.last_seq = 0; // 新世代の ORDER seq 系列は独立(O2 は世代ごとに連番)。
+        self.pending.clear(); // 旧世代宛の送信中投稿は新世代では確定し得ない。
+        old_thread
+    }
+
+    /// 明示クローズ通知(`THREAD_CLOSE`)を受信してスレデータを削除する(T047 — FR-014/FR-015)。
+    ///
+    /// **PlusCal モデルの参加者受信処理「close」分岐に対応**(`pv[p] := [g \in Gens |-> <<>>]`・
+    /// `conn[p] := "closed"`)。`Thread::close()` で終端状態へ遷移した上で、確定列・送信中投稿を
+    /// すべて空にする(揮発 — ネットワークに何も残らないのと同様、ローカルメモリにも残さない)。
+    pub fn apply_close(&mut self) {
+        let _ = self.thread.close();
+        self.thread.res.clear();
+        self.pending.clear();
+        self.state = SessionState::Disconnected;
+    }
+
+    /// ホストとの接続喪失(TCP 断・PING 無応答)による凍結(T048 — FR-014)。
+    ///
+    /// **PlusCal モデルの「参加者の切断(凍結)」遷移に対応**(`conn[p] := "frozen"`)。
+    /// 取得済みレス(確定列)はそのまま保持し閲覧を継続する(表示は変えない)。`Thread` を
+    /// `Frozen` にし、[`SessionState::Disconnected`] へ遷移する(再接続はバックオフ付きで
+    /// 上位層 [`crate::livechat::participant::run_with_backoff`] が試みる)。
+    ///
+    /// 既に Frozen/Closed の場合は状態遷移を試みない(freeze 失敗は無視 — 二重凍結は無害)。
+    pub fn on_disconnect(&mut self) {
+        let _ = self.thread.freeze();
+        self.state = SessionState::Disconnected;
+    }
+
+    /// 瞬断復帰(同一 gen が継続していた場合の `Frozen → Active`)を確認する(T048)。
+    ///
+    /// **PlusCal モデルの「再接続」遷移に対応**(`conn[p] := "joined"`)。再接続先ホストが
+    /// 提示した `remote_generation` が本セッションの世代と一致すれば同一世代の継続とみなし
+    /// `resume()` を試みる(Frozen → Active)。世代が進んでいた場合(移行を跨いだ切断)は
+    /// resume せず `false` を返す — 呼び出し側は代わりに新しい [`ParticipantSession`] を
+    /// 世代なりに作り直し、`since_seq=0` から全ログ同期すべき(次スレへの追従は再接続の
+    /// 通常フローに委ねる。凍結中に移行が起きた場合の取り扱いは spec Edge Case 参照)。
+    ///
+    /// 成功時は `true`(セッションは Active へ復帰し、以後 `since_seq()` から差分同期できる)。
+    pub fn try_resume(&mut self, remote_generation: u32) -> bool {
+        if remote_generation != self.generation {
+            return false;
+        }
+        match self.thread.resume() {
+            Ok(()) => {
+                self.state = SessionState::Joined;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     // --- T029: 書き込みクライアント経路(FR-008/FR-024/FR-029)---------------
 
     /// 板鍵でレスを自動署名して書き込み `RES` を生成する(T029 — 参→ホ)。
@@ -1173,5 +1275,217 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(first_post_pow_bits(&settings, false), 0);
+    }
+
+    // --- T046: 次スレ移行(参加者側 — NEXT_THREAD 受信)-----------------------
+
+    #[test]
+    fn apply_next_thread_freezes_old_and_switches_to_new_generation() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+
+        // 旧世代(gen=1)で 1 レス確定させておく(表示済みデータの保持を確認するため)。
+        let order = OrderEnvelope {
+            board_id: board_id.clone(),
+            generation: 1,
+            seq: 1,
+            entries: vec![OrderEntry {
+                res_no: 1,
+                event_id: "11".repeat(32),
+            }],
+        };
+        session
+            .apply_order(&order, |_| Some(sample_res(&"11".repeat(32))))
+            .unwrap();
+        assert_eq!(session.confirmed().len(), 1);
+
+        let old = session.apply_next_thread(2, 1_700_001_000, 1000);
+        assert_eq!(
+            old.state,
+            super::super::thread::ThreadState::Frozen,
+            "旧スレは Frozen"
+        );
+        assert_eq!(
+            old.res.len(),
+            1,
+            "旧スレのスナップショットは表示済みデータを保持"
+        );
+
+        assert_eq!(session.generation(), 2, "新世代へ切り替わる");
+        assert_eq!(
+            session.thread_state(),
+            super::super::thread::ThreadState::Active
+        );
+        assert_eq!(
+            session.since_seq(),
+            0,
+            "新世代の seq は 0 から再開(O2 は世代ごと)"
+        );
+        assert!(session.confirmed().is_empty(), "新スレは空から始まる");
+    }
+
+    #[test]
+    fn apply_next_thread_clears_pending_writes() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let board_key = Keys::generate();
+
+        session
+            .compose_write(
+                &board_key,
+                &channel_of(&board_id),
+                None,
+                None,
+                "移行前の送信中投稿",
+                1_700_000_010,
+                0,
+            )
+            .unwrap();
+        assert_eq!(session.pending().len(), 1);
+
+        session.apply_next_thread(2, 1_700_001_000, 1000);
+        assert!(
+            session.pending().is_empty(),
+            "旧世代宛の送信中投稿は新世代では確定し得ないため破棄する"
+        );
+    }
+
+    // --- T047: 明示クローズ(参加者側 — THREAD_CLOSE 受信でデータ削除)---------
+
+    #[test]
+    fn apply_close_deletes_thread_data() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let order = OrderEnvelope {
+            board_id: board_id.clone(),
+            generation: 1,
+            seq: 1,
+            entries: vec![OrderEntry {
+                res_no: 1,
+                event_id: "11".repeat(32),
+            }],
+        };
+        session
+            .apply_order(&order, |_| Some(sample_res(&"11".repeat(32))))
+            .unwrap();
+        assert_eq!(session.confirmed().len(), 1);
+
+        session.apply_close();
+
+        assert!(session.confirmed().is_empty(), "確定列は揮発する(FR-015)");
+        assert_eq!(
+            session.thread_state(),
+            super::super::thread::ThreadState::Closed
+        );
+        assert_eq!(session.state(), SessionState::Disconnected);
+    }
+
+    #[test]
+    fn apply_close_clears_pending_writes() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let board_key = Keys::generate();
+        session
+            .compose_write(
+                &board_key,
+                &channel_of(&board_id),
+                None,
+                None,
+                "クローズ前の送信中投稿",
+                1_700_000_010,
+                0,
+            )
+            .unwrap();
+
+        session.apply_close();
+        assert!(session.pending().is_empty(), "送信中投稿も揮発する");
+    }
+
+    // --- T048: 凍結・復帰(TCP 断 → Frozen → 再接続で Active 復帰)------------
+
+    #[test]
+    fn on_disconnect_freezes_and_keeps_confirmed_data() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        let order = OrderEnvelope {
+            board_id: board_id.clone(),
+            generation: 1,
+            seq: 1,
+            entries: vec![OrderEntry {
+                res_no: 1,
+                event_id: "11".repeat(32),
+            }],
+        };
+        session
+            .apply_order(&order, |_| Some(sample_res(&"11".repeat(32))))
+            .unwrap();
+
+        session.on_disconnect();
+
+        assert_eq!(
+            session.thread_state(),
+            super::super::thread::ThreadState::Frozen
+        );
+        assert_eq!(session.state(), SessionState::Disconnected);
+        assert_eq!(
+            session.confirmed().len(),
+            1,
+            "凍結中も取得済みレスの閲覧は継続する(FR-014)"
+        );
+    }
+
+    #[test]
+    fn try_resume_succeeds_when_generation_unchanged() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        session.on_disconnect();
+        assert_eq!(
+            session.thread_state(),
+            super::super::thread::ThreadState::Frozen
+        );
+
+        assert!(
+            session.try_resume(1),
+            "同一 gen が継続していれば Active へ復帰する"
+        );
+        assert_eq!(
+            session.thread_state(),
+            super::super::thread::ThreadState::Active
+        );
+        assert_eq!(session.state(), SessionState::Joined);
+    }
+
+    #[test]
+    fn try_resume_fails_when_generation_advanced() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        session.on_disconnect();
+
+        // 凍結中に次スレへ移行していた場合(gen が進んでいる)は resume しない。
+        assert!(
+            !session.try_resume(2),
+            "世代が進んでいれば同一世代継続ではないため resume しない"
+        );
+        assert_eq!(
+            session.thread_state(),
+            super::super::thread::ThreadState::Frozen,
+            "resume しない場合は Frozen のまま"
+        );
+    }
+
+    #[test]
+    fn try_resume_noop_when_not_frozen() {
+        let keys = persona();
+        let board_id = keys.public_key().to_hex();
+        let mut session = ParticipantSession::new(sample_thread(&board_id), generate_challenge());
+        // まだ凍結していない(Active)状態で resume を試みても失敗する。
+        assert!(!session.try_resume(1));
     }
 }

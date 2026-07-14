@@ -451,6 +451,73 @@ impl OrderInfo {
 }
 
 // ---------------------------------------------------------------------------
+// kind 21311 の特殊形 — 明示クローズ通知(T047 — thread-delivery.md THREAD_CLOSE)
+// ---------------------------------------------------------------------------
+
+/// 明示クローズ通知(kind 21311 の `["peca","close"]` 特殊形)。`content` は空文字列。
+///
+/// [`OrderInfo`] と kind は同じ(21311)だが `order` エントリを持たず、代わりに
+/// `["peca","close"]` タグで「このスレを閉じる」ことを表す。スレ主ペルソナ鍵で署名し
+/// (署名者一致は [`OrderInfo`] と同じく呼び出し側が照合)、受信側はスレデータを削除する
+/// (揮発 — FR-014/FR-015)。`seq` を持たないのは、クローズが O2 の seq 連番系列とは別の
+/// 終端シグナルであり、欠落検出・再送要求の対象にしないため(クローズは再送不要 — 受信すれば
+/// 即座にスレデータを破棄するだけで、欠落しても次回接続の WELCOME で closed reject を返す
+/// ため実害がない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadClose {
+    /// スレ主 pubkey(hex 64)。
+    pub board_id: String,
+    /// 世代(u32)。
+    pub generation: u32,
+}
+
+impl ThreadClose {
+    /// クローズ通知に署名して kind 21311 イベントを生成する(発行側 — スレ主ペルソナ鍵)。
+    pub fn sign(&self, keys: &Keys, created_at: u64) -> Result<Event, LivechatBuildError> {
+        if !is_lower_hex(&self.board_id, 64) {
+            return Err(LivechatBuildError::Invalid("invalid board_id"));
+        }
+        let raw: Vec<Vec<String>> = vec![
+            vec![
+                "peca".into(),
+                "thread".into(),
+                self.board_id.clone(),
+                self.generation.to_string(),
+            ],
+            vec!["peca".into(), "close".into()],
+        ];
+        let tags = build_tags(raw)?;
+        sign_tags(keys, ORDER_KIND, "", tags, created_at, 0)
+    }
+
+    /// 検証済みイベントから写像を復元する(`["peca","close"]` タグの有無で判別)。
+    ///
+    /// kind 21311 かつ `["peca","close"]` タグを持たない場合は
+    /// [`LivechatReject::InvalidFormat`]([`OrderInfo`] として解釈すべきイベント)。
+    /// スレ主一致(FR-011 と同じ規範)は署名者 pubkey の照合で呼び出し側が行う。
+    pub fn from_event(event: &Event) -> Result<Self, LivechatReject> {
+        if event.kind.as_u16() != ORDER_KIND {
+            return Err(LivechatReject::InvalidFormat("unexpected kind"));
+        }
+        if peca_slice(event, "close").is_none() {
+            return Err(LivechatReject::InvalidFormat("missing close tag"));
+        }
+        let (board_id, generation) = parse_thread_tag(event)?;
+        Ok(Self {
+            board_id,
+            generation,
+        })
+    }
+}
+
+/// イベントが明示クローズ通知(`["peca","close"]` タグ付き kind 21311)かどうかを判定する
+/// (受信側が [`OrderInfo::from_event`] と [`ThreadClose::from_event`] のどちらを試すか
+/// 分岐するための軽量な判別子。タグ検査のみで署名検証は行わない)。
+pub fn is_close_notice(event: &Event) -> bool {
+    event.kind.as_u16() == ORDER_KIND && peca_slice(event, "close").is_some()
+}
+
+// ---------------------------------------------------------------------------
 // 共通ヘルパ
 // ---------------------------------------------------------------------------
 
@@ -851,6 +918,66 @@ mod tests {
         let mut order = sample_order(&board_id);
         order.entries.clear();
         assert!(order.sign(&keys, 1).is_err());
+    }
+
+    // --- kind 21311 特殊形: 明示クローズ通知(T047)---------------------------
+
+    #[test]
+    fn thread_close_sign_and_roundtrip() {
+        let keys = board_keys();
+        let board_id = "de".repeat(32);
+        let close = ThreadClose {
+            board_id: board_id.clone(),
+            generation: 5,
+        };
+        let event = close.sign(&keys, 1_700_000_000).unwrap();
+
+        assert_eq!(event.kind.as_u16(), ORDER_KIND, "kind は 21311 を共有する");
+        assert_eq!(event.content, "");
+        assert!(is_close_notice(&event), "close タグで判別できる");
+        let restored = ThreadClose::from_event(&event).unwrap();
+        assert_eq!(restored, close);
+    }
+
+    #[test]
+    fn thread_close_is_distinguishable_from_order() {
+        // 通常の OrderInfo(close タグなし)は is_close_notice で偽と判定され、
+        // ThreadClose::from_event でも拒否される(受信側の分岐規則)。
+        let keys = board_keys();
+        let board_id = "ef".repeat(32);
+        let order_event = sample_order(&board_id).sign(&keys, 1).unwrap();
+        assert!(!is_close_notice(&order_event));
+        assert_eq!(
+            ThreadClose::from_event(&order_event),
+            Err(LivechatReject::InvalidFormat("missing close tag"))
+        );
+
+        // 逆に ThreadClose イベントは OrderInfo::from_event では seq タグを持たないため
+        // 拒否される(invalid seq — close イベントに seq/order タグが一切ないことの確認)。
+        let close_event = ThreadClose {
+            board_id: board_id.clone(),
+            generation: 1,
+        }
+        .sign(&keys, 1)
+        .unwrap();
+        assert!(is_close_notice(&close_event));
+        assert_eq!(
+            OrderInfo::from_event(&close_event),
+            Err(LivechatReject::InvalidFormat("invalid seq"))
+        );
+    }
+
+    #[test]
+    fn thread_close_rejects_invalid_board_id() {
+        let keys = board_keys();
+        let close = ThreadClose {
+            board_id: "not-hex".into(),
+            generation: 1,
+        };
+        assert_eq!(
+            close.sign(&keys, 1),
+            Err(LivechatBuildError::Invalid("invalid board_id"))
+        );
     }
 
     // --- 前方互換 ------------------------------------------------------------
