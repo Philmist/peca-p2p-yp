@@ -182,14 +182,45 @@ impl ResView {
     }
 }
 
+/// 送信中(未確定)の自分の投稿の表示ビュー(T066 — FR-008 の「送信中」区別表示)。
+///
+/// 未確定のため `res_no` を持たない([`ResView`] とは別型)。ホストの ORDER で確定すると
+/// `pending` から消え、確定列([`ThreadDetail::res`])へ移る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingResView {
+    pub name: String,
+    pub mail: String,
+    pub body: String,
+}
+
+impl PendingResView {
+    /// [`crate::livechat::thread::Res`](未確定)から表示用ビューを組み立てる。
+    pub fn from_res(res: &crate::livechat::thread::Res, noname_name: &str) -> Self {
+        PendingResView {
+            name: res
+                .name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| noname_name.to_string()),
+            mail: res.mail.clone().unwrap_or_default(),
+            body: res.body.clone(),
+        }
+    }
+}
+
 /// スレ詳細(`GET /api/v1/livechat/threads/{board_id}` の応答本体)。
 ///
-/// 板設定と確定レス一覧をまとめて返す(閲覧に板鍵は不要 — FR-016)。
+/// 板設定と確定レス一覧をまとめて返す(閲覧に板鍵は不要 — FR-016)。開いているセッション
+/// (他ノード板)では自分の送信中投稿を `pending` に含める(FR-008)。自板(ホスト)は `pending`
+/// を持たない(空)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ThreadDetail {
     pub settings: BoardSettingsView,
     /// 確定レス一覧(res_no 昇順)。
     pub res: Vec<ResView>,
+    /// 自分の送信中投稿(FR-008)。自板・未オープンは空。
+    #[serde(default)]
+    pub pending: Vec<PendingResView>,
 }
 
 /// 操作 API(変更系)の失敗理由(定型 — 内部情報を漏らさない Principle II)。
@@ -282,6 +313,19 @@ pub struct OpenThreadResult {
     pub generation: u32,
 }
 
+/// スレ書き込み要求(T066 — `POST /api/v1/livechat/threads/{board_id}/write`)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WriteInput {
+    /// 名前欄(`#` 以降除去は送信側が担う — FR-024)。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// メール欄(表示互換のみ — FR-029)。
+    #[serde(default)]
+    pub mail: Option<String>,
+    /// 本文。
+    pub body: String,
+}
+
 /// 実況スレ一覧・詳細の供給元(自板 = ホストレジストリ、他ノード板 = gossip 受信 31311)。
 ///
 /// `web/announced.rs` の `AnnouncedProvider` と同じ注入パターン。具体的な実装(レジストリ・
@@ -344,6 +388,22 @@ pub trait LivechatDirectory: Send + Sync {
     fn rotate_board_key(&self, _board_id: &str) -> Result<String, LivechatOpError> {
         Err(LivechatOpError::Unsupported)
     }
+
+    /// スレを開く(T064 — FR-004)。他ノード板の常駐セッションを起動する(announce 由来の
+    /// 接続情報を用いる)。自板は接続不要のため no-op 成功。announce も無い未知 board は
+    /// [`LivechatOpError::NotFound`]。既定は未サポート。
+    fn open_session(&self, _board_id: &str) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// スレから抜ける(T064)。常駐セッションを畳む。既定は未サポート。
+    fn leave_session(&self, _board_id: &str) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// スレ書き込み(T066 — FR-008)。開いているセッション経由で RES を送る(送信中 = pending は
+    /// [`Self::thread`] で観測できる)。未オープン板は [`LivechatOpError::NotFound`]。既定は未サポート。
+    fn write(&self, _board_id: &str, _input: WriteInput) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
 }
 
 /// `/api/v1/livechat` エンドポイント群のサブルーター。[`super::api_router`] が `.merge` する。
@@ -352,7 +412,10 @@ pub(crate) fn routes() -> Router<AppState> {
         // 一覧(GET)+ スレ開設(POST — T063)。
         .route("/livechat/threads", get(list_threads).post(open_thread))
         .route("/livechat/threads/{board_id}", get(get_thread))
+        // スレを開く/抜ける(T064)+ 書き込み(T066)。
         .route("/livechat/threads/{board_id}/join", post(join_thread))
+        .route("/livechat/threads/{board_id}/leave", post(leave_thread))
+        .route("/livechat/threads/{board_id}/write", post(write_thread))
         .route("/livechat/threads/{board_id}/next", post(next_thread))
         .route("/livechat/threads/{board_id}/close", post(close_thread))
         // 板設定変更(T068)。
@@ -402,12 +465,47 @@ async fn get_thread(State(state): State<AppState>, Path(board_id): Path<String>)
     }
 }
 
-/// `POST /api/v1/livechat/threads/{board_id}/join` — スレを開く操作(スタブ)。
+/// `POST /api/v1/livechat/threads/{board_id}/join` — スレを開く(T064 — FR-004)。
 ///
-/// モジュール doc の制約を参照。実接続(`crate::livechat::participant::connect_once`)の
-/// 起動・結果保持はまだ配線していないため、シグネチャのみ用意し 501 を返す。
-async fn join_thread(State(_state): State<AppState>, Path(_board_id): Path<String>) -> Response {
-    error_response(StatusCode::NOT_IMPLEMENTED, "not_implemented")
+/// 他ノード板の常駐セッションを起動する(announce 由来の接続情報を用いる)。自板は接続不要で
+/// no-op 成功。announce も無い未知 board は `not_found`。成功は 204。
+async fn join_thread(State(state): State<AppState>, Path(board_id): Path<String>) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.open_session(&board_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/leave` — スレから抜ける(T064)。
+async fn leave_thread(State(state): State<AppState>, Path(board_id): Path<String>) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.leave_session(&board_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/write` — スレ書き込み(T066 — FR-008)。
+///
+/// 開いているセッション経由で RES を送る。送信中(pending)は後続の `GET .../{board_id}` で
+/// 観測できる(FR-008 の「送信中」区別表示)。未オープン板は `not_found`。成功は 202。
+async fn write_thread(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Json(input): Json<WriteInput>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.write(&board_id, input) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// 次スレ操作・クローズ操作の応答本体(T046/T047)。
@@ -763,6 +861,7 @@ mod tests {
                     res: vec![
                         ResView::from_res(&confirmed_res(Some(1), None), "名無しさん").unwrap(),
                     ],
+                    pending: Vec::new(),
                 })
             } else {
                 None
@@ -892,10 +991,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_thread_is_not_implemented_stub() {
+    async fn join_thread_unwired_is_not_found() {
         let state = state_with_directory(None);
         let resp = join_thread(State(state), Path("ab".repeat(32))).await;
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // --- T046: 次スレ操作 API ------------------------------------------------
@@ -958,13 +1057,15 @@ mod tests {
 
     // --- T063/T067/T068: 変更系操作ハンドラの疎通 ------------------------------
 
-    /// 操作(open/settings/ban/rotate)の結果を制御できるフェイク供給元。
+    /// 操作(open/settings/ban/rotate/join/write)の結果を制御できるフェイク供給元。
     #[derive(Default)]
     struct OpsDirectory {
         open_ok: bool,
         settings_result: Option<Result<(), LivechatOpError>>,
         ban_ok_board: Option<String>,
         rotate_pubkey: Option<String>,
+        session_ok_board: Option<String>,
+        write_result: Option<Result<(), LivechatOpError>>,
     }
 
     impl LivechatDirectory for OpsDirectory {
@@ -1009,6 +1110,16 @@ mod tests {
             self.rotate_pubkey
                 .clone()
                 .ok_or(LivechatOpError::Unavailable)
+        }
+        fn open_session(&self, board_id: &str) -> Result<(), LivechatOpError> {
+            if self.session_ok_board.as_deref() == Some(board_id) {
+                Ok(())
+            } else {
+                Err(LivechatOpError::NotFound)
+            }
+        }
+        fn write(&self, _board_id: &str, _input: WriteInput) -> Result<(), LivechatOpError> {
+            self.write_result.unwrap_or(Err(LivechatOpError::NotFound))
         }
     }
 
@@ -1122,6 +1233,55 @@ mod tests {
         let dir = std::sync::Arc::new(OpsDirectory::default());
         let resp = rotate_board_key(State(state_with_dyn(dir)), Path("ab".repeat(32))).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // --- T064/T066: セッション操作(join/write)ハンドラの疎通 -------------------
+
+    #[tokio::test]
+    async fn join_thread_opens_session_for_known_board() {
+        let board = "ab".repeat(32);
+        let dir = std::sync::Arc::new(OpsDirectory {
+            session_ok_board: Some(board.clone()),
+            ..Default::default()
+        });
+        let resp = join_thread(State(state_with_dyn(dir.clone())), Path(board)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // 未知 board は not_found。
+        let resp = join_thread(State(state_with_dyn(dir)), Path("ff".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn write_thread_maps_accepted_and_not_open() {
+        let ok = std::sync::Arc::new(OpsDirectory {
+            write_result: Some(Ok(())),
+            ..Default::default()
+        });
+        let resp = write_thread(
+            State(state_with_dyn(ok)),
+            Path("ab".repeat(32)),
+            Json(WriteInput {
+                name: None,
+                mail: None,
+                body: "本文".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // 未オープン板は not_found(既定 write_result=NotFound)。
+        let closed = std::sync::Arc::new(OpsDirectory::default());
+        let resp = write_thread(
+            State(state_with_dyn(closed)),
+            Path("ab".repeat(32)),
+            Json(WriteInput {
+                name: None,
+                mail: None,
+                body: "本文".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // --- T045: 互換 API 板 URL ---------------------------------------------

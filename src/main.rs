@@ -24,6 +24,8 @@ use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::identity::{IdentityManager, Keystore, KeystoreHealth, keystore};
 use peca_p2p_yp::livechat::board::BoardKeyManager;
+use peca_p2p_yp::livechat::manager::ParticipantManager;
+use peca_p2p_yp::livechat::participant::ParticipantConfig;
 use peca_p2p_yp::livechat::registry::LivechatRegistry;
 use peca_p2p_yp::livechat::thread::{BoardSettings, ThreadState};
 use peca_p2p_yp::p2p::hub::GossipHub;
@@ -38,7 +40,7 @@ use peca_p2p_yp::web::announced::{
 };
 use peca_p2p_yp::web::livechat::{
     BoardSettingsInput, BoardSettingsView, LivechatDirectory, LivechatOpError, OpenThreadRequest,
-    OpenThreadResult, ResView, ThreadDetail, ThreadSummary,
+    OpenThreadResult, PendingResView, ResView, ThreadDetail, ThreadSummary, WriteInput,
 };
 use peca_p2p_yp::web::{AppState, IndexLanStatus, build_index_router, build_router};
 
@@ -292,6 +294,13 @@ async fn run() -> Result<(), i32> {
         .unwrap_or_else(|_| Keystore::ephemeral());
     let board_keys = Arc::new(BoardKeyManager::new(Arc::clone(&store), board_keystore));
 
+    // 14a-2. 参加者セッションの常駐マネージャ(006-livechat-thread T064)。他ノード板の
+    //        「スレを開く」で run_session を常駐させ、確定レスのライブ供給・書き込み・凍結/復帰・
+    //        クローズ揮発・バックオフ再接続を稼働バイナリで成立させる。Web 層(LivechatAdapter)と
+    //        互換 API(T069)で同一インスタンスを共有する。
+    let participant_manager =
+        ParticipantManager::new(Arc::clone(&board_keys), Some(Arc::clone(&security)));
+
     let identity = Arc::new(
         IdentityManager::new_with_health(Arc::clone(&store), keystore, keystore_health)
             .with_broadcast_state(Arc::clone(&broadcast)),
@@ -473,6 +482,7 @@ async fn run() -> Result<(), i32> {
             identity: Arc::clone(&identity),
             channels: Arc::clone(&registry),
             board_keys: Arc::clone(&board_keys),
+            manager: Arc::clone(&participant_manager),
             listen_port,
         }));
     }
@@ -705,6 +715,8 @@ struct LivechatAdapter {
     identity: Arc<IdentityManager>,
     channels: Arc<ChannelRegistry>,
     board_keys: Arc<BoardKeyManager>,
+    /// 他ノード板の常駐セッション(T064 — 「スレを開く」で起動・詳細供給・書き込み)。
+    manager: Arc<ParticipantManager>,
     /// 自ノード P2P 待受ポート(tip の port 成分 — スレ開設時に channel tracker の IP と合成)。
     listen_port: u16,
 }
@@ -775,17 +787,38 @@ impl LivechatDirectory for LivechatAdapter {
     }
 
     fn thread(&self, board_id: &str) -> Option<ThreadDetail> {
-        // 自板のみ確定レスを保持する(他ノード板の詳細は参加者セッション T064 が供給する)。
-        let snap = self.registry.board_snapshot(board_id)?;
-        let res = snap
-            .active
-            .res
+        // 自板はホストレジストリが確定レスを保持する。
+        if let Some(snap) = self.registry.board_snapshot(board_id) {
+            let res = snap
+                .active
+                .res
+                .iter()
+                .filter_map(|r| ResView::from_res(r, &snap.settings.noname_name))
+                .collect();
+            return Some(ThreadDetail {
+                settings: BoardSettingsView::from_settings(&snap.settings),
+                res,
+                pending: Vec::new(),
+            });
+        }
+        // 他ノード板は開いている常駐セッション(T064)が確定レス・板設定・送信中を供給する。
+        let view = self.manager.view(board_id)?;
+        let settings = view.settings.clone().unwrap_or_default();
+        let noname = settings.noname_name.clone();
+        let res = view
+            .confirmed
             .iter()
-            .filter_map(|r| ResView::from_res(r, &snap.settings.noname_name))
+            .filter_map(|r| ResView::from_res(r, &noname))
+            .collect();
+        let pending = view
+            .pending
+            .iter()
+            .map(|r| PendingResView::from_res(r, &noname))
             .collect();
         Some(ThreadDetail {
-            settings: BoardSettingsView::from_settings(&snap.settings),
+            settings: BoardSettingsView::from_settings(&settings),
             res,
+            pending,
         })
     }
 
@@ -879,6 +912,54 @@ impl LivechatDirectory for LivechatAdapter {
             .rotate(board_id)
             .map_err(|_| LivechatOpError::Unavailable)?;
         Ok(keys.public_key().to_hex())
+    }
+
+    fn open_session(&self, board_id: &str) -> Result<(), LivechatOpError> {
+        // 自板は自ノードがホストのため接続不要(閲覧はレジストリ直読み) — no-op 成功。
+        if self.registry.board_snapshot(board_id).is_some() {
+            return Ok(());
+        }
+        // 他ノード板: announce から接続情報(tip/channel/世代/key/title/res_limit)を引く。
+        let (_pubkey, ann) = self
+            .hub
+            .announce_snapshot()
+            .into_iter()
+            .find(|(pubkey, _)| pubkey == board_id)
+            .ok_or(LivechatOpError::NotFound)?;
+        // res_limit は announce に含まれないため既定値で器を作る(確定は ORDER/表示側が担う)。
+        let config = ParticipantConfig {
+            host_addr: ann.tip.clone(),
+            board_id: board_id.to_string(),
+            channel: ann.channel.clone(),
+            generation: ann.generation,
+            key: ann.key,
+            title: ann.title.clone(),
+            res_limit: BoardSettings::default().res_limit,
+            security: None,
+        };
+        self.manager.open(config);
+        Ok(())
+    }
+
+    fn leave_session(&self, board_id: &str) -> Result<(), LivechatOpError> {
+        // 自板は常駐セッションを持たない(no-op 成功)。他ノード板はセッションを畳む。
+        self.manager.leave(board_id);
+        Ok(())
+    }
+
+    fn write(&self, board_id: &str, input: WriteInput) -> Result<(), LivechatOpError> {
+        match self
+            .manager
+            .write(board_id, input.name, input.mail, input.body)
+        {
+            Ok(()) => Ok(()),
+            Err(peca_p2p_yp::livechat::manager::ManagerError::NotOpen) => {
+                Err(LivechatOpError::NotFound)
+            }
+            Err(peca_p2p_yp::livechat::manager::ManagerError::KeyUnavailable) => {
+                Err(LivechatOpError::Unavailable)
+            }
+        }
     }
 }
 

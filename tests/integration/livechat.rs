@@ -928,3 +928,98 @@ async fn us5_sc003_late_joiner_syncs_4000_res_within_15_seconds() {
         "SC-003: 4000 レス同期は 15 秒以内に完了すべき(実測 {elapsed:?})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T064/T066: 常駐セッションマネージャ(ライブ供給 + 書き込み)の end-to-end
+// ---------------------------------------------------------------------------
+
+/// ParticipantManager が「スレを開く」→ 確定レスのライブ供給 → 書き込み往復までを
+/// 稼働経路(run_session)で成立させることを実ホストに対して検証する(T064/T066)。
+#[tokio::test]
+async fn manager_opens_session_supplies_confirmed_and_writes() {
+    use peca_p2p_yp::livechat::board::BoardKeyManager;
+    use peca_p2p_yp::livechat::manager::ParticipantManager;
+    use peca_p2p_yp::livechat::thread::BoardSettings;
+    use std::sync::Arc;
+
+    let host = LivechatHostNode::spawn(0xA64).await;
+    // PoW を課さない板設定で開設(テストの書き込みを軽くする)。
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..BoardSettings::default()
+        },
+    );
+    // 既存レスを 2 件 seed(接続時同期で取得できるはず)。
+    let seed_key = Keys::generate();
+    host.seed_res(&seed_key, "一つ目", 1_700_000_001);
+    host.seed_res(&seed_key, "二つ目", 1_700_000_002);
+    let board_id = host.board_id();
+
+    // 視聴者の板鍵管理 + マネージャ(バックオフ短縮)。
+    let store = Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap());
+    let board_keys = Arc::new(BoardKeyManager::new(
+        store,
+        peca_p2p_yp::identity::Keystore::ephemeral(),
+    ));
+    let manager = ParticipantManager::with_tuning(board_keys, None, 1000, 0.01);
+
+    // 「スレを開く」= 常駐セッション起動。
+    manager.open(ParticipantConfig {
+        host_addr: host.listen_addr().to_string(),
+        board_id: board_id.clone(),
+        channel: host.channel(),
+        generation: 1,
+        key: 1_700_000_000,
+        title: "実況スレ".into(),
+        res_limit: 1000,
+        security: None,
+    });
+
+    // 確定レス 2 件がライブ供給されるまで待つ(T064)。
+    let ok = wait_until(Duration::from_secs(5), || {
+        manager
+            .view(&board_id)
+            .map(|v| v.confirmed.len())
+            .unwrap_or(0)
+            >= 2
+    })
+    .await;
+    assert!(ok, "接続時同期で 2 件の確定レスが供給される");
+
+    // 書き込み(T066)。ホストのシーケンサが採番し ORDER が返って確定 3 件になる。
+    manager
+        .write(&board_id, None, None, "三つ目".into())
+        .expect("write");
+    let ok = wait_until(Duration::from_secs(5), || {
+        manager
+            .view(&board_id)
+            .map(|v| v.confirmed.len())
+            .unwrap_or(0)
+            >= 3
+    })
+    .await;
+    assert!(ok, "書き込みがホスト採番経由で確定 3 件になる");
+
+    let view = manager.view(&board_id).unwrap();
+    assert!(
+        view.confirmed.iter().any(|r| r.body == "三つ目"),
+        "自分の書き込みが確定列に現れる"
+    );
+    manager.leave(&board_id);
+}
+
+/// 条件が満たされるまで(タイムアウトまで)ポーリングする補助。
+async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if cond() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}

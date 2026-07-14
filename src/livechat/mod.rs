@@ -11,6 +11,7 @@
 
 pub mod board;
 pub mod host;
+pub mod manager;
 pub mod moderation;
 pub mod participant;
 pub mod registry;

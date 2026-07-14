@@ -27,7 +27,7 @@ use super::session::{
     ParticipantSession, RejectHandling, SyncError, WelcomeOutcome, generate_challenge,
     res_from_event,
 };
-use super::thread::{Res, Thread};
+use super::thread::{BoardSettings, Res, Thread};
 
 /// 初回同期のアイドル打ち切り時間。WELCOME 後にこの時間だけ RES/ORDER が来なければ、
 /// 初回同期のバッチが尽きたとみなして確定列を返す(継続受信は US2)。
@@ -121,7 +121,7 @@ where
 {
     // 1〜3. ハンドシェイク(HELLO → JOIN → WELCOME 検証)。joined 済みセッションを得る。
     let mut session = match handshake_join(config, since_seq, &mut reader, &mut writer).await {
-        Ok(s) => s,
+        Ok((s, _board_settings)) => s,
         Err(result) => return result,
     };
 
@@ -208,7 +208,7 @@ async fn handshake_join<R, W>(
     since_seq: u32,
     reader: &mut R,
     writer: &mut W,
-) -> Result<ParticipantSession, JoinResult>
+) -> Result<(ParticipantSession, serde_json::Value), JoinResult>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -247,8 +247,13 @@ where
         _ => return Err(JoinResult::Transport),
     };
     match first {
-        Message::ThreadWelcome { sig, .. } => match session.on_welcome(&sig) {
-            WelcomeOutcome::Accepted => Ok(session),
+        Message::ThreadWelcome {
+            sig,
+            board_settings,
+            ..
+        } => match session.on_welcome(&sig) {
+            // 板設定(WELCOME 同梱)も持ち帰る(T064 — 他ノード板の設定表示に使う)。
+            WelcomeOutcome::Accepted => Ok((session, board_settings)),
             WelcomeOutcome::ChallengeFailed { category } => {
                 self_log(config, category);
                 Err(JoinResult::ChallengeFailed)
@@ -290,7 +295,7 @@ pub async fn connect_write_collect(
 
     // 1. ハンドシェイク。
     let mut session = match handshake_join(config, 0, &mut reader, &mut writer).await {
-        Ok(s) => s,
+        Ok((s, _board_settings)) => s,
         Err(result) => return result,
     };
 
@@ -489,6 +494,7 @@ async fn connect_and_handshake(
 ) -> Result<
     (
         ParticipantSession,
+        serde_json::Value,
         tokio::net::tcp::OwnedReadHalf,
         tokio::net::tcp::OwnedWriteHalf,
     ),
@@ -498,8 +504,9 @@ async fn connect_and_handshake(
         .await
         .map_err(|_| JoinResult::Transport)?;
     let (mut reader, mut writer) = stream.into_split();
-    let session = handshake_join(config, since_seq, &mut reader, &mut writer).await?;
-    Ok((session, reader, writer))
+    let (session, board_settings) =
+        handshake_join(config, since_seq, &mut reader, &mut writer).await?;
+    Ok((session, board_settings, reader, writer))
 }
 
 /// 明示操作(スレを開く)を起点に、接続 → 継続受信 → 凍結 → バックオフ再接続 を繰り返す
@@ -524,34 +531,35 @@ pub async fn run_forever(
     let mut last_session: Option<ParticipantSession> = None;
 
     while attempt < max_attempts {
-        let (mut session, reader, writer) = match connect_and_handshake(config, since_seq).await {
-            Ok(parts) => parts,
-            Err(
-                result @ JoinResult::Rejected {
-                    handling: RejectHandling::GiveUp,
-                    ..
-                },
-            ) => {
-                return (last_session, result);
-            }
-            Err(result @ JoinResult::Closed) => {
-                return (last_session, result);
-            }
-            Err(result) => {
-                // Transport/ChallengeFailed/Backoff/WaitFrozen 系はバックオフして再試行する。
-                let delay =
-                    crate::livechat::session::backoff_delay_secs(attempt) as f64 * sleep_scale;
-                if delay > 0.0 {
-                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                }
-                attempt += 1;
-                last_session = None;
-                if attempt >= max_attempts {
+        let (mut session, _board_settings, reader, writer) =
+            match connect_and_handshake(config, since_seq).await {
+                Ok(parts) => parts,
+                Err(
+                    result @ JoinResult::Rejected {
+                        handling: RejectHandling::GiveUp,
+                        ..
+                    },
+                ) => {
                     return (last_session, result);
                 }
-                continue;
-            }
-        };
+                Err(result @ JoinResult::Closed) => {
+                    return (last_session, result);
+                }
+                Err(result) => {
+                    // Transport/ChallengeFailed/Backoff/WaitFrozen 系はバックオフして再試行する。
+                    let delay =
+                        crate::livechat::session::backoff_delay_secs(attempt) as f64 * sleep_scale;
+                    if delay > 0.0 {
+                        tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                    }
+                    attempt += 1;
+                    last_session = None;
+                    if attempt >= max_attempts {
+                        return (last_session, result);
+                    }
+                    continue;
+                }
+            };
 
         // 接続に成功したので試行回数をリセットし、継続受信へ入る。
         attempt = 0;
@@ -580,6 +588,307 @@ pub async fn run_forever(
             confirmed: Vec::new(),
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// T064: 常駐セッション(ライブ状態共有 + 書き込みコマンド)
+// ---------------------------------------------------------------------------
+
+/// 常駐セッションのライブ状態(視聴者から見た表示・接続状態)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLiveState {
+    /// 接続確立前・再接続中(まだ WELCOME を受けていない)。
+    Connecting,
+    /// joined(継続受信中)。書き込み可。
+    Active,
+    /// 通知なき切断で凍結(取得済みレスの閲覧のみ・バックオフ再接続中 — FR-014)。
+    Frozen,
+    /// 明示クローズまたはスレ消滅で終端(以後再接続しない — FR-014/FR-015)。
+    Closed,
+}
+
+/// 常駐セッションのライブ・スナップショット(マネージャが保持し UI/互換 API が読む)。
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    /// 確定レス(res_no 昇順)。
+    pub confirmed: Vec<Res>,
+    /// 自分の未確定投稿(送信中 — FR-008)。
+    pub pending: Vec<Res>,
+    /// 現在の世代。
+    pub generation: u32,
+    /// スレ作成 unix 秒(現行世代)。
+    pub key: u64,
+    /// 現在の接続・表示状態。
+    pub state: SessionLiveState,
+    /// 板設定(WELCOME/SETTINGS 由来。未受信・検証失敗は `None`)。
+    pub settings: Option<BoardSettings>,
+    /// スレが終端した(Closed / GiveUp)か。true なら再接続しない。
+    pub terminated: bool,
+}
+
+impl SessionView {
+    /// 接続前の初期状態(器の Thread から世代・key を引き継ぐ)。
+    pub fn initial(generation: u32, key: u64) -> Self {
+        SessionView {
+            confirmed: Vec::new(),
+            pending: Vec::new(),
+            generation,
+            key,
+            state: SessionLiveState::Connecting,
+            settings: None,
+            terminated: false,
+        }
+    }
+}
+
+/// マネージャ → セッションタスクへの書き込み要求(T066)。
+pub struct WriteCommand {
+    /// 送信に使う板鍵(視聴者の当該板向け書き込み鍵。ローテーション後は新鍵)。
+    pub board_keys: nostr::Keys,
+    /// 名前欄(`#` 以降除去は封筒 sign が担う — FR-024)。
+    pub name: Option<String>,
+    /// メール欄(表示互換のみ — FR-029)。
+    pub mail: Option<String>,
+    /// 本文。
+    pub body: String,
+    /// 初回書き込み PoW ビット(初見板鍵は `first_post_pow_bits`、既知は 0 — research R6)。
+    pub pow_bits: u8,
+}
+
+/// フレーム適用の結果(継続 / 終端)。
+enum FrameOutcome {
+    Continue,
+    Closed,
+}
+
+/// 共有ビューへ現在のセッション状態を書き出す(確定列・送信中・世代・状態)。
+fn publish_view(
+    shared: &std::sync::Mutex<SessionView>,
+    session: &ParticipantSession,
+    state: SessionLiveState,
+) {
+    let mut view = shared.lock().unwrap_or_else(|e| e.into_inner());
+    view.confirmed = session.confirmed().to_vec();
+    view.pending = session.pending().to_vec();
+    view.generation = session.generation();
+    view.state = state;
+}
+
+/// 受信フレーム 1 件を joined 済みセッションへ適用する(継続受信 — [`stream_until_disconnect`] と
+/// 同じ検証規則。書き込みと同一接続で多重化するため本ヘルパーに切り出す)。
+async fn apply_session_frame<W>(
+    config: &ParticipantConfig,
+    session: &mut ParticipantSession,
+    shared: &std::sync::Mutex<SessionView>,
+    pending: &mut std::collections::HashMap<String, Res>,
+    writer: &mut W,
+    msg: Message,
+) -> FrameOutcome
+where
+    W: AsyncWrite + Unpin,
+{
+    match msg {
+        Message::Res { event } => {
+            if let Some(res) = verify_res(&event) {
+                pending.insert(res.event_id.clone(), res);
+            }
+        }
+        Message::Order { event } => match verify_order(&event, &config.board_id) {
+            Some(order) => {
+                let resolve = |eid: &str| pending.get(eid).cloned();
+                match session.apply_order(&order, resolve) {
+                    Ok(()) => {}
+                    Err(SyncError::SeqGap { .. }) => {
+                        let req = Message::ResendReq {
+                            from_seq: session.since_seq() + 1,
+                            to_seq: order.seq,
+                        };
+                        let _ = write_frame(writer, &req).await;
+                    }
+                    Err(_) => {}
+                }
+            }
+            None => self_log(config, SecurityCategory::LivechatOrderInvalid),
+        },
+        Message::Settings { board_settings } => {
+            // 受信側検証を通った設定のみ表示へ反映(FR-025)。違反は破棄。
+            if let Ok(bs) = crate::livechat::session::parse_and_validate_settings(&board_settings) {
+                shared.lock().unwrap_or_else(|e| e.into_inner()).settings = Some(bs);
+            }
+        }
+        Message::NextThread { generation, key } => {
+            session.apply_next_thread(generation, key, config.res_limit);
+            pending.clear();
+            shared.lock().unwrap_or_else(|e| e.into_inner()).key = key;
+        }
+        Message::ThreadClose { .. } => {
+            session.apply_close();
+            return FrameOutcome::Closed;
+        }
+        _ => {}
+    }
+    FrameOutcome::Continue
+}
+
+/// 明示操作(スレを開く)を起点に常駐し、継続受信 + 書き込み + 凍結/復帰/クローズを駆動する
+/// (T064 — FR-004/FR-008/FR-010/FR-014/FR-015)。
+///
+/// [`run_forever`] の接続 → 継続受信 → バックオフ再接続ループを土台に、次の 2 点を足す:
+///
+/// 1. **ライブ状態共有**: フレーム適用ごとに `shared`([`SessionView`])へ確定列・送信中・
+///    世代・状態を書き出す(UI/互換 API がポーリングで読む)。
+/// 2. **書き込み多重化**: `cmd_rx` から [`WriteCommand`] を受け、joined 中の同一接続で
+///    [`ParticipantSession::compose_write`] → RES 送出する(送信中 = pending — FR-008)。
+///
+/// **キャンセル安全性**: 受信(`read_frame`)は別タスクへ分離し、[`Message`] を mpsc で
+/// 主ループへ渡す。主ループは受信フレームと書き込みコマンドを [`tokio::select`] で待つため、
+/// `read_frame` を select で途中キャンセルしてフレーム境界を壊すことがない。
+///
+/// `cmd_rx` が閉じた(マネージャがセッションを破棄した)ら終了する。`max_attempts` 到達・
+/// `THREAD_CLOSE`・`GiveUp`(旧スレ消滅)でも終了し、`shared.terminated=true` を立てる。
+pub async fn run_session(
+    config: ParticipantConfig,
+    shared: std::sync::Arc<std::sync::Mutex<SessionView>>,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<WriteCommand>,
+    max_attempts: u32,
+    sleep_scale: f64,
+) {
+    let channel = config.channel.clone();
+    let mut since_seq = 0u32;
+    let mut attempt = 0u32;
+
+    while attempt < max_attempts {
+        let (mut session, board_settings, reader, mut writer) =
+            match connect_and_handshake(&config, since_seq).await {
+                Ok(parts) => parts,
+                Err(JoinResult::Rejected {
+                    handling: RejectHandling::GiveUp,
+                    ..
+                })
+                | Err(JoinResult::Closed) => break,
+                Err(_) => {
+                    // Transport/ChallengeFailed 系はバックオフ再試行(Connecting のまま)。
+                    set_view_state(&shared, SessionLiveState::Connecting);
+                    backoff(attempt, sleep_scale).await;
+                    attempt += 1;
+                    continue;
+                }
+            };
+        attempt = 0;
+        // WELCOME 同梱の板設定を反映(検証通過分のみ)。
+        if let Ok(bs) = crate::livechat::session::parse_and_validate_settings(&board_settings) {
+            shared.lock().unwrap_or_else(|e| e.into_inner()).settings = Some(bs);
+        }
+        publish_view(&shared, &session, SessionLiveState::Active);
+
+        // 受信を別タスクへ分離(キャンセル安全)。フレームを mpsc で主ループへ渡す。
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Option<Message>>();
+        let reader_task = tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(Some(f)) => {
+                        if frame_tx.send(Some(f.message)).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {
+                        let _ = frame_tx.send(None);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut pending: std::collections::HashMap<String, Res> = std::collections::HashMap::new();
+        // 継続受信 + 書き込み多重化。終端理由を持ち帰る。
+        enum LoopEnd {
+            Disconnected,
+            Closed,
+            ManagerGone,
+        }
+        let end = loop {
+            tokio::select! {
+                biased;
+                maybe_cmd = cmd_rx.recv() => {
+                    let Some(cmd) = maybe_cmd else { break LoopEnd::ManagerGone; };
+                    // 形式違反(本文長・行数等)は送らずスキップ(前方互換で切断しない)。
+                    // 書き込み失敗(切断途上)は凍結扱いで再接続へ。
+                    if let Ok(msg) = session.compose_write(
+                        &cmd.board_keys,
+                        &channel,
+                        cmd.name,
+                        cmd.mail,
+                        &cmd.body,
+                        unix_now() as u64,
+                        cmd.pow_bits,
+                    ) && write_frame(&mut writer, &msg).await.is_err()
+                    {
+                        break LoopEnd::Disconnected;
+                    }
+                    publish_view(&shared, &session, SessionLiveState::Active);
+                }
+                maybe_frame = frame_rx.recv() => {
+                    match maybe_frame {
+                        Some(Some(msg)) => {
+                            let outcome = apply_session_frame(
+                                &config, &mut session, &shared, &mut pending, &mut writer, msg,
+                            ).await;
+                            match outcome {
+                                FrameOutcome::Continue => {
+                                    publish_view(&shared, &session, SessionLiveState::Active);
+                                }
+                                FrameOutcome::Closed => break LoopEnd::Closed,
+                            }
+                        }
+                        // 受信タスク終了(EOF/エラー) = 通知なき切断。
+                        Some(None) | None => break LoopEnd::Disconnected,
+                    }
+                }
+            }
+        };
+        reader_task.abort();
+        since_seq = session.since_seq();
+
+        match end {
+            LoopEnd::Closed => {
+                // 明示クローズ: データ削除済み・終端(FR-014/FR-015)。
+                let mut view = shared.lock().unwrap_or_else(|e| e.into_inner());
+                view.confirmed.clear();
+                view.pending.clear();
+                view.state = SessionLiveState::Closed;
+                view.terminated = true;
+                return;
+            }
+            LoopEnd::ManagerGone => return,
+            LoopEnd::Disconnected => {
+                // 通知なき切断 → Frozen(閲覧継続)。バックオフして再接続する(FR-014)。
+                session.on_disconnect();
+                publish_view(&shared, &session, SessionLiveState::Frozen);
+                backoff(attempt, sleep_scale).await;
+                attempt += 1;
+            }
+        }
+    }
+    // max_attempts 到達・GiveUp・Closed(handshake 段)で終端。
+    let mut view = shared.lock().unwrap_or_else(|e| e.into_inner());
+    view.terminated = true;
+    if view.state != SessionLiveState::Closed {
+        view.state = SessionLiveState::Frozen;
+    }
+}
+
+/// バックオフ待機(試行回数に応じた遅延。テストは `sleep_scale` で短縮できる)。
+async fn backoff(attempt: u32, sleep_scale: f64) {
+    let delay = crate::livechat::session::backoff_delay_secs(attempt) as f64 * sleep_scale;
+    if delay > 0.0 {
+        tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+    }
+}
+
+/// 共有ビューの状態だけを更新する(接続中・凍結の遷移表示用)。
+fn set_view_state(shared: &std::sync::Mutex<SessionView>, state: SessionLiveState) {
+    shared.lock().unwrap_or_else(|e| e.into_inner()).state = state;
 }
 
 /// 受信 RES(kind 1311)の封筒署名 + 形式を検証してドメイン Res を作る。
