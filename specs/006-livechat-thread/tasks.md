@@ -194,8 +194,8 @@
 
 **Purpose**: 横断的な成功基準の確認・文書化・最終検証
 
-- [ ] T058 SC-006 の維持確認: 既存 scale テストに announce 負荷(live チャンネル併設スレ)を追加した構成で、チャンネル掲載 60 秒以内の一覧反映が維持されることを tests/integration/scale.rs で検証(research R3 の容量判定の実測裏付け)
-- [ ] T059 [P] ドメイン文書の更新: CONTEXT.md に livechat モジュール・互換 API・kind 3 種の追加を反映(docs/agents/domain.md の単一コンテキスト方針に従う)
+- [X] T058 SC-006 の維持確認: 既存 scale テストに announce 負荷(live チャンネル併設スレ)を追加した構成で、チャンネル掲載 60 秒以内の一覧反映が維持されることを tests/integration/scale.rs で検証(research R3 の容量判定の実測裏付け)
+- [X] T059 [P] ドメイン文書の更新: CONTEXT.md に livechat モジュール・互換 API・kind 3 種の追加を反映(docs/agents/domain.md の単一コンテキスト方針に従う)
 - [ ] T060 ADR-0014 の最終化: TLC 検査結果・実装中に生じた設計逸脱・SJIS 仮説の状態を docs/adr/0014-livechat-thread.md へ反映
 - [ ] T061 quickstart §1〜§5 の全検証を実行: `cargo fmt -- --check` / `cargo clippy --all-targets` / `cargo test` / `cargo test --test cucumber` / `cargo audit` / gitleaks をすべてパスさせる(specs/006-livechat-thread/quickstart.md §完了判定)
 - [ ] T062 SC-007 実機確認(利用者の協力が必要): 利用者所有の実況ツール一式を `http://127.0.0.1:7183/<board_id>/` に向け、quickstart §5 の 8 観点(hex 板名の登録可否・SJIS/数値文字参照描画・Range/304 の噛み合い・dat 落ち解釈・SETTING.TXT キー突合・head.txt 表示・確認画面なし書き込み・固定 ID の NG 機能)を確認し、結果を specs/006-livechat-thread/research.md の R5 へ追記。不成立項目は追加タスク化
