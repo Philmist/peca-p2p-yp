@@ -240,7 +240,9 @@ pub enum LivechatOpError {
 }
 
 impl LivechatOpError {
-    fn into_response(self) -> Response {
+    /// 定型 HTTP 応答へ写像する(内部情報を含めない — Principle II)。操作ハンドラが用いるほか、
+    /// 応答本文に内部情報が乗らないことを検証するテストからも参照する。
+    pub fn into_response(self) -> Response {
         let (status, code) = match self {
             LivechatOpError::Unsupported | LivechatOpError::NotFound => {
                 (StatusCode::NOT_FOUND, "not_found")
@@ -403,6 +405,62 @@ pub trait LivechatDirectory: Send + Sync {
     /// [`Self::thread`] で観測できる)。未オープン板は [`LivechatOpError::NotFound`]。既定は未サポート。
     fn write(&self, _board_id: &str, _input: WriteInput) -> Result<(), LivechatOpError> {
         Err(LivechatOpError::Unsupported)
+    }
+}
+
+/// スレ書き込みを board の局在で振り分ける(T066 — 配線層の共有ロジック)。
+///
+/// [`crate::livechat::registry::LivechatRegistry`]・板鍵・常駐セッションを束ねた配線層
+/// (`src/main.rs` の `LivechatAdapter`)の [`LivechatDirectory::write`] 実体。バイナリ内の
+/// アダプタから振り分けの本体を切り出し、ライブラリ側で直接テストできるようにする
+/// (回帰防止 — `tests/features/livechat.feature` の自板書き込みシナリオが本関数を検証する)。
+///
+/// - **自板(自ノードがホスト)**: 互換 API(bbs.cgi)と**同一の採番経路**
+///   ([`crate::web::compat::bbs_cgi::submit`] — 板鍵で署名 → `registry.accept_write`)へ渡す。
+///   自板は常駐セッションを持たないため、ここを誤って `manager.write` へ流すと `NotOpen` で
+///   書けなくなる(UI から自分のスレへ書き込めない回帰があった — 本関数がその防波堤)。
+/// - **他ノード板**: 開いている常駐セッション([`crate::livechat::manager::ParticipantManager::write`])
+///   へ送る(送信中 = pending はセッションが反映する)。未オープン板は
+///   [`LivechatOpError::NotFound`]。
+pub fn route_write(
+    registry: &crate::livechat::registry::LivechatRegistry,
+    board_keys: &crate::livechat::board::BoardKeyManager,
+    manager: &crate::livechat::manager::ParticipantManager,
+    board_id: &str,
+    input: WriteInput,
+    now: u64,
+) -> Result<(), LivechatOpError> {
+    use crate::livechat::manager::ManagerError;
+    use crate::web::compat::bbs_cgi::{self, BbsCgiError, BbsForm};
+
+    if registry.board_snapshot(board_id).is_some() {
+        let form = BbsForm {
+            bbs: board_id.to_string(),
+            key: None,
+            from: input.name,
+            mail: input.mail,
+            message: input.body,
+            subject: None,
+        };
+        // 採番結果(`AcceptOutcome::Rejected` = BAN/PoW 不足/レート超過/満員)は submit が `Ok`
+        // で返す — 互換 bbs.cgi と同じく理由を開示せず受理扱い(FR-006 の非開示)。`Err` は形式・
+        // 状態・内部要因のみ。全バリアントを明示写像し、将来の追加を包括アームで無言吸収しない
+        // (`BuildFailed` = 本文長超過等の形式違反は入力不正 = 400。BoardKeyUnavailable のみ 503)。
+        return match bbs_cgi::submit(registry, board_keys, &form, now) {
+            Ok(_) => Ok(()),
+            Err(BbsCgiError::UnknownBoard) => Err(LivechatOpError::NotFound),
+            Err(BbsCgiError::ThreadNotActive)
+            | Err(BbsCgiError::BuildFailed)
+            | Err(BbsCgiError::MalformedForm)
+            | Err(BbsCgiError::ThreadCreationNotAllowed)
+            | Err(BbsCgiError::Rejected) => Err(LivechatOpError::Invalid),
+            Err(BbsCgiError::BoardKeyUnavailable) => Err(LivechatOpError::Unavailable),
+        };
+    }
+    match manager.write(board_id, input.name, input.mail, input.body) {
+        Ok(()) => Ok(()),
+        Err(ManagerError::NotOpen) => Err(LivechatOpError::NotFound),
+        Err(ManagerError::KeyUnavailable) => Err(LivechatOpError::Unavailable),
     }
 }
 
@@ -1293,5 +1351,104 @@ mod tests {
             board_compat_url(&board_id),
             format!("http://127.0.0.1:7183/{board_id}/")
         );
+    }
+
+    // --- route_write: 自板/他ノード板の振り分けとエラー写像 --------------------
+
+    /// 自板を開設した registry・板鍵・常駐セッション管理と board_id を返す(pow=0 で採番を軽く)。
+    fn route_write_deps() -> (
+        std::sync::Arc<crate::livechat::registry::LivechatRegistry>,
+        std::sync::Arc<crate::livechat::board::BoardKeyManager>,
+        std::sync::Arc<crate::livechat::manager::ParticipantManager>,
+        String,
+    ) {
+        use nostr::Keys;
+        use std::sync::Arc;
+        let registry = crate::livechat::registry::LivechatRegistry::new(128);
+        let persona = Keys::generate();
+        let board_id = persona.public_key().to_hex();
+        registry
+            .open_thread(
+                persona,
+                format!("30311:{board_id}:0123456789abcdef0123456789abcdef"),
+                1,
+                1_700_000_000,
+                "実況スレ",
+                BoardSettings {
+                    first_post_pow_bits: 0,
+                    ..Default::default()
+                },
+                "198.51.100.1:7147",
+            )
+            .unwrap();
+        let board_keys = Arc::new(crate::livechat::board::BoardKeyManager::new(
+            Arc::new(crate::store::Store::open_in_memory().unwrap()),
+            crate::identity::Keystore::ephemeral(),
+        ));
+        let manager =
+            crate::livechat::manager::ParticipantManager::new(Arc::clone(&board_keys), None);
+        (registry, board_keys, manager, board_id)
+    }
+
+    fn write_input(body: &str) -> WriteInput {
+        WriteInput {
+            name: None,
+            mail: None,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn route_write_local_board_is_numbered() {
+        let (registry, board_keys, manager, board_id) = route_write_deps();
+        let r = route_write(
+            &registry,
+            &board_keys,
+            &manager,
+            &board_id,
+            write_input("自板への書き込み"),
+            1_700_000_010,
+        );
+        assert_eq!(r, Ok(()), "自板は採番経路へ振り分けられ成功する");
+        let snap = registry.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.res.len(), 1, "確定レスに反映される");
+    }
+
+    #[test]
+    fn route_write_over_long_body_is_invalid_not_unavailable() {
+        // 本文長超過は BuildFailed(形式違反)。503(Unavailable/再試行誘導)ではなく
+        // 400(Invalid)へ写像されること(レビュー指摘 1 の回帰防止)。
+        let (registry, board_keys, manager, board_id) = route_write_deps();
+        let too_long = "あ".repeat(crate::event::livechat::BODY_MAX_CHARS + 1);
+        let r = route_write(
+            &registry,
+            &board_keys,
+            &manager,
+            &board_id,
+            write_input(&too_long),
+            1_700_000_010,
+        );
+        assert_eq!(
+            r,
+            Err(LivechatOpError::Invalid),
+            "本文長超過は入力不正(400)へ写像される"
+        );
+    }
+
+    #[test]
+    fn route_write_unopened_board_is_not_found() {
+        use nostr::Keys;
+        let (registry, board_keys, manager, _board_id) = route_write_deps();
+        // 自板でも開いている他ノード板でもない board_id は定型 not_found。
+        let unknown = Keys::generate().public_key().to_hex();
+        let r = route_write(
+            &registry,
+            &board_keys,
+            &manager,
+            &unknown,
+            write_input("未オープン板への書き込み"),
+            1_700_000_010,
+        );
+        assert_eq!(r, Err(LivechatOpError::NotFound));
     }
 }

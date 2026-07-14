@@ -949,18 +949,17 @@ impl LivechatDirectory for LivechatAdapter {
     }
 
     fn write(&self, board_id: &str, input: WriteInput) -> Result<(), LivechatOpError> {
-        match self
-            .manager
-            .write(board_id, input.name, input.mail, input.body)
-        {
-            Ok(()) => Ok(()),
-            Err(peca_p2p_yp::livechat::manager::ManagerError::NotOpen) => {
-                Err(LivechatOpError::NotFound)
-            }
-            Err(peca_p2p_yp::livechat::manager::ManagerError::KeyUnavailable) => {
-                Err(LivechatOpError::Unavailable)
-            }
-        }
+        // 自板(自ノードホスト)は互換 API と同一の採番経路へ、他ノード板は常駐セッションへ
+        // 振り分ける(ライブラリの route_write が本体 — 自板をセッション経路へ誤送すると
+        // NotOpen で書けない回帰を防ぐ。詳細は route_write の doc)。
+        peca_p2p_yp::web::livechat::route_write(
+            &self.registry,
+            &self.board_keys,
+            &self.manager,
+            board_id,
+            input,
+            Self::now(),
+        )
     }
 }
 

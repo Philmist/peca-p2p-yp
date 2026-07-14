@@ -127,6 +127,15 @@ pub struct LivechatWorld {
     us6_last_body: Option<String>,
     /// アクセスに使う Host ヘッダ(loopback 外検証用)。
     us6_request_host: Option<String>,
+    // --- ローカル API 書き込み経路(回帰防止 — route_write)---
+    /// 自板をホストするレジストリ・板鍵・常駐セッション管理(route_write の依存)。
+    local_write_registry: Option<std::sync::Arc<LivechatRegistry>>,
+    local_write_board_keys: Option<std::sync::Arc<peca_p2p_yp::livechat::board::BoardKeyManager>>,
+    local_write_manager: Option<std::sync::Arc<peca_p2p_yp::livechat::manager::ParticipantManager>>,
+    /// 自板の board_id。
+    local_write_board_id: Option<String>,
+    /// route_write の結果(When で実行 → Then で検証)。
+    local_write_result: Option<Result<(), peca_p2p_yp::web::livechat::LivechatOpError>>,
 }
 
 impl std::fmt::Debug for LivechatWorld {
@@ -1827,4 +1836,142 @@ async fn compat_error_is_conventional_and_safe(world: &mut AppWorld) {
     assert!(!body.contains("panic"));
     assert!(!body.contains(".rs:"));
     assert!(!body.to_lowercase().contains("ban"));
+}
+
+// ---------------------------------------------------------------------------
+// 回帰防止: HTTP UI/ローカル API から自板へ書き込む経路(web::livechat::route_write)
+//
+// LivechatDirectory::write(バイナリの LivechatAdapter)が自板を常駐セッション経路
+// (manager.write)へ誤送すると NotOpen で書けなくなる不具合があった。振り分けの本体を
+// ライブラリの route_write へ切り出し、ここで自板 = 採番反映・未オープン他ノード板 =
+// not_found を直接検証する。
+// ---------------------------------------------------------------------------
+
+/// route_write を呼び、結果を World へ格納する(2 つの When が board_id と本文だけ違う共通処理)。
+fn call_route_write(c: &mut LivechatWorld, board_id: &str, body: &str) {
+    let result = peca_p2p_yp::web::livechat::route_write(
+        c.local_write_registry.as_ref().expect("registry"),
+        c.local_write_board_keys.as_ref().expect("board_keys"),
+        c.local_write_manager.as_ref().expect("manager"),
+        board_id,
+        peca_p2p_yp::web::livechat::WriteInput {
+            name: None,
+            mail: None,
+            body: body.to_string(),
+        },
+        unix_now(),
+    );
+    c.local_write_result = Some(result);
+}
+
+#[given("配信者が自ノードで自分の実況スレをホストしている")]
+async fn broadcaster_hosts_own_thread(world: &mut AppWorld) {
+    let registry = LivechatRegistry::new(128);
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    registry
+        .open_thread(
+            persona,
+            format!("30311:{board_id}:{GUID}"),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            // 採番判定の主題は「自板が書き込み経路へ正しく振り分くか」なので、
+            // 初回 PoW 計算のコストは外す(0 でも accept_write の採番パスは同一)。
+            BoardSettings {
+                first_post_pow_bits: 0,
+                ..Default::default()
+            },
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+    let board_keys = std::sync::Arc::new(peca_p2p_yp::livechat::board::BoardKeyManager::new(
+        std::sync::Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap()),
+        peca_p2p_yp::identity::Keystore::ephemeral(),
+    ));
+    let manager = peca_p2p_yp::livechat::manager::ParticipantManager::new(
+        std::sync::Arc::clone(&board_keys),
+        None,
+    );
+    let c = ctx(world);
+    c.local_write_registry = Some(registry);
+    c.local_write_board_keys = Some(board_keys);
+    c.local_write_manager = Some(manager);
+    c.local_write_board_id = Some(board_id);
+}
+
+#[when("配信者がローカル API 経由で自板へ書き込む")]
+async fn broadcaster_writes_to_own_board_via_local_api(world: &mut AppWorld) {
+    let c = ctx(world);
+    let board_id = c.local_write_board_id.clone().expect("board_id");
+    call_route_write(c, &board_id, "自板へのテスト書き込み");
+}
+
+#[then("書き込みは採番され自板の確定レスに反映される")]
+async fn write_is_numbered_and_reflected_in_own_board(world: &mut AppWorld) {
+    let c = ctx(world);
+    assert_eq!(
+        c.local_write_result,
+        Some(Ok(())),
+        "自板への書き込みは成功する(セッション経路へ誤送されない)"
+    );
+    let registry = c.local_write_registry.as_ref().expect("registry");
+    let board_id = c.local_write_board_id.as_ref().expect("board_id");
+    let snapshot = registry
+        .board_snapshot(board_id)
+        .expect("自板スナップショット");
+    assert_eq!(
+        snapshot.active.res.len(),
+        1,
+        "書き込みが採番され確定レスに反映される"
+    );
+    assert_eq!(
+        snapshot.active.res[0].body, "自板へのテスト書き込み",
+        "確定レスの本文が一致する"
+    );
+    assert_eq!(
+        snapshot.active.res[0].res_no,
+        Some(1),
+        "res_no=1 で採番される"
+    );
+}
+
+#[when("配信者がローカル API 経由で未オープンの他ノード板へ書き込む")]
+async fn broadcaster_writes_to_unopened_remote_board(world: &mut AppWorld) {
+    let c = ctx(world);
+    // 自板でも開いている他ノード板でもない board_id(常駐セッション未オープン)。
+    let unknown_board = Keys::generate().public_key().to_hex();
+    call_route_write(c, &unknown_board, "未オープン板への書き込み");
+}
+
+#[then("書き込みは定型 not_found で拒否され内部情報は漏洩しない")]
+async fn write_is_rejected_with_typical_not_found(world: &mut AppWorld) {
+    use peca_p2p_yp::web::livechat::LivechatOpError;
+    let c = ctx(world);
+    let err = match c.local_write_result {
+        Some(Err(e)) => e,
+        other => panic!("書き込みは拒否されるべき: {other:?}"),
+    };
+    // 定型 not_found へ写像される(未開設/他ノード板/未サポートを区別せず丸める — 配線状態の非開示)。
+    assert_eq!(
+        err,
+        LivechatOpError::NotFound,
+        "未オープンの他ノード板への書き込みは定型 not_found"
+    );
+    // 応答本文レベルでも内部情報が乗らないことを確認する(compat 側の非漏洩検証と同水準)。
+    // LivechatOpError::into_response は payload を持たない定型応答のみを返す。
+    let resp = err.into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(!body.contains(".rs:"), "内部パスを含まない: {body}");
+    assert!(!body.contains("panic"), "内部情報を含まない: {body}");
+    // 板 id など内部識別子も乗らない(定型コードのみ)。
+    let board_id = c.local_write_board_id.as_ref().expect("board_id");
+    assert!(
+        !body.contains(board_id.as_str()),
+        "板 id を含まない: {body}"
+    );
 }
