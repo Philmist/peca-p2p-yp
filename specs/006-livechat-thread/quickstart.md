@@ -49,8 +49,9 @@ cargo test --test livechat -- us2
 ## 4. セキュリティ・ネガティブ(US3・US4 / SC-004)
 
 ```powershell
-cargo test --test contract -- livechat   # モックピアによる契約ネガティブ
-cargo test --test cucumber -- security
+cargo test --test thread_events          # イベント契約(ネガティブ含む)
+cargo test --test thread_delivery        # モックピアによる配送契約ネガティブ
+cargo test --test cucumber -- -i tests/features/security.feature
 ```
 
 - 署名不一致 announce / 偽 ORDER / 過大レス / レート違反 → 100% 不可視 +
@@ -62,7 +63,7 @@ cargo test --test cucumber -- security
 
 ```powershell
 cargo test --test livechat -- us5
-cargo test --test contract -- compat_bbs
+cargo test --test compat_bbs
 ```
 
 - レス上限(テスト用に小さく設定)→ 次スレ移行・旧スレ書き込み不可

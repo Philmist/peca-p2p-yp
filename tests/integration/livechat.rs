@@ -97,7 +97,7 @@ fn viewer_config(host: &LivechatHostNode) -> ParticipantConfig {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn announce_propagates_to_viewers() {
+async fn us1_announce_propagates_to_viewers() {
     let host = LivechatHostNode::spawn(0x1001).await;
     let viewer1 = TestNode::spawn(0x2001).await;
     let viewer2 = TestNode::spawn(0x2002).await;
@@ -134,7 +134,7 @@ async fn announce_propagates_to_viewers() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn explicit_join_syncs_all_res_in_order() {
+async fn us1_explicit_join_syncs_all_res_in_order() {
     let host = LivechatHostNode::spawn(0x1002).await;
     // 板鍵(視聴者は持たない — 書き込み側の鍵)で 3 レスを seed。
     let board_key = Keys::generate();
@@ -167,7 +167,7 @@ async fn explicit_join_syncs_all_res_in_order() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn announce_alone_does_not_connect() {
+async fn us1_announce_alone_does_not_connect() {
     let host = LivechatHostNode::spawn(0x1003).await;
     let viewer = TestNode::spawn(0x2003).await;
 
@@ -210,7 +210,7 @@ async fn announce_alone_does_not_connect() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn viewing_requires_no_board_key() {
+async fn us1_viewing_requires_no_board_key() {
     let host = LivechatHostNode::spawn(0x1004).await;
     let board_key = Keys::generate();
     host.open_thread("実況スレ", Default::default());
@@ -233,7 +233,7 @@ async fn viewing_requires_no_board_key() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn board_settings_reach_viewer() {
+async fn us1_board_settings_reach_viewer() {
     use peca_p2p_yp::livechat::thread::BoardSettings;
 
     let host = LivechatHostNode::spawn(0x1005).await;
@@ -274,7 +274,7 @@ fn no_pow_settings() -> BoardSettings {
 
 /// 単独参加者の書き込みが採番・確定される(FR-007/008 の基本ラウンドトリップ)。
 #[tokio::test]
-async fn single_write_is_numbered_and_confirmed() {
+async fn us2_single_write_is_numbered_and_confirmed() {
     let host = LivechatHostNode::spawn(0x1006).await;
     host.open_thread("実況スレ", no_pow_settings());
 
@@ -305,7 +305,7 @@ async fn single_write_is_numbered_and_confirmed() {
 /// ホスト(シーケンサ)が単点で採番するため、2 参加者の確定列は res_no → event_id が
 /// 完全一致し、res_no は 1..=N で欠番なく一意(不変条件 T3/O1・PlusCal 検査済み特性)。
 #[tokio::test]
-async fn concurrent_writes_agree_on_res_order() {
+async fn us2_concurrent_writes_agree_on_res_order() {
     let host = LivechatHostNode::spawn(0x1007).await;
     host.open_thread("実況スレ", no_pow_settings());
 
@@ -360,7 +360,7 @@ async fn concurrent_writes_agree_on_res_order() {
 /// ことを確認する軽量版。フル負荷プロファイルは別途 bench で計測する。
 #[tokio::test]
 #[ignore = "負荷プロファイル(明示実行): cargo test --test livechat -- --ignored"]
-async fn burst_writes_all_confirmed_without_gaps() {
+async fn us2_burst_writes_all_confirmed_without_gaps() {
     let host = LivechatHostNode::spawn(0x1008).await;
     // レート上限を十分大きく(バースト 20 件を受けられるよう)設定した板で確認する。
     host.open_thread("実況スレ", no_pow_settings());
@@ -394,7 +394,7 @@ async fn burst_writes_all_confirmed_without_gaps() {
 /// registry が BAN 済み板鍵を Rejected として扱う(採番せず配布もしない)ことを確認する。
 /// `expect_total=0` で待ち、一定時間内に確定が届かないことを見る。
 #[tokio::test]
-async fn banned_board_key_write_is_never_numbered_over_real_connection() {
+async fn us4_banned_board_key_write_is_never_numbered_over_real_connection() {
     let host = LivechatHostNode::spawn(0x1101).await;
     host.open_thread("実況スレ", no_pow_settings());
 
@@ -433,7 +433,7 @@ async fn banned_board_key_write_is_never_numbered_over_real_connection() {
 /// `Thread::visible_res`)を適用すると、対象レスのみ非表示になり、他のレスの res_no は
 /// 詰められない(欠番として維持される)。
 #[tokio::test]
-async fn ng_hides_locally_without_affecting_host_numbering() {
+async fn us4_ng_hides_locally_without_affecting_host_numbering() {
     let host = LivechatHostNode::spawn(0x1102).await;
     host.open_thread("実況スレ", no_pow_settings());
 
@@ -479,7 +479,7 @@ async fn ng_hides_locally_without_affecting_host_numbering() {
 ///
 /// PoW なしでの書き込みは採番されず、PoW 付きなら採番される(実ノード経由での確認)。
 #[tokio::test]
-async fn rotated_key_requires_pow_for_first_write_over_real_connection() {
+async fn us4_rotated_key_requires_pow_for_first_write_over_real_connection() {
     let host = LivechatHostNode::spawn(0x1103).await;
     host.open_thread(
         "実況スレ",
@@ -541,7 +541,7 @@ async fn rotated_key_requires_pow_for_first_write_over_real_connection() {
 /// レス上限到達で次スレへ移行し、旧スレは書き込み不可・新規書き込みは次スレへ採番される
 /// (FR-012/FR-013)。実ノード経由(TCP 接続)で確認する。
 #[tokio::test]
-async fn res_limit_reached_migrates_to_next_thread_over_real_connection() {
+async fn us5_res_limit_reached_migrates_to_next_thread_over_real_connection() {
     let host = LivechatHostNode::spawn(0x1201).await;
     // res_limit を小さくして上限到達を素早く再現する。
     host.open_thread(
@@ -629,7 +629,7 @@ async fn res_limit_reached_migrates_to_next_thread_over_real_connection() {
 
 /// 明示クローズ → 参加者はスレデータを削除する(FR-014/FR-015)。実ノード経由で確認する。
 #[tokio::test]
-async fn explicit_close_deletes_participant_thread_data_over_real_connection() {
+async fn us5_explicit_close_deletes_participant_thread_data_over_real_connection() {
     let host = LivechatHostNode::spawn(0x1202).await;
     host.open_thread("実況スレ", no_pow_settings());
     let board_key = Keys::generate();
@@ -715,7 +715,7 @@ async fn explicit_close_deletes_participant_thread_data_over_real_connection() {
 /// ホストとの通知なき切断(kill 相当)はスレを凍結する。取得済みレスの閲覧は継続し、
 /// 書き込みはできない(FR-014)。
 #[tokio::test]
-async fn host_disconnect_without_close_freezes_thread() {
+async fn us5_host_disconnect_without_close_freezes_thread() {
     let host = LivechatHostNode::spawn(0x1203).await;
     host.open_thread("実況スレ", no_pow_settings());
     let board_key = Keys::generate();
@@ -796,7 +796,7 @@ async fn host_disconnect_without_close_freezes_thread() {
 
 /// 500 レス進行済みのスレへ途中参加すると、全レスが確定順序どおりに取得・表示される。
 #[tokio::test]
-async fn late_joiner_syncs_all_existing_res_in_order() {
+async fn us5_late_joiner_syncs_all_existing_res_in_order() {
     let host = LivechatHostNode::spawn(0x1204).await;
     host.open_thread("実況スレ", no_pow_settings());
     let board_key = Keys::generate();
@@ -828,7 +828,7 @@ async fn late_joiner_syncs_all_existing_res_in_order() {
 /// 「15 秒以内に全ログ同期」を実測する。
 #[tokio::test]
 #[ignore]
-async fn sc003_late_joiner_syncs_4000_res_within_15_seconds() {
+async fn us5_sc003_late_joiner_syncs_4000_res_within_15_seconds() {
     let host = LivechatHostNode::spawn(0x1205).await;
     host.open_thread(
         "実況スレ",
