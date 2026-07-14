@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>実況スレ — peca-p2p-yp</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
+    th, td { border: 1px solid #ccc; padding: 0.3rem 0.5rem; text-align: left; font-size: 0.9rem; }
+    th { background: #f0f0f0; }
+    .err { color: #b00; }
+    .ok { color: #060; }
+    .muted { color: #888; }
+    button { cursor: pointer; }
+    section { margin-bottom: 1.6rem; }
+    h2 { margin: 1.4rem 0 0.2rem; font-size: 1.1rem; border-bottom: 1px solid #ccc; padding-bottom: 0.2rem; }
+    .badge-local { color: #060; font-weight: bold; }
+    .badge-remote { color: #46c; }
+    .res-no { color: #888; margin-right: 0.4rem; }
+    .res-name { color: #060; font-weight: bold; }
+    .res-mail { color: #46c; }
+    .res-pending { color: #b06000; font-style: italic; }
+    .rules { background: #f8f8f8; border: 1px solid #ddd; padding: 0.5rem 0.8rem; border-radius: 4px; }
+    .rules a { color: #46c; }
+    .toolbar button { margin-right: 0.4rem; }
+    input, textarea, select { font: inherit; }
+    textarea { width: 100%; box-sizing: border-box; }
+    label { display: inline-block; min-width: 6rem; }
+    .row { margin: 0.3rem 0; }
+    #board-url { font-family: monospace; background: #f0f0f0; padding: 0.2rem 0.4rem; }
+    .banner { padding: 0.5rem 0.8rem; margin-bottom: 0.6rem; border-radius: 4px; }
+    .banner-warn { background: #fff3cd; border: 1px solid #b06000; color: #663c00; }
+    .banner-info { background: #e7f1ff; border: 1px solid #4a76c4; color: #1c3b6e; }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; トップ</a></p>
+  <h1>実況スレ(配信実況掲示板)</h1>
+  <div id="disabled-banner" class="banner banner-warn" hidden>
+    スレ機能が無効(livechat_enabled=false)か、供給元が未配線です。設定を確認してください。
+  </div>
+
+  <!-- スレ開設(掲載中チャンネルのペルソナが配信者としてスレを立てる) -->
+  <section>
+    <h2>スレを開設する(配信者)</h2>
+    <div class="row">
+      <label for="open-channel">チャンネル</label>
+      <select id="open-channel"><option value="">— 掲載中チャンネルを選択 —</option></select>
+    </div>
+    <div class="row">
+      <label for="open-title">タイトル</label>
+      <input id="open-title" type="text" size="40" placeholder="実況スレ">
+    </div>
+    <div class="row">
+      <button id="open-btn">スレを開設</button>
+      <span id="open-status" class="muted"></span>
+    </div>
+  </section>
+
+  <!-- スレ一覧(自板 + 他ノード板) -->
+  <section>
+    <h2>スレ一覧</h2>
+    <div id="list-status" class="muted">読み込み中...</div>
+    <table id="threads-table" hidden>
+      <thead>
+        <tr><th>種別</th><th>タイトル</th><th>板ID</th><th>世代</th><th>レス数</th><th>接続先(tip)</th><th>操作</th></tr>
+      </thead>
+      <tbody id="threads-body"></tbody>
+    </table>
+  </section>
+
+  <!-- スレ詳細(閲覧 + 書き込み + 操作) -->
+  <section id="detail" hidden>
+    <h2 id="detail-title">スレ詳細</h2>
+    <div class="row">
+      互換 API 板 URL(専ブラ向け): <span id="board-url"></span>
+      <button id="copy-url-btn">コピー</button>
+    </div>
+    <div class="row">
+      <span id="detail-badge"></span>
+      <span class="toolbar">
+        <button id="refresh-btn">更新</button>
+        <button id="next-btn">次スレ</button>
+        <button id="close-btn">クローズ</button>
+        <button id="leave-btn">閉じる(セッション終了)</button>
+        <button id="rotate-btn">板鍵ローテーション</button>
+      </span>
+    </div>
+
+    <div id="rules-wrap" class="row" hidden>
+      <div class="muted">ローカルルール</div>
+      <div id="rules" class="rules"></div>
+    </div>
+
+    <table>
+      <thead><tr><th>#</th><th>名前</th><th>本文</th></tr></thead>
+      <tbody id="res-body"></tbody>
+    </table>
+
+    <!-- 書き込み -->
+    <div class="row" style="margin-top:0.8rem">
+      <div class="row"><label for="w-name">名前</label><input id="w-name" type="text" size="20"></div>
+      <div class="row"><label for="w-mail">メール</label><input id="w-mail" type="text" size="20"></div>
+      <div class="row"><textarea id="w-body" rows="3" placeholder="本文"></textarea></div>
+      <div class="row"><button id="write-btn">書き込む</button> <span id="write-status" class="muted"></span></div>
+    </div>
+
+    <!-- モデレーション(配信者) -->
+    <details>
+      <summary>モデレーション(配信者)</summary>
+      <div class="row"><label for="ban-key">板鍵 BAN</label>
+        <input id="ban-key" type="text" size="40" placeholder="板鍵 pubkey hex">
+        <button id="ban-btn">BAN</button><button id="unban-btn">解除</button></div>
+      <div class="row"><label for="connban-addr">接続 BAN</label>
+        <input id="connban-addr" type="text" size="24" placeholder="ip:port">
+        <button id="connban-btn">ConnBan</button><button id="unconnban-btn">解除</button></div>
+    </details>
+
+    <!-- 板設定変更(配信者) -->
+    <details>
+      <summary>板設定を変更(配信者)</summary>
+      <div class="row"><label for="s-title">タイトル</label><input id="s-title" type="text" size="40"></div>
+      <div class="row"><label for="s-noname">名無し名</label><input id="s-noname" type="text" size="24"></div>
+      <div class="row"><label for="s-reslimit">レス上限</label><input id="s-reslimit" type="number" min="100" max="4000"></div>
+      <div class="row"><label for="s-pow">初回PoW</label><input id="s-pow" type="number" min="0" max="32"></div>
+      <div class="row"><label for="s-rules">ルール</label></div>
+      <div class="row"><textarea id="s-rules" rows="4" placeholder="ローカルルール(Markdown)"></textarea></div>
+      <div class="row"><button id="settings-btn">設定を保存</button> <span id="settings-status" class="muted"></span></div>
+    </details>
+  </section>
+
+  <noscript>この画面は JavaScript を利用します。</noscript>
+  <script>
+    let token = null;
+    let currentBoard = null;
+    let currentSummary = null;
+
+    async function loadToken() {
+      const res = await fetch('/api/v1/token');
+      if (!res.ok) throw new Error('token');
+      token = (await res.json()).token;
+    }
+
+    function escHtml(s) {
+      if (s === null || s === undefined) return '';
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function shortId(id) { return id ? id.substring(0, 12) + '…' : ''; }
+
+    async function api(method, path, body) {
+      const opts = { method, headers: {} };
+      if (method !== 'GET') opts.headers['X-Api-Token'] = token;
+      if (body !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      return fetch('/api/v1' + path, opts);
+    }
+
+    // 掲載中チャンネル(スレ開設の選択肢)。
+    async function loadChannels() {
+      const sel = document.getElementById('open-channel');
+      try {
+        const res = await fetch('/api/v1/announced');
+        if (!res.ok) return;
+        const data = await res.json();
+        for (const ch of (data.channels ?? [])) {
+          if (ch.state === 'ended') continue;
+          const opt = document.createElement('option');
+          // channel_id は 30311 の d タグ(guid hex32)。
+          opt.value = ch.channel_id;
+          opt.textContent = (ch.name || '(無題)') + ' — ' + shortId(ch.channel_id);
+          sel.appendChild(opt);
+        }
+      } catch (_) {}
+    }
+
+    // スレ一覧。
+    async function loadThreads() {
+      const statusEl = document.getElementById('list-status');
+      try {
+        const res = await fetch('/api/v1/livechat/threads');
+        if (!res.ok) { statusEl.textContent = 'エラー: ' + res.status; return; }
+        const threads = await res.json();
+        const tbody = document.getElementById('threads-body');
+        tbody.innerHTML = '';
+        if (threads.length === 0) {
+          statusEl.textContent = 'スレはありません。';
+          document.getElementById('threads-table').hidden = true;
+          return;
+        }
+        statusEl.textContent = '';
+        document.getElementById('threads-table').hidden = false;
+        for (const t of threads) {
+          const tr = document.createElement('tr');
+          const badge = t.is_local
+            ? '<span class="badge-local">自板</span>'
+            : '<span class="badge-remote">他ノード</span>';
+          const openBtn = t.is_local
+            ? `<button class="view-btn" data-b="${escHtml(t.board_id)}">閲覧</button>`
+            : `<button class="join-btn" data-b="${escHtml(t.board_id)}">開く</button>`;
+          tr.innerHTML = `
+            <td>${badge}</td>
+            <td>${escHtml(t.title)}</td>
+            <td title="${escHtml(t.board_id)}">${escHtml(shortId(t.board_id))}</td>
+            <td>${t.generation}</td>
+            <td>${t.res_count}</td>
+            <td>${escHtml(t.tip)}</td>
+            <td>${openBtn}</td>`;
+          tr._summary = t;
+          tbody.appendChild(tr);
+        }
+        document.querySelectorAll('.view-btn').forEach(b =>
+          b.addEventListener('click', () => selectThread(b.dataset.b, findSummary(b.dataset.b))));
+        document.querySelectorAll('.join-btn').forEach(b =>
+          b.addEventListener('click', () => joinThread(b.dataset.b)));
+      } catch (e) {
+        statusEl.textContent = 'エラー: ' + e;
+      }
+    }
+
+    function findSummary(board) {
+      const rows = document.querySelectorAll('#threads-body tr');
+      for (const r of rows) if (r._summary && r._summary.board_id === board) return r._summary;
+      return null;
+    }
+
+    // 他ノード板を開く(常駐セッション起動)→ 少し待ってから詳細表示。
+    async function joinThread(board) {
+      const r = await api('POST', `/livechat/threads/${board}/join`);
+      if (r.status === 204) {
+        setTimeout(() => selectThread(board, findSummary(board)), 400);
+      } else {
+        alert('スレを開けません: ' + r.status);
+      }
+    }
+
+    // スレ詳細を表示する。
+    async function selectThread(board, summary) {
+      currentBoard = board;
+      currentSummary = summary;
+      const res = await fetch('/api/v1/livechat/threads/' + board);
+      const detail = document.getElementById('detail');
+      if (!res.ok) {
+        // 他ノード板は接続直後まだ供給が始まっていないことがある(リトライ導線)。
+        detail.hidden = false;
+        document.getElementById('res-body').innerHTML =
+          '<tr><td colspan="3" class="muted">まだ取得できていません。「更新」を押してください。</td></tr>';
+        document.getElementById('detail-title').textContent = summary ? summary.title : board;
+        setBoardUrl(board);
+        return;
+      }
+      const d = await res.json();
+      detail.hidden = false;
+      document.getElementById('detail-title').textContent = d.settings.title || (summary ? summary.title : board);
+      document.getElementById('detail-badge').innerHTML =
+        (summary && summary.is_local) ? '<span class="badge-local">自板</span>' : '<span class="badge-remote">他ノード板</span>';
+      setBoardUrl(board);
+
+      // ローカルルール(サーバが安全 HTML 化済み — そのまま挿入してよい)。
+      const rulesWrap = document.getElementById('rules-wrap');
+      if (d.settings.local_rules_html) {
+        document.getElementById('rules').innerHTML = d.settings.local_rules_html;
+        rulesWrap.hidden = false;
+      } else {
+        rulesWrap.hidden = true;
+      }
+
+      // レス一覧 + 送信中。
+      const tbody = document.getElementById('res-body');
+      tbody.innerHTML = '';
+      for (const r of d.res) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="res-no">${r.res_no}</td>
+          <td><span class="res-name">${escHtml(r.name)}</span>${r.mail ? ' <span class="res-mail">['+escHtml(r.mail)+']</span>' : ''}</td>
+          <td>${escHtml(r.body)}</td>`;
+        tbody.appendChild(tr);
+      }
+      for (const p of (d.pending ?? [])) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="res-no">—</td>
+          <td><span class="res-name">${escHtml(p.name)}</span></td>
+          <td class="res-pending">${escHtml(p.body)}(送信中)</td>`;
+        tbody.appendChild(tr);
+      }
+
+      // 設定フォームへ現在値を反映。
+      document.getElementById('s-title').value = d.settings.title || '';
+      document.getElementById('s-noname').value = d.settings.noname_name || '';
+      document.getElementById('s-reslimit').value = d.settings.res_limit || 1000;
+      document.getElementById('s-pow').value = d.settings.first_post_pow_bits ?? 20;
+      document.getElementById('s-rules').value = d.settings.local_rules || '';
+    }
+
+    function setBoardUrl(board) {
+      document.getElementById('board-url').textContent = 'http://127.0.0.1:7183/' + board + '/';
+    }
+
+    // --- 操作ハンドラ ---
+    document.getElementById('open-btn').addEventListener('click', async () => {
+      const channel_id = document.getElementById('open-channel').value;
+      const title = document.getElementById('open-title').value;
+      const st = document.getElementById('open-status');
+      if (!channel_id) { st.textContent = 'チャンネルを選択してください'; return; }
+      const r = await api('POST', '/livechat/threads', { channel_id, title: title || null });
+      if (r.status === 201) {
+        const j = await r.json();
+        st.textContent = '開設しました: ' + shortId(j.board_id);
+        loadThreads();
+      } else {
+        st.textContent = 'エラー: ' + r.status;
+      }
+    });
+
+    document.getElementById('copy-url-btn').addEventListener('click', () => {
+      const url = document.getElementById('board-url').textContent;
+      navigator.clipboard.writeText(url).then(
+        () => { document.getElementById('copy-url-btn').textContent = 'コピー済'; },
+        () => {});
+    });
+
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+      if (currentBoard) selectThread(currentBoard, currentSummary);
+    });
+    document.getElementById('leave-btn').addEventListener('click', async () => {
+      if (!currentBoard) return;
+      await api('POST', `/livechat/threads/${currentBoard}/leave`);
+      document.getElementById('detail').hidden = true;
+      currentBoard = null;
+    });
+    document.getElementById('next-btn').addEventListener('click', async () => {
+      if (!currentBoard) return;
+      const r = await api('POST', `/livechat/threads/${currentBoard}/next`);
+      if (r.ok) { loadThreads(); selectThread(currentBoard, currentSummary); }
+      else alert('次スレ操作に失敗: ' + r.status);
+    });
+    document.getElementById('close-btn').addEventListener('click', async () => {
+      if (!currentBoard) return;
+      if (!confirm('スレをクローズしますか?(データは揮発します)')) return;
+      const r = await api('POST', `/livechat/threads/${currentBoard}/close`);
+      if (r.status === 204) { document.getElementById('detail').hidden = true; loadThreads(); }
+      else alert('クローズに失敗: ' + r.status);
+    });
+    document.getElementById('rotate-btn').addEventListener('click', async () => {
+      if (!currentBoard) return;
+      const r = await api('POST', `/livechat/boards/${currentBoard}/rotate-key`);
+      if (r.ok) { const j = await r.json(); alert('新しい板鍵: ' + j.pubkey); }
+      else alert('ローテーションに失敗: ' + r.status);
+    });
+
+    document.getElementById('write-btn').addEventListener('click', async () => {
+      if (!currentBoard) return;
+      const body = document.getElementById('w-body').value;
+      const st = document.getElementById('write-status');
+      if (!body) { st.textContent = '本文を入力してください'; return; }
+      const r = await api('POST', `/livechat/threads/${currentBoard}/write`, {
+        name: document.getElementById('w-name').value || null,
+        mail: document.getElementById('w-mail').value || null,
+        body,
+      });
+      if (r.status === 202) {
+        st.textContent = '送信しました(送信中 → 確定を待ちます)';
+        document.getElementById('w-body').value = '';
+        setTimeout(() => selectThread(currentBoard, currentSummary), 500);
+      } else {
+        st.textContent = 'エラー: ' + r.status;
+      }
+    });
+
+    async function moderate(path, body, okMsg) {
+      if (!currentBoard) return;
+      const r = await api('POST', `/livechat/threads/${currentBoard}/${path}`, body);
+      alert(r.status === 204 ? okMsg : ('失敗: ' + r.status));
+    }
+    document.getElementById('ban-btn').addEventListener('click', () =>
+      moderate('ban', { target: document.getElementById('ban-key').value }, 'BAN しました'));
+    document.getElementById('unban-btn').addEventListener('click', () =>
+      moderate('unban', { target: document.getElementById('ban-key').value }, 'BAN 解除しました'));
+    document.getElementById('connban-btn').addEventListener('click', () =>
+      moderate('connban', { target: document.getElementById('connban-addr').value }, 'ConnBan しました'));
+    document.getElementById('unconnban-btn').addEventListener('click', () =>
+      moderate('unconnban', { target: document.getElementById('connban-addr').value }, 'ConnBan 解除しました'));
+
+    document.getElementById('settings-btn').addEventListener('click', async () => {
+      if (!currentBoard) return;
+      const st = document.getElementById('settings-status');
+      const r = await api('PUT', `/livechat/threads/${currentBoard}/settings`, {
+        title: document.getElementById('s-title').value,
+        noname_name: document.getElementById('s-noname').value,
+        res_limit: parseInt(document.getElementById('s-reslimit').value, 10),
+        local_rules: document.getElementById('s-rules').value,
+        first_post_pow_bits: parseInt(document.getElementById('s-pow').value, 10),
+      });
+      if (r.status === 204) { st.textContent = '保存しました'; selectThread(currentBoard, currentSummary); }
+      else st.textContent = 'エラー: ' + r.status;
+    });
+
+    (async () => {
+      try { await loadToken(); } catch (_) {}
+      await Promise.all([loadChannels(), loadThreads()]);
+      setInterval(loadThreads, 8000);
+    })();
+  </script>
+</body>
+</html>

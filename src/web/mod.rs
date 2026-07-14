@@ -405,12 +405,14 @@ async fn static_handler(req: Request) -> Response {
     const PEERS_HTML: &str = include_str!("../../ui/peers.html");
     const CHANNELS_HTML: &str = include_str!("../../ui/channels.html");
     const PERSONAS_HTML: &str = include_str!("../../ui/personas.html");
+    const LIVECHAT_HTML: &str = include_str!("../../ui/livechat.html");
     let html = match req.uri().path() {
         "/" | "/index.html" => Some(INDEX_HTML),
         "/settings.html" => Some(SETTINGS_HTML),
         "/peers.html" => Some(PEERS_HTML),
         "/channels.html" => Some(CHANNELS_HTML),
         "/personas.html" => Some(PERSONAS_HTML),
+        "/livechat.html" => Some(LIVECHAT_HTML),
         _ => None,
     };
     match html {
