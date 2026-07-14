@@ -279,3 +279,14 @@ T063/T065 は他の操作系の前提となる。
 - [X] T068 板設定変更の操作 API を追加する: `LivechatRegistry::update_settings`(検証・SETTINGS 即時配布は実装済み)を呼ぶ変更系エンドポイントを src/web/livechat.rs に追加する per FR-022 / US1-AC5 (missing)
 - [X] T069 互換 API を接続中・凍結中のリモート板に対応させる: T064 の参加者セッションが保持する確定レス・板設定を subject.txt / dat / SETTING.TXT / head.txt / bbs.cgi(書き込みはセッション経由の RES 送信)へ供給する(contracts/compat-api.md §板の URL 対応「接続中・凍結中のスレを持つ板のみが解決される」。現状は自ノードホスト板限定 — Phase 8 コミットで受容した既知の逸脱) per US6-AC1 / FR-026 / FR-028 (partial) 【実装: `resolve_snapshot`(registry 優先・無ければ SessionView から BoardSnapshot 合成)。bbs.cgi は UnknownBoard 時に manager.write へフォールバック。前世代非保持のため dat は現行世代のみ。end-to-end 統合テストで検証】
 - [X] T070 Web UI に実況スレ画面を追加する: スレ一覧(announce 由来)・スレを開く・閲覧・書き込み・板設定・NG/BAN・ローテーション・次スレ/クローズ・板 URL コピー表示を ui/ に実装し既存ページ群と同じ流儀で配線する(現状 ui/ に livechat ページが存在しない) per US1-AC2/AC5・US2-AC1(操作面) (partial) 【実装: ui/livechat.html(既存ページと同じ vanilla JS・token・escHtml 流儀)。static_handler + index.html ナビへ配線。開設/一覧/join/閲覧/書き込み(送信中表示)/設定/BAN/ConnBan/ローテーション/次スレ/クローズ/板 URL コピーを網羅】
+
+---
+
+## Phase 11: Convergence
+
+**Purpose**: /speckit-converge(2026-07-14 再実行)の所見。Phase 10 の 8 タスク
+(T063〜T070)はすべて実装・配線済みで、機能ギャップは解消されている。残るのは
+Phase 10 実装で陳腐化したドキュメントコメントの是正 1 件のみ(LOW)。
+T062(SC-007 実機確認)は既存タスクとして未完のまま残っている(利用者協力待ち)。
+
+- [X] T071 src/web/livechat.rs の冒頭モジュール doc を現状へ更新する: 「main.rs の起動配線箇所に TODO コメントあり・別担当が配線する」「『スレを開く』操作はスタブで 501 を返す」「書き込み・継続受信ループは US2」「モデレーションの HTTP エンドポイントは追加しない」の各記述は T063〜T067 で解消済みの実装と矛盾しており、保守者を誤導する。実装済みの供給元配線(main.rs の LivechatAdapter)・join/write/設定/NG/BAN/ConnBan/ローテーション/next/close の各エンドポイントを反映した記述へ書き換える per Constitution III(コードは読みやすく保守可能 — MUST) (partial)

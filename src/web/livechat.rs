@@ -1,33 +1,39 @@
-//! 実況スレ Web UI / ローカル API(T024/T025 — spec.md `livechat-thread`)
+//! 実況スレ Web UI / ローカル API(T024/T025・T063〜T068 — spec.md `livechat-thread`)
 //!
 //! - [`render_local_rules_html`](T025): ローカルルールの Markdown を安全な
 //!   サブセットのみ HTML へ描画する(FR-025 / research R7)。
-//! - (T024) `GET /api/v1/livechat/threads` / `GET /api/v1/livechat/threads/{board_id}`:
-//!   announce 由来のスレ一覧・板設定参照(タイトル・名無しのデフォルト名・
-//!   ローカルルール)・確定レス閲覧。供給元は [`LivechatDirectory`] を注入する
-//!   (`web/announced.rs` の `AnnouncedProvider` と同一パターン)。
+//! - [`board_compat_url`](T045/T057): 互換 API 板 URL(コピー用)を返す純粋関数。
+//! - `/api/v1/livechat` エンドポイント群(`routes()` — `super::api_router` が merge):
+//!   - 閲覧(T024): `GET /threads`(announce 由来のスレ一覧)/
+//!     `GET /threads/{board_id}`(板設定参照・確定レス閲覧・自分の送信中投稿
+//!     `pending` — 閲覧に板鍵は不要 = FR-016)。
+//!   - スレ開設(T063 — FR-001): `POST /threads`(掲載中チャンネルのペルソナ限定)。
+//!   - スレを開く/抜ける(T064 — FR-004): `POST /threads/{board_id}/join` / `leave`
+//!     (他ノード板の常駐セッションを起動/停止。接続は明示操作起点のみ)。
+//!   - 書き込み(T066 — FR-008): `POST /threads/{board_id}/write`。振り分けは
+//!     [`route_write`] — 自板はホスト採番経路(互換 bbs.cgi と同一)、他ノード板は
+//!     常駐セッション経由の RES 送信。
+//!   - 次スレ/クローズ(T065 — FR-013/FR-014): `POST /threads/{board_id}/next` / `close`。
+//!   - 板設定変更(T068 — FR-022): `PUT /threads/{board_id}/settings`。
+//!   - モデレーション(T067 — FR-017/FR-019): `POST /threads/{board_id}/ban` /
+//!     `unban` / `connban` / `unconnban`、`POST /boards/{board_id}/rotate-key`
+//!     (板鍵ローテーション。初回書き込みには `first_post_pow_bits` の PoW が課される)。
 //!
-//! ## 供給元の配線(本タスクでは自己完結)
+//! ## 供給元の配線
 //!
-//! [`LivechatDirectory`] の**トレイト定義のみ**を本モジュールが持ち、具体的な実体
-//! (自板 = `crate::livechat::registry::LivechatRegistry`、他ノード板 = gossip 受信
-//! 31311)を束ねた実装は別担当が配線する(`src/main.rs` の起動配線箇所に TODO
-//! コメントあり)。`registry.rs`・`event/view.rs`・`p2p/hub.rs` はいずれも本タスクの
-//! 変更範囲外(並行編集中)であり、本モジュールはそれらに依存しない。
+//! [`LivechatDirectory`] の**トレイト定義のみ**を本モジュールが持ち、具体的な実体は
+//! `src/main.rs` の `LivechatAdapter` が配線済み(T065): 自板 =
+//! `crate::livechat::registry::LivechatRegistry`、他ノード板 = gossip 受信 31311
+//! (`EventStore`)+ `crate::livechat::manager::ParticipantManager` の常駐セッション
+//! (`web/announced.rs` の `AnnouncedProvider` と同一の注入パターン)。
+//! `AppState.livechat_directory` が `None`(`livechat_enabled=false` 等)のときは
+//! 一覧が空・変更系は定型 `not_found` になる。
 //!
-//! ## US1 のスコープ(重要な制約)
+//! ## エラー応答
 //!
-//! - **閲覧専用**: 確定レスの表示・板設定参照のみ。書き込み・継続受信ループは US2。
-//! - **「スレを開く」操作は本タスクではスタブ**: 実接続(`crate::livechat::participant`)
-//!   の起動は非同期 TCP ハンドシェイクを伴い、結果の保持・ポーリング方式の設計が
-//!   US1 の一覧/閲覧 API より優先度が低いため、シグネチャのみ用意し 501 を返す。
-//!
-//! ## US4(T045)の追加分
-//!
-//! - [`board_compat_url`]: 互換 API 板 URL(コピー用)を返す純粋関数。モデレーション
-//!   (NG/BAN/ローテーション)の HTTP エンドポイントは `AppState` 配線が未完(T024 の
-//!   宿題)のため本タスクでは追加しない — ドメイン層([`crate::livechat::moderation`] /
-//!   [`crate::livechat::registry::LivechatRegistry`])はテスト経由で直接検証する。
+//! 変更系の失敗は [`LivechatOpError`] の定型応答のみ(内部情報を漏洩しない — FR-030 と
+//! 同方針)。BAN/PoW 不足/レート超過による採番拒否は理由を開示せず受理扱いで返す
+//! (FR-006 の非開示)。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
