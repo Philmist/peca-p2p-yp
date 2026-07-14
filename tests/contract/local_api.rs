@@ -328,8 +328,9 @@ async fn get_settings_returns_all_keys_with_defaults() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    // 14 キー(data-model §Settings — ADR-0012 で index_bind 追加、13→14)
-    assert_eq!(json.as_object().unwrap().len(), 14);
+    // 20 キー(data-model §Settings — ADR-0012 で index_bind 追加 13→14、
+    // 006-livechat-thread T009 で livechat 系 6 キー追加 14→20)
+    assert_eq!(json.as_object().unwrap().len(), 20);
     assert_eq!(json["pcp_bind"], "127.0.0.1:7146");
     assert_eq!(json["http_bind"], "127.0.0.1:7180");
     assert_eq!(json["p2p_bind"], "0.0.0.0:7147,[::]:7147");
@@ -338,6 +339,13 @@ async fn get_settings_returns_all_keys_with_defaults() {
     assert_eq!(json["index_txt_encoding"], "utf-8");
     // index_bind の既定は空文字(機能無効)。
     assert_eq!(json["index_bind"], "");
+    // livechat 系 6 キーの既定(006 data-model §Settings)。
+    assert_eq!(json["livechat_enabled"], true);
+    assert_eq!(json["thread_max_participants"], 128);
+    assert_eq!(json["thread_write_rate"], 4);
+    assert_eq!(json["thread_msg_rate"], 16);
+    assert_eq!(json["announce_store_quota"], 2048);
+    assert_eq!(json["compat_bbs_bind"], "127.0.0.1:7183");
 }
 
 // ---------------------------------------------------------------------------
