@@ -32,10 +32,10 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{AppState, error_response};
 
@@ -192,14 +192,105 @@ pub struct ThreadDetail {
     pub res: Vec<ResView>,
 }
 
+/// 操作 API(変更系)の失敗理由(定型 — 内部情報を漏らさない Principle II)。
+///
+/// HTTP へは [`Self::into_response`] で写像する。存在しない対象と未サポートは区別せず
+/// `not_found` に丸める(内部の配線状態を攻撃者へ開示しない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivechatOpError {
+    /// 供給元が当該操作を持たない(未配線・読み取り専用フェイク)。→ 404
+    Unsupported,
+    /// 対象チャンネル/板が見つからない(未掲載・他ノード板・未開設)。→ 404
+    NotFound,
+    /// 入力が不正(板設定の値域違反など)。→ 400
+    Invalid,
+    /// 機能無効・鍵/keystore 利用不可・到達不能(tip 未確定)で実行できない。→ 503
+    Unavailable,
+}
+
+impl LivechatOpError {
+    fn into_response(self) -> Response {
+        let (status, code) = match self {
+            LivechatOpError::Unsupported | LivechatOpError::NotFound => {
+                (StatusCode::NOT_FOUND, "not_found")
+            }
+            LivechatOpError::Invalid => (StatusCode::BAD_REQUEST, "invalid"),
+            LivechatOpError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        };
+        error_response(status, code)
+    }
+}
+
+/// 板設定の入力(POST スレ開設 / PUT 設定変更の本体)。全項目を持つ**全置換**入力
+/// (省略項目は [`Default`] = [`crate::livechat::thread::BoardSettings::default`] と一致)。
+///
+/// レジストリ側 [`crate::livechat::registry::LivechatRegistry::update_settings`] は設定を
+/// 丸ごと差し替えるため、UI は現行値を取得・編集して全項目を送る。値域検証・制御文字除去は
+/// レジストリ側([`crate::livechat::thread::BoardSettings::validate`] / `sanitized`)が行う。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BoardSettingsInput {
+    pub title: String,
+    pub res_limit: u16,
+    pub noname_name: String,
+    pub local_rules: String,
+    pub first_post_pow_bits: u8,
+}
+
+impl Default for BoardSettingsInput {
+    fn default() -> Self {
+        let d = crate::livechat::thread::BoardSettings::default();
+        BoardSettingsInput {
+            title: d.title,
+            res_limit: d.res_limit,
+            noname_name: d.noname_name,
+            local_rules: d.local_rules,
+            first_post_pow_bits: d.first_post_pow_bits,
+        }
+    }
+}
+
+impl From<BoardSettingsInput> for crate::livechat::thread::BoardSettings {
+    fn from(i: BoardSettingsInput) -> Self {
+        crate::livechat::thread::BoardSettings {
+            title: i.title,
+            res_limit: i.res_limit,
+            noname_name: i.noname_name,
+            local_rules: i.local_rules,
+            first_post_pow_bits: i.first_post_pow_bits,
+        }
+    }
+}
+
+/// スレ開設要求(T063 — `POST /api/v1/livechat/threads`)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenThreadRequest {
+    /// 対象チャンネル(掲載中 30311 の `d` タグ = channel_id hex 32 小文字)。
+    pub channel_id: String,
+    /// スレタイトル(省略時は板設定の title を用いる)。
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 初期板設定(省略時は既定値)。
+    #[serde(default)]
+    pub settings: Option<BoardSettingsInput>,
+}
+
+/// スレ開設の結果(開設できた自板の board_id と世代)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenThreadResult {
+    pub board_id: String,
+    pub generation: u32,
+}
+
 /// 実況スレ一覧・詳細の供給元(自板 = ホストレジストリ、他ノード板 = gossip 受信 31311)。
 ///
-/// `web/announced.rs` の `AnnouncedProvider` と同じ注入パターン。**本モジュールはトレイト
-/// 定義のみを持ち、具体的な実装(レジストリ・gossip ハブを束ねる適合層)は別担当が
-/// `src/main.rs` で配線する**(モジュール doc 参照)。
+/// `web/announced.rs` の `AnnouncedProvider` と同じ注入パターン。具体的な実装(レジストリ・
+/// gossip ハブ・ペルソナ・板鍵を束ねる適合層)は `src/main.rs` の `LivechatAdapter` が配線する。
 ///
-/// T046/T047(US5)で `next_thread`/`close_thread` を追加した(自板のみが操作対象 — 他ノード
-/// 板の操作は本ノードの権限外なので `false`/`None` を返す実装でよい)。
+/// - **読み取り**(`threads`/`thread`): 自板 + 他ノード板。
+/// - **US5 操作**(`next_thread`/`close_thread`): 自板のみ(他ノード板の操作は本ノードの権限外)。
+/// - **T063/T067/T068 操作**(`open_thread`/`update_settings`/BAN/ローテーション): 既定実装は
+///   [`LivechatOpError::Unsupported`] を返す(未配線・読み取り専用フェイク向け)。配線側が上書きする。
 pub trait LivechatDirectory: Send + Sync {
     /// 見えている全スレの一覧(自板 + 他ノード板)。
     fn threads(&self) -> Vec<ThreadSummary>;
@@ -217,24 +308,70 @@ pub trait LivechatDirectory: Send + Sync {
     /// クローズ操作(T047 — FR-014)。自板の Active/Frozen スレを明示クローズする。
     /// 成功なら `true`。未知 board_id・他ノード板・既 Closed は `false`。
     fn close_thread(&self, board_id: &str) -> bool;
+
+    /// スレ開設(T063 — FR-001)。掲載中チャンネル(スレ主 = 掲載ペルソナ限定)に対して
+    /// kind 31311 の発行対象となるスレを開設する。既定は未サポート。
+    fn open_thread(&self, _req: OpenThreadRequest) -> Result<OpenThreadResult, LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// 板設定変更(T068 — FR-022)。自板の板設定を全置換し SETTINGS を即時配布する。既定は未サポート。
+    fn update_settings(
+        &self,
+        _board_id: &str,
+        _settings: BoardSettingsInput,
+    ) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// 板鍵 BAN(T067 — FR-018/spec Edge Case)。以後の当該板鍵の書き込みを採番拒否する。既定は未サポート。
+    fn ban_board_key(&self, _board_id: &str, _board_key: &str) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// 板鍵 BAN 解除(T067)。既定は未サポート。
+    fn unban_board_key(&self, _board_id: &str, _board_key: &str) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// 接続元 ConnBan(T067 — FR-019)。以後の当該接続元を接続拒否する。既定は未サポート。
+    fn ban_connection(&self, _board_id: &str, _addr: &str) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// 接続元 ConnBan 解除(T067)。既定は未サポート。
+    fn unban_connection(&self, _board_id: &str, _addr: &str) -> Result<(), LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
+    /// 板鍵ローテーション(T067 — FR-017)。**視聴者自身**の当該板向け書き込み鍵を再生成し、
+    /// 新しい公開鍵(hex)を返す(旧鍵は破棄。初回 PoW は次回書き込み時にクライアントが計算)。
+    /// 既定は未サポート。
+    fn rotate_board_key(&self, _board_id: &str) -> Result<String, LivechatOpError> {
+        Err(LivechatOpError::Unsupported)
+    }
 }
 
 /// `/api/v1/livechat` エンドポイント群のサブルーター。[`super::api_router`] が `.merge` する。
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
-        .route("/livechat/threads", get(list_threads))
+        // 一覧(GET)+ スレ開設(POST — T063)。
+        .route("/livechat/threads", get(list_threads).post(open_thread))
         .route("/livechat/threads/{board_id}", get(get_thread))
+        .route("/livechat/threads/{board_id}/join", post(join_thread))
+        .route("/livechat/threads/{board_id}/next", post(next_thread))
+        .route("/livechat/threads/{board_id}/close", post(close_thread))
+        // 板設定変更(T068)。
         .route(
-            "/livechat/threads/{board_id}/join",
-            axum::routing::post(join_thread),
+            "/livechat/threads/{board_id}/settings",
+            put(update_settings),
         )
+        // モデレーション(T067)。
+        .route("/livechat/threads/{board_id}/ban", post(ban_board_key))
+        .route("/livechat/threads/{board_id}/unban", post(unban_board_key))
+        .route("/livechat/threads/{board_id}/connban", post(ban_connection))
         .route(
-            "/livechat/threads/{board_id}/next",
-            axum::routing::post(next_thread),
+            "/livechat/threads/{board_id}/unconnban",
+            post(unban_connection),
         )
+        // 視聴者自身の板鍵ローテーション(T067 — FR-017)。
         .route(
-            "/livechat/threads/{board_id}/close",
-            axum::routing::post(close_thread),
+            "/livechat/boards/{board_id}/rotate-key",
+            post(rotate_board_key),
         )
 }
 
@@ -308,6 +445,132 @@ async fn close_thread(State(state): State<AppState>, Path(board_id): Path<String
         StatusCode::NO_CONTENT.into_response()
     } else {
         error_response(StatusCode::NOT_FOUND, "not_found")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T063/T067/T068: 変更系操作エンドポイント(X-Api-Token 保護は api_router が付与)
+// ---------------------------------------------------------------------------
+
+/// BAN/ConnBan の対象(板鍵 hex または接続元 `ip:port`)を運ぶ共通ボディ。
+#[derive(Debug, Clone, Deserialize)]
+struct TargetBody {
+    target: String,
+}
+
+/// ローテーション結果(新しい板鍵の公開鍵 hex)。
+#[derive(Debug, Clone, Serialize)]
+struct RotateResult {
+    pubkey: String,
+}
+
+/// 供給元(`livechat_directory`)未配線時の定型 `not_found`(内部状態を開示しない)。
+fn not_wired() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found")
+}
+
+/// `POST /api/v1/livechat/threads` — スレ開設(T063 — FR-001)。
+///
+/// 掲載中チャンネル(スレ主 = 掲載ペルソナ限定)に対しスレを開設する。成功で 201 +
+/// `{board_id, generation}`。未掲載・非ペルソナ・tip 未確定などは定型エラー。
+async fn open_thread(
+    State(state): State<AppState>,
+    Json(req): Json<OpenThreadRequest>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.open_thread(req) {
+        Ok(result) => (StatusCode::CREATED, Json(result)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `PUT /api/v1/livechat/threads/{board_id}/settings` — 板設定変更(T068 — FR-022)。
+async fn update_settings(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Json(settings): Json<BoardSettingsInput>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.update_settings(&board_id, settings) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/ban` — 板鍵 BAN(T067)。
+async fn ban_board_key(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Json(body): Json<TargetBody>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.ban_board_key(&board_id, &body.target) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/unban` — 板鍵 BAN 解除(T067)。
+async fn unban_board_key(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Json(body): Json<TargetBody>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.unban_board_key(&board_id, &body.target) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/connban` — 接続元 ConnBan(T067 — FR-019)。
+async fn ban_connection(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Json(body): Json<TargetBody>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.ban_connection(&board_id, &body.target) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/threads/{board_id}/unconnban` — 接続元 ConnBan 解除(T067)。
+async fn unban_connection(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Json(body): Json<TargetBody>,
+) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.unban_connection(&board_id, &body.target) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/v1/livechat/boards/{board_id}/rotate-key` — 板鍵ローテーション(T067 — FR-017)。
+///
+/// **視聴者自身**の当該板向け書き込み鍵を再生成し、新しい公開鍵 hex を返す。
+async fn rotate_board_key(State(state): State<AppState>, Path(board_id): Path<String>) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.rotate_board_key(&board_id) {
+        Ok(pubkey) => (StatusCode::OK, Json(RotateResult { pubkey })).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -554,6 +817,27 @@ mod tests {
         state
     }
 
+    /// 任意の [`LivechatDirectory`] 実装を注入した [`AppState`](操作ハンドラ疎通テスト用)。
+    fn state_with_dyn(directory: std::sync::Arc<dyn LivechatDirectory>) -> AppState {
+        use crate::security::SecurityLog;
+        use crate::store::Store;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityLog::new(dir.path().join("s.log")).unwrap());
+        std::mem::forget(dir);
+        AppState::with_parts(
+            store,
+            security,
+            "test-token",
+            HashSet::new(),
+            super::super::RateLimiter::per_second(100),
+        )
+        .with_livechat_directory(directory)
+    }
+
     async fn body_json(resp: Response) -> serde_json::Value {
         use http_body_util::BodyExt;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -670,6 +954,174 @@ mod tests {
     async fn close_thread_returns_not_found_when_unwired() {
         let resp = close_thread(State(state_with_directory(None)), Path("ab".repeat(32))).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- T063/T067/T068: 変更系操作ハンドラの疎通 ------------------------------
+
+    /// 操作(open/settings/ban/rotate)の結果を制御できるフェイク供給元。
+    #[derive(Default)]
+    struct OpsDirectory {
+        open_ok: bool,
+        settings_result: Option<Result<(), LivechatOpError>>,
+        ban_ok_board: Option<String>,
+        rotate_pubkey: Option<String>,
+    }
+
+    impl LivechatDirectory for OpsDirectory {
+        fn threads(&self) -> Vec<ThreadSummary> {
+            Vec::new()
+        }
+        fn thread(&self, _board_id: &str) -> Option<ThreadDetail> {
+            None
+        }
+        fn next_thread(&self, _board_id: &str) -> Option<u32> {
+            None
+        }
+        fn close_thread(&self, _board_id: &str) -> bool {
+            false
+        }
+        fn open_thread(&self, req: OpenThreadRequest) -> Result<OpenThreadResult, LivechatOpError> {
+            if self.open_ok {
+                Ok(OpenThreadResult {
+                    board_id: format!("board-{}", req.channel_id),
+                    generation: 1,
+                })
+            } else {
+                Err(LivechatOpError::NotFound)
+            }
+        }
+        fn update_settings(
+            &self,
+            _board_id: &str,
+            _settings: BoardSettingsInput,
+        ) -> Result<(), LivechatOpError> {
+            self.settings_result
+                .unwrap_or(Err(LivechatOpError::NotFound))
+        }
+        fn ban_board_key(&self, board_id: &str, _board_key: &str) -> Result<(), LivechatOpError> {
+            if self.ban_ok_board.as_deref() == Some(board_id) {
+                Ok(())
+            } else {
+                Err(LivechatOpError::NotFound)
+            }
+        }
+        fn rotate_board_key(&self, _board_id: &str) -> Result<String, LivechatOpError> {
+            self.rotate_pubkey
+                .clone()
+                .ok_or(LivechatOpError::Unavailable)
+        }
+    }
+
+    fn open_req(channel_id: &str) -> OpenThreadRequest {
+        OpenThreadRequest {
+            channel_id: channel_id.to_string(),
+            title: None,
+            settings: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_thread_returns_created_with_board_id() {
+        let dir = std::sync::Arc::new(OpsDirectory {
+            open_ok: true,
+            ..Default::default()
+        });
+        let resp = open_thread(
+            State(state_with_dyn(dir)),
+            Json(open_req("cd".repeat(16).as_str())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["generation"], 1);
+        assert!(json["board_id"].as_str().unwrap().starts_with("board-"));
+    }
+
+    #[tokio::test]
+    async fn open_thread_maps_not_found() {
+        let dir = std::sync::Arc::new(OpsDirectory::default());
+        let resp = open_thread(State(state_with_dyn(dir)), Json(open_req("x"))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn open_thread_unwired_is_not_found() {
+        let resp = open_thread(State(state_with_directory(None)), Json(open_req("x"))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_settings_maps_ok_and_invalid() {
+        let ok = std::sync::Arc::new(OpsDirectory {
+            settings_result: Some(Ok(())),
+            ..Default::default()
+        });
+        let resp = update_settings(
+            State(state_with_dyn(ok)),
+            Path("ab".repeat(32)),
+            Json(BoardSettingsInput::default()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let invalid = std::sync::Arc::new(OpsDirectory {
+            settings_result: Some(Err(LivechatOpError::Invalid)),
+            ..Default::default()
+        });
+        let resp = update_settings(
+            State(state_with_dyn(invalid)),
+            Path("ab".repeat(32)),
+            Json(BoardSettingsInput::default()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ban_board_key_maps_allowed_and_unknown() {
+        let board = "ab".repeat(32);
+        let dir = std::sync::Arc::new(OpsDirectory {
+            ban_ok_board: Some(board.clone()),
+            ..Default::default()
+        });
+        let resp = ban_board_key(
+            State(state_with_dyn(dir.clone())),
+            Path(board),
+            Json(TargetBody {
+                target: "cc".repeat(32),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = ban_board_key(
+            State(state_with_dyn(dir)),
+            Path("ff".repeat(32)),
+            Json(TargetBody {
+                target: "cc".repeat(32),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rotate_board_key_returns_new_pubkey() {
+        let dir = std::sync::Arc::new(OpsDirectory {
+            rotate_pubkey: Some("dd".repeat(32)),
+            ..Default::default()
+        });
+        let resp = rotate_board_key(State(state_with_dyn(dir)), Path("ab".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["pubkey"], "dd".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn rotate_board_key_unavailable_maps_503() {
+        let dir = std::sync::Arc::new(OpsDirectory::default());
+        let resp = rotate_board_key(State(state_with_dyn(dir)), Path("ab".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // --- T045: 互換 API 板 URL ---------------------------------------------

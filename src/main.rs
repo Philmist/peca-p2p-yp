@@ -24,6 +24,8 @@ use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::identity::{IdentityManager, Keystore, KeystoreHealth, keystore};
 use peca_p2p_yp::livechat::board::BoardKeyManager;
+use peca_p2p_yp::livechat::registry::LivechatRegistry;
+use peca_p2p_yp::livechat::thread::{BoardSettings, ThreadState};
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::{P2pRuntime, bind_listener};
@@ -33,6 +35,10 @@ use peca_p2p_yp::security::SecurityLog;
 use peca_p2p_yp::store::Store;
 use peca_p2p_yp::web::announced::{
     AnnouncedProvider, AnnouncedSummary, ClockSkewStatus, NodeStatusProvider, clock_skew_status,
+};
+use peca_p2p_yp::web::livechat::{
+    BoardSettingsInput, BoardSettingsView, LivechatDirectory, LivechatOpError, OpenThreadRequest,
+    OpenThreadResult, ResView, ThreadDetail, ThreadSummary,
 };
 use peca_p2p_yp::web::{AppState, IndexLanStatus, build_index_router, build_router};
 
@@ -456,11 +462,20 @@ async fn run() -> Result<(), i32> {
     if let Some(status) = index_lan_status {
         state = state.with_index_lan(status);
     }
-    // 実況スレ一覧・板設定の供給元(T024 — web/livechat.rs の LivechatDirectory)。
-    // TODO(統括): LivechatRegistry(自板)・gossip ハブ(他ノード板 31311)を束ねた実装を
-    // ここで生成して `.with_livechat_directory(...)` を配線する。registry.rs / hub.rs に
-    // 読み取り専用の公開 API が必要になる見込み(web/livechat.rs モジュール doc 参照)。
-    // 現時点では未配線(None)のため、スレ一覧 API は空・詳細 API は 404 を返す。
+    // 実況スレの供給元 + 操作(T063/T065/T067/T068 — web/livechat.rs の LivechatDirectory)。
+    // 自板 = ホストレジストリ、他ノード板 = gossip 受信 announce、変更系 = 掲載ペルソナ・板鍵
+    // 管理へ配線する。livechat_enabled=false(registry なし)のときは未配線のままで、スレ一覧は
+    // 空・詳細/操作は 404 を返す(機能無効を内部開示しない)。
+    if let Some(livechat_reg) = runtime.livechat().cloned() {
+        state = state.with_livechat_directory(Arc::new(LivechatAdapter {
+            registry: livechat_reg,
+            hub: Arc::clone(&hub),
+            identity: Arc::clone(&identity),
+            channels: Arc::clone(&registry),
+            board_keys: Arc::clone(&board_keys),
+            listen_port,
+        }));
+    }
     let app = build_router(state.clone());
 
     // 15d. bind に成功していれば index.txt 専用の第 2 リスナーを serve する(既存
@@ -673,6 +688,206 @@ impl NodeStatusProvider for StatusAdapter {
     }
     fn inbound_reachable(&self) -> bool {
         self.inbound_reachable.get()
+    }
+}
+
+/// 実況スレの供給元 + 変更系操作(006-livechat-thread T063/T065/T067/T068 —
+/// [`LivechatDirectory`])。
+///
+/// - **読み取り**: 自板 = ホストレジストリ([`LivechatRegistry`])、他ノード板 = gossip 受信
+///   announce([`GossipHub::announce_snapshot`])。他ノード板の**詳細(確定レス)**は参加者
+///   セッション(T064)が供給するため、本アダプタは自板のみ詳細を返す(他ノード板の一覧
+///   掲載は行う)。
+/// - **変更系**: スレ開設(掲載ペルソナ限定)・板設定変更・BAN/ConnBan・視聴者板鍵ローテーション。
+struct LivechatAdapter {
+    registry: Arc<LivechatRegistry>,
+    hub: Arc<GossipHub>,
+    identity: Arc<IdentityManager>,
+    channels: Arc<ChannelRegistry>,
+    board_keys: Arc<BoardKeyManager>,
+    /// 自ノード P2P 待受ポート(tip の port 成分 — スレ開設時に channel tracker の IP と合成)。
+    listen_port: u16,
+}
+
+impl LivechatAdapter {
+    /// 現在の unix 秒(スレ key・ORDER 署名時刻・クローズ時刻の時刻源)。
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// tip を導出する(ユーザー確定方針 — チャンネル tracker の IP + 自ノード P2P listen_port)。
+    ///
+    /// tracker 無し(firewalled で配信元アドレス不明)・P2P 待受無し(`listen_port=0`)は `None`
+    /// (視聴者が到達できるホストアドレスを提示できないため開設不可)。IPv4/IPv6 いずれも
+    /// [`SocketAddr`] パースで正しく port 差し替えする。
+    fn derive_tip(&self, tracker: Option<&str>) -> Option<String> {
+        if self.listen_port == 0 {
+            return None;
+        }
+        let mut addr: SocketAddr = tracker?.parse().ok()?;
+        addr.set_port(self.listen_port);
+        Some(addr.to_string())
+    }
+}
+
+impl LivechatDirectory for LivechatAdapter {
+    fn threads(&self) -> Vec<ThreadSummary> {
+        let local_ids: std::collections::HashSet<String> =
+            self.registry.board_ids().into_iter().collect();
+        let mut out = Vec::new();
+        // 自板(ホストレジストリ)。Closed は announce 停止済みのため一覧に出さない。
+        for board_id in &local_ids {
+            let Some(snap) = self.registry.board_snapshot(board_id) else {
+                continue;
+            };
+            if matches!(snap.active.state, ThreadState::Closed) {
+                continue;
+            }
+            out.push(ThreadSummary {
+                board_id: board_id.clone(),
+                channel: snap.active.channel.clone(),
+                title: snap.active.title.clone(),
+                generation: snap.active.generation,
+                res_count: snap.active.res.len() as u64,
+                tip: self.registry.board_tip(board_id).unwrap_or_default(),
+                is_local: true,
+            });
+        }
+        // 他ノード板(gossip 受信 announce)。自板と重複する board_id は自板を優先して除く。
+        for (pubkey, ann) in self.hub.announce_snapshot() {
+            if local_ids.contains(&pubkey) {
+                continue;
+            }
+            out.push(ThreadSummary {
+                board_id: pubkey,
+                channel: ann.channel,
+                title: ann.title,
+                generation: ann.generation,
+                res_count: ann.res_count.unwrap_or(0),
+                tip: ann.tip,
+                is_local: false,
+            });
+        }
+        out
+    }
+
+    fn thread(&self, board_id: &str) -> Option<ThreadDetail> {
+        // 自板のみ確定レスを保持する(他ノード板の詳細は参加者セッション T064 が供給する)。
+        let snap = self.registry.board_snapshot(board_id)?;
+        let res = snap
+            .active
+            .res
+            .iter()
+            .filter_map(|r| ResView::from_res(r, &snap.settings.noname_name))
+            .collect();
+        Some(ThreadDetail {
+            settings: BoardSettingsView::from_settings(&snap.settings),
+            res,
+        })
+    }
+
+    fn next_thread(&self, board_id: &str) -> Option<u32> {
+        // 現行スレの title を引き継ぐ(トレイト doc の規約)。
+        let snap = self.registry.board_snapshot(board_id)?;
+        self.registry
+            .start_next_generation(board_id, Self::now(), snap.active.title.clone())
+            .ok()
+    }
+
+    fn close_thread(&self, board_id: &str) -> bool {
+        self.registry.close_thread(board_id, Self::now()).is_ok()
+    }
+
+    fn open_thread(&self, req: OpenThreadRequest) -> Result<OpenThreadResult, LivechatOpError> {
+        // 1. 掲載中チャンネルを引く(channel_id = 30311 の d タグ)。Ended は対象外。
+        let ch = self
+            .channels
+            .snapshot()
+            .into_iter()
+            .find(|c| c.channel_id_hex() == req.channel_id && c.state != ChannelState::Ended)
+            .ok_or(LivechatOpError::NotFound)?;
+        // 2. スレ主 = 掲載ペルソナ(FR-001)。ペルソナ未割当・鍵利用不可は開設不可。
+        let persona_pubkey = self
+            .identity
+            .persona_for_channel(&req.channel_id)
+            .ok()
+            .flatten()
+            .ok_or(LivechatOpError::NotFound)?;
+        let persona = self
+            .identity
+            .signing_keys(&persona_pubkey)
+            .map_err(|_| LivechatOpError::Unavailable)?;
+        // 3. tip(視聴者の接続先)。tracker の IP + 自ノード P2P ポート。
+        let tip = self
+            .derive_tip(ch.tracker.as_deref())
+            .ok_or(LivechatOpError::Unavailable)?;
+        // 4. 板設定(省略時は既定。title は req.title 優先)。制御文字除去 + 値域検証。
+        let mut settings: BoardSettings = req.settings.map(Into::into).unwrap_or_default();
+        if let Some(t) = req.title {
+            settings.title = t;
+        }
+        let settings = settings.sanitized();
+        settings.validate().map_err(|_| LivechatOpError::Invalid)?;
+        // 5. 開設(gen=1・key=現在秒)。channel は `30311:<persona>:<guid>`。
+        let channel = format!("30311:{persona_pubkey}:{}", req.channel_id);
+        let title = settings.title.clone();
+        self.registry
+            .open_thread(persona, channel, 1, Self::now(), title, settings, tip)
+            .map_err(|_| LivechatOpError::Invalid)?;
+        Ok(OpenThreadResult {
+            board_id: persona_pubkey,
+            generation: 1,
+        })
+    }
+
+    fn update_settings(
+        &self,
+        board_id: &str,
+        settings: BoardSettingsInput,
+    ) -> Result<(), LivechatOpError> {
+        match self.registry.update_settings(board_id, settings.into()) {
+            Ok(_) => Ok(()),
+            Err(peca_p2p_yp::livechat::registry::RegistryError::UnknownBoard) => {
+                Err(LivechatOpError::NotFound)
+            }
+            Err(_) => Err(LivechatOpError::Invalid),
+        }
+    }
+
+    fn ban_board_key(&self, board_id: &str, board_key: &str) -> Result<(), LivechatOpError> {
+        map_registry_bool(self.registry.ban_board_key(board_id, board_key))
+    }
+
+    fn unban_board_key(&self, board_id: &str, board_key: &str) -> Result<(), LivechatOpError> {
+        map_registry_bool(self.registry.unban_board_key(board_id, board_key))
+    }
+
+    fn ban_connection(&self, board_id: &str, addr: &str) -> Result<(), LivechatOpError> {
+        map_registry_bool(self.registry.ban_connection(board_id, addr))
+    }
+
+    fn unban_connection(&self, board_id: &str, addr: &str) -> Result<(), LivechatOpError> {
+        map_registry_bool(self.registry.unban_connection(board_id, addr))
+    }
+
+    fn rotate_board_key(&self, board_id: &str) -> Result<String, LivechatOpError> {
+        let keys = self
+            .board_keys
+            .rotate(board_id)
+            .map_err(|_| LivechatOpError::Unavailable)?;
+        Ok(keys.public_key().to_hex())
+    }
+}
+
+/// レジストリの `bool`(false = 未知 board)を操作結果へ写像する(T067)。
+fn map_registry_bool(ok: bool) -> Result<(), LivechatOpError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(LivechatOpError::NotFound)
     }
 }
 

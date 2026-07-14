@@ -233,6 +233,26 @@ impl IngestState {
         view::aggregate(self.store.live_fresh_events(), &self.sources, &mute_set)
     }
 
+    /// 受信済み announce(kind 31311)の生存スナップショット(T065 — スレ一覧の他ノード板)。
+    ///
+    /// live かつ鮮度窓内の 31311 イベントのみを [`ThreadAnnounce`] へ復元して返す
+    /// (`(スレ主 pubkey hex, 復元済み announce)` のペア)。鮮度切れ・期限切れは
+    /// [`EventStore::live_fresh_events`] が除外するため、announce 鮮度切れのスレは自然に
+    /// 一覧から落ちる(FR-002 の一覧鮮度規則)。`livechat_enabled=false` のときは
+    /// [`Self::ingest_announce`] が格納自体をしないため、結果は空になる。
+    pub fn announce_snapshot(&self) -> Vec<(String, crate::event::livechat::ThreadAnnounce)> {
+        self.store
+            .live_fresh_events()
+            .into_iter()
+            .filter(|e| e.kind.as_u16() == ANNOUNCE_KIND)
+            .filter_map(|e| {
+                crate::event::livechat::ThreadAnnounce::from_event(e)
+                    .ok()
+                    .map(|a| (e.pubkey.to_hex(), a))
+            })
+            .collect()
+    }
+
     /// 鮮度切れ/期限切れエントリを物理回収し、対応する source_peers も掃除する。
     pub fn sweep(&mut self) -> usize {
         let removed = self.store.sweep();

@@ -250,6 +250,12 @@ impl LivechatRegistry {
             .map(|e| e.host.thread.generation)
     }
 
+    /// 指定 board のホスト接続先 `tip`(announce の `tip` — スレ開設時に確定した自ノードの
+    /// 到達アドレス。T065 のスレ一覧が視聴者へ提示する接続先)。未知 board は `None`。
+    pub fn board_tip(&self, board_id: &str) -> Option<String> {
+        lock(&self.hosts).get(board_id).map(|e| e.tip.clone())
+    }
+
     // -------------------------------------------------- T054/T055: 互換 API 読み取り
 
     /// 互換 API(subject.txt/dat/SETTING.TXT/head.txt)向けの板スナップショット。

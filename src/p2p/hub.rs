@@ -300,6 +300,14 @@ impl GossipHub {
         lock(&self.state).snapshot(&mutes)
     }
 
+    /// 受信済み announce(kind 31311)の生存スナップショット(T065 — 他ノード板の一覧供給源)。
+    ///
+    /// `(スレ主 pubkey hex, 復元済み [`ThreadAnnounce`])` を返す。鮮度切れは除外済み。
+    /// `livechat_enabled=false` では格納自体が無いため空になる。
+    pub fn announce_snapshot(&self) -> Vec<(String, crate::event::livechat::ThreadAnnounce)> {
+        lock(&self.state).announce_snapshot()
+    }
+
     /// 鮮度切れ/期限切れイベントを物理回収する(周期保守 — 戻り値は回収件数)。
     pub fn sweep(&self) -> usize {
         lock(&self.state).sweep()
