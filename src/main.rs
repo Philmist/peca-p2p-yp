@@ -525,6 +525,7 @@ async fn run() -> Result<(), i32> {
                     let compat_state = peca_p2p_yp::web::compat::CompatState {
                         registry,
                         board_keys: Arc::clone(&board_keys),
+                        manager: Arc::clone(&participant_manager),
                         security: Arc::clone(&security),
                         allowed_hosts: Arc::new(peca_p2p_yp::web::loopback_hosts(
                             compat_addr.port(),

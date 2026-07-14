@@ -1498,9 +1498,14 @@ fn build_compat_state(registry: std::sync::Arc<LivechatRegistry>) -> CompatState
     let mut hosts = std::collections::HashSet::new();
     hosts.insert("127.0.0.1:7183".to_string());
     hosts.insert("localhost:7183".to_string());
+    let manager = peca_p2p_yp::livechat::manager::ParticipantManager::new(
+        std::sync::Arc::clone(&board_keys),
+        None,
+    );
     CompatState {
         registry,
         board_keys,
+        manager,
         security,
         allowed_hosts: std::sync::Arc::new(hosts),
         rate_limiter: std::sync::Arc::new(peca_p2p_yp::web::RateLimiter::per_second(1000)),

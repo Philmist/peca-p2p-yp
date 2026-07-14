@@ -7,14 +7,16 @@
 //! 露出する」という故障モードを構造的に排除する(本リスナーは `/api/v1` のルートを
 //! 物理的に持たない)。
 //!
-//! ## 対象範囲(設計判断)
+//! ## 対象範囲(T069 で拡張)
 //!
-//! 互換 API は**自ノードがホストしている板のみ**を対象とする(読み出し・書き込みとも)。
-//! 契約(spec 背景・tasks.md)が「各利用者ノードが自分のためだけに提供するブリッジ」と
-//! 明記しており、リモート板(他ノードがホスト)を互換 API 経由で読み書きするには本ノードが
-//! 参加者セッションを常時維持する必要があり、スコープを超える。`LivechatRegistry` は
-//! 自ノードホスト板のみを保持するため、この制約は自然に構造化される(リモート板の
-//! board_id を指定すると `UnknownBoard` 相当の 404 になる)。
+//! 互換 API は**自ノードがホストしている板**(`registry`)に加え、**「スレを開く」で常駐セッションを
+//! 維持している他ノード板**(`manager` — 接続中・凍結中)も対象とする(compat-api.md §板の URL 対応
+//! 「接続中・凍結中のスレを持つ板のみが解決される」)。[`resolve_snapshot`] が registry を優先し、
+//! 無ければ参加者セッションの [`SessionView`] から [`BoardSnapshot`] を合成する。どちらも保持して
+//! いない板(未開設・未接続・クローズ揮発)は `UnknownBoard` 相当の 404 になる。
+//!
+//! リモート板の書き込み(bbs.cgi)は常駐セッション経由で RES を送る(FR-028 — 通常経路と同一)。
+//! 参加者セッションは前世代を保持しないため、リモート板の dat は現行世代のみ(旧世代 key は 404)。
 //!
 //! ## 保護層(FR-026)
 //!
@@ -40,8 +42,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use crate::livechat::board::BoardKeyManager;
-use crate::livechat::registry::LivechatRegistry;
-use crate::livechat::thread::ThreadState;
+use crate::livechat::manager::ParticipantManager;
+use crate::livechat::participant::{SessionLiveState, SessionView};
+use crate::livechat::registry::{BoardSnapshot, LivechatRegistry};
+use crate::livechat::thread::{Thread, ThreadState};
 use crate::security::{SecurityCategory, SecurityLog};
 use crate::web::RateLimiter;
 
@@ -59,16 +63,69 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// 互換 API 専用の共有状態(既存 `/api/v1` の `AppState` とは独立)。
 #[derive(Clone)]
 pub struct CompatState {
-    /// 自ノードホスト板のレジストリ(読み出し・書き込みとも本レジストリのみを対象とする)。
+    /// 自ノードホスト板のレジストリ(自板の読み出し・書き込み対象)。
     pub registry: Arc<LivechatRegistry>,
     /// 板鍵の自動管理(bbs.cgi の自動署名 — T056)。
     pub board_keys: Arc<BoardKeyManager>,
+    /// 他ノード板の常駐セッション(T069 — 接続中・凍結中のリモート板を解決する)。
+    pub manager: Arc<ParticipantManager>,
     /// セキュリティイベントログ(`compat_bbs_denied` の記録先)。
     pub security: Arc<SecurityLog>,
     /// 受理する `Host` ヘッダのホワイトリスト(バインドポート由来)。
     pub allowed_hosts: Arc<std::collections::HashSet<String>>,
     /// 接続元ごとのレート制限器。
     pub rate_limiter: Arc<RateLimiter>,
+}
+
+/// 自板(registry)優先、無ければ他ノード板の常駐セッション(manager)から板スナップショットを
+/// 解決する(T069 — 接続中・凍結中のリモート板に互換 API を対応させる)。
+///
+/// リモート板の [`SessionView`] から [`BoardSnapshot`] を合成する。参加者セッションは前世代を
+/// 保持しないため `frozen` は常に `None`(dat は現行世代のみ — compat-api.md の 404 許容範囲)。
+/// クローズ・終端でデータ削除済み(揮発)は `None`(定型 404)。
+fn resolve_snapshot(state: &CompatState, board: &str) -> Option<BoardSnapshot> {
+    if let Some(snap) = state.registry.board_snapshot(board) {
+        return Some(snap);
+    }
+    let view = state.manager.view(board)?;
+    session_view_to_snapshot(board, &view)
+}
+
+/// 他ノード板の [`SessionView`] から [`BoardSnapshot`] を合成する(T069)。
+///
+/// クローズ(揮発)は `None`。状態は Frozen/Active を写す。`last_confirmed_at` は確定レスの
+/// 申告 created_at の最大値(自板と異なりホスト時計を持たないためベストエフォート)。
+fn session_view_to_snapshot(board: &str, view: &SessionView) -> Option<BoardSnapshot> {
+    if matches!(view.state, SessionLiveState::Closed) {
+        return None;
+    }
+    let settings = view.settings.clone().unwrap_or_default();
+    let state = match view.state {
+        SessionLiveState::Frozen => ThreadState::Frozen,
+        _ => ThreadState::Active,
+    };
+    let last_confirmed_at = view
+        .confirmed
+        .iter()
+        .map(|r| r.created_at)
+        .max()
+        .unwrap_or(view.key as i64);
+    let active = Thread {
+        board_id: board.to_string(),
+        channel: String::new(),
+        generation: view.generation,
+        key: view.key,
+        title: settings.title.clone(),
+        res_limit: settings.res_limit,
+        state,
+        res: view.confirmed.clone(),
+        last_confirmed_at,
+    };
+    Some(BoardSnapshot {
+        active,
+        frozen: None,
+        settings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +235,7 @@ fn html_response(html: &str) -> Response {
 
 /// `GET /{board}/subject.txt` — スレ一覧(アクティブ + 凍結)。
 async fn subject_txt(State(state): State<CompatState>, Path(board): Path<String>) -> Response {
-    let Some(snapshot) = state.registry.board_snapshot(&board) else {
+    let Some(snapshot) = resolve_snapshot(&state, &board) else {
         return error_response(StatusCode::NOT_FOUND);
     };
     let mut out = String::new();
@@ -211,7 +268,7 @@ fn push_subject_line(out: &mut String, thread: &crate::livechat::thread::Thread)
 
 /// `GET /{board}/SETTING.TXT` — 板設定提示(FR-027)。
 async fn setting_txt(State(state): State<CompatState>, Path(board): Path<String>) -> Response {
-    let Some(snapshot) = state.registry.board_snapshot(&board) else {
+    let Some(snapshot) = resolve_snapshot(&state, &board) else {
         return error_response(StatusCode::NOT_FOUND);
     };
     let s = &snapshot.settings;
@@ -224,7 +281,7 @@ async fn setting_txt(State(state): State<CompatState>, Path(board): Path<String>
 
 /// `GET /{board}/head.txt` — ローカルルール(Markdown を平文のまま返す — research R7)。
 async fn head_txt(State(state): State<CompatState>, Path(board): Path<String>) -> Response {
-    let Some(snapshot) = state.registry.board_snapshot(&board) else {
+    let Some(snapshot) = resolve_snapshot(&state, &board) else {
         return error_response(StatusCode::NOT_FOUND);
     };
     text_response(&snapshot.settings.local_rules)
@@ -242,7 +299,13 @@ async fn dat_file(
     let Ok(key) = key_str.parse::<u64>() else {
         return error_response(StatusCode::NOT_FOUND);
     };
-    let Some(thread) = state.registry.thread_by_key(&board, key) else {
+    // 自板は registry の thread_by_key(現行 + 直近凍結世代)。無ければ他ノード板の
+    // 常駐セッション(T069)から現行世代を合成する(前世代は保持しないため key 不一致は 404)。
+    let Some(thread) = state.registry.thread_by_key(&board, key).or_else(|| {
+        resolve_snapshot(&state, &board)
+            .map(|snap| snap.active)
+            .filter(|t| t.key == key)
+    }) else {
         return error_response(StatusCode::NOT_FOUND);
     };
     // Closed(クローズ済み・データ削除済み)は取得済み分も含めて 404
@@ -363,6 +426,20 @@ async fn bbs_cgi_handler(State(state): State<CompatState>, req: Request) -> Resp
 
     match bbs_cgi::submit(&state.registry, &state.board_keys, &form, created_at) {
         Ok(_) => html_response(&bbs_cgi::success_page()),
+        // 他ノード板(T069): registry に無い板は、開いている常駐セッション経由で書き込む
+        // (FR-028 — 通常経路と同一の RES 送信。板鍵解決・初回 PoW はマネージャが担う)。未
+        // オープン・未知板は元の定型エラーを返す(内部状態を開示しない)。
+        Err(bbs_cgi::BbsCgiError::UnknownBoard) => {
+            match state.manager.write(
+                &form.bbs,
+                form.from.clone(),
+                form.mail.clone(),
+                form.message.clone(),
+            ) {
+                Ok(()) => html_response(&bbs_cgi::success_page()),
+                Err(_) => html_response(&bbs_cgi::error_page(bbs_cgi::BbsCgiError::UnknownBoard)),
+            }
+        }
         Err(e) => html_response(&bbs_cgi::error_page(e)),
     }
 }
@@ -399,9 +476,11 @@ mod tests {
         let mut hosts = std::collections::HashSet::new();
         hosts.insert(GOOD_HOST.to_string());
         hosts.insert("localhost:7183".to_string());
+        let manager = ParticipantManager::new(Arc::clone(&board_keys), None);
         CompatState {
             registry,
             board_keys,
+            manager,
             security,
             allowed_hosts: Arc::new(hosts),
             rate_limiter: Arc::new(RateLimiter::with_clock(1000, Box::new(|| 1_000))),

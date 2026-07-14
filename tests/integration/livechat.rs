@@ -1023,3 +1023,113 @@ async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
+
+/// T069: 互換 API が「接続中のリモート板」を常駐セッション経由で解決することを検証する。
+/// ホストのスレを別ノード(視聴者)がマネージャで開き、その視聴者の互換 API(自分用ブリッジ)
+/// で subject.txt / dat が確定レスを返す。
+#[tokio::test]
+async fn compat_api_serves_remote_board_via_session() {
+    use axum::body::to_bytes;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, header};
+    use peca_p2p_yp::livechat::board::BoardKeyManager;
+    use peca_p2p_yp::livechat::manager::ParticipantManager;
+    use peca_p2p_yp::livechat::registry::LivechatRegistry;
+    use peca_p2p_yp::livechat::thread::BoardSettings;
+    use peca_p2p_yp::web::RateLimiter;
+    use peca_p2p_yp::web::compat::{CompatState, RATE_LIMIT_PER_SEC, routes, sjis};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let host = LivechatHostNode::spawn(0x069).await;
+    host.open_thread(
+        "実況スレ",
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..BoardSettings::default()
+        },
+    );
+    let seed_key = Keys::generate();
+    host.seed_res(&seed_key, "一つ目", 1_700_000_001);
+    host.seed_res(&seed_key, "二つ目", 1_700_000_002);
+    let board_id = host.board_id();
+
+    // 視聴者: 板鍵管理 + マネージャで「スレを開く」。
+    let store = Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap());
+    let board_keys = Arc::new(BoardKeyManager::new(
+        store,
+        peca_p2p_yp::identity::Keystore::ephemeral(),
+    ));
+    let manager = ParticipantManager::with_tuning(Arc::clone(&board_keys), None, 1000, 0.01);
+    manager.open(ParticipantConfig {
+        host_addr: host.listen_addr().to_string(),
+        board_id: board_id.clone(),
+        channel: host.channel(),
+        generation: 1,
+        key: 1_700_000_000,
+        title: "実況スレ".into(),
+        res_limit: 1000,
+        security: None,
+    });
+    let ok = wait_until(Duration::from_secs(5), || {
+        manager
+            .view(&board_id)
+            .map(|v| v.confirmed.len())
+            .unwrap_or(0)
+            >= 2
+    })
+    .await;
+    assert!(ok, "セッションが 2 件の確定レスを保持する");
+
+    // 視聴者の互換 API(自ノードは板をホストしていない → registry は空)。
+    let dir = tempfile::tempdir().unwrap();
+    let security =
+        Arc::new(peca_p2p_yp::security::SecurityLog::new(dir.path().join("s.log")).unwrap());
+    let mut hosts = std::collections::HashSet::new();
+    hosts.insert("127.0.0.1:7183".to_string());
+    let state = CompatState {
+        registry: LivechatRegistry::new(128),
+        board_keys,
+        manager: Arc::clone(&manager),
+        security,
+        allowed_hosts: Arc::new(hosts),
+        rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
+    };
+
+    // subject.txt: リモート板がセッション経由で解決され、アクティブスレ 1 行が返る。
+    let req = Request::builder()
+        .uri(format!("/{board_id}/subject.txt"))
+        .header(header::HOST, "127.0.0.1:7183")
+        .extension(ConnectInfo(
+            "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = routes(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200, "リモート板の subject.txt が 200");
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let text = sjis::decode(&bytes);
+    assert!(
+        text.contains("1700000000.dat"),
+        "アクティブスレの key が載る: {text}"
+    );
+    assert!(text.contains("(2)"), "確定レス数 2 が載る: {text}");
+
+    // dat: 現行世代の確定レスが返る。
+    let req = Request::builder()
+        .uri(format!("/{board_id}/dat/1700000000.dat"))
+        .header(header::HOST, "127.0.0.1:7183")
+        .extension(ConnectInfo(
+            "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = routes(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200, "リモート板の dat が 200");
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let text = sjis::decode(&bytes);
+    assert!(text.contains("一つ目"), "dat に確定レス本文が載る: {text}");
+    assert!(text.contains("二つ目"), "dat に 2 件目が載る: {text}");
+
+    manager.leave(&board_id);
+}

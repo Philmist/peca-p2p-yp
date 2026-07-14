@@ -24,6 +24,7 @@ use tower::ServiceExt;
 
 use peca_p2p_yp::identity::Keystore;
 use peca_p2p_yp::livechat::board::BoardKeyManager;
+use peca_p2p_yp::livechat::manager::ParticipantManager;
 use peca_p2p_yp::livechat::registry::LivechatRegistry;
 use peca_p2p_yp::livechat::thread::BoardSettings;
 use peca_p2p_yp::security::SecurityLog;
@@ -50,9 +51,11 @@ fn test_state() -> CompatState {
     let mut hosts = HashSet::new();
     hosts.insert(GOOD_HOST.to_string());
     hosts.insert("localhost:7183".to_string());
+    let manager = ParticipantManager::new(Arc::clone(&board_keys), None);
     CompatState {
         registry,
         board_keys,
+        manager,
         security,
         allowed_hosts: Arc::new(hosts),
         rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
