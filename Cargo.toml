@@ -72,6 +72,10 @@ name = "thread_events"
 path = "tests/contract/thread_events.rs"
 
 [[test]]
+name = "compat_bbs"
+path = "tests/contract/compat_bbs.rs"
+
+[[test]]
 name = "key_envelope"
 path = "tests/contract/key_envelope.rs"
 

@@ -175,16 +175,16 @@
 
 ### Tests for User Story 6
 
-- [ ] T051 [P] [US6] 契約テスト(互換 API): 各エンドポイントの形式・SJIS 変換・数値文字参照保全・実体参照エスケープ・dat 追記不変性・loopback 外/Host 不正の定型拒否・エラー定型(`<title>ERROR!</title>`)を tests/contract/compat_bbs.rs(新規)に作成し失敗を確認
+- [X] T051 [P] [US6] 契約テスト(互換 API): 各エンドポイントの形式・SJIS 変換・数値文字参照保全・実体参照エスケープ・dat 追記不変性・loopback 外/Host 不正の定型拒否・エラー定型(`<title>ERROR!</title>`)を tests/contract/compat_bbs.rs(新規)に作成し失敗を確認
 
 ### Implementation for User Story 6
 
-- [ ] T052 [US6] 専用 loopback リスナーを実装: `compat_bbs_bind`(既定 `127.0.0.1:7183`・非 loopback 起動拒否・空文字で無効化)、Host 検証(`127.0.0.1[:port]` / `localhost[:port]` 以外は定型 403)、レート制限・ボディ上限 ≤ 64KB、違反は `compat_bbs_denied` 記録(FR-026 / research R5)— src/web/compat/mod.rs
-- [ ] T053 [US6] Shift_JIS 変換層を実装: encoding_rs(CP932)での全応答エンコード、変換不能文字の数値文字参照(`&#dddd;`)保全、受理時の数値文字参照(`&#dddd;` / `&#xhhhh;`)展開(contracts/compat-api.md §受け口)— src/web/compat/sjis.rs(新規)
-- [ ] T054 [US6] 読み出し系エンドポイントを実装: `GET /{board}/subject.txt`(`<key>.dat<>タイトル (レス数)`)・`GET /{board}/SETTING.TXT`(BBS_TITLE 等 + 拡張キー BBS_MAX_RES、単位は文字数)・`GET /{board}/head.txt`(ローカルルール Markdown を平文のまま)・未知の板/保持しない dat は定型 404(FR-027)— src/web/compat/mod.rs
-- [ ] T055 [US6] dat 出力を実装: `GET /{board}/dat/{key}.dat` — 確定済みレスのみ・1 レス 1 行(`名前<>メール<>日付 ID:xxxxxxxx<>本文<>スレタイトル`)・エスケープ一意規則(`&` `<` `>` `"` の順で実体参照・改行 `<br>`)・板鍵由来の短縮 ID 8 文字(表示専用)・名無し名はレス確定時点で固定・**追記不変性(MUST)**・`Last-Modified`/304・`Range`/206/416・gzip なし(contracts/compat-api.md §HTTP メタデータ)— src/web/compat/dat.rs(新規)
-- [ ] T056 [US6] bbs.cgi を実装: `POST /test/bbs.cgi` — SJIS フォーム解析(bbs/key/time/FROM/mail/MESSAGE)・数値文字参照展開・名前欄 `#` 除去・板鍵自動署名(なければ生成 + 初回 PoW 計算)・**通常経路と同一の検証・送信(FR-028 抜け道禁止)**・確認画面なし/Cookie なし/Referer 不使用・`subject` 付き(スレ立て)は定型拒否・成功 `<title>書きこみました。</title>` / エラー `<title>ERROR!</title>` + `ERROR:<定型>`(内部情報非漏洩 — FR-030)— src/web/compat/bbs_cgi.rs(新規)
-- [ ] T057 [US6] 板 URL(`http://127.0.0.1:7183/<board_id>/`)のコピー可能な UI 表示を src/web/livechat.rs に追加し、US6 の cucumber ステップ + quickstart §5 の curl 手動確認(一覧 → 書き込み → dat 反映・loopback 外拒否)を tests/steps/livechat.rs で実装して全パス
+- [X] T052 [US6] 専用 loopback リスナーを実装: `compat_bbs_bind`(既定 `127.0.0.1:7183`・非 loopback 起動拒否・空文字で無効化)、Host 検証(`127.0.0.1[:port]` / `localhost[:port]` 以外は定型 403)、レート制限・ボディ上限 ≤ 64KB、違反は `compat_bbs_denied` 記録(FR-026 / research R5)— src/web/compat/mod.rs
+- [X] T053 [US6] Shift_JIS 変換層を実装: encoding_rs(CP932)での全応答エンコード、変換不能文字の数値文字参照(`&#dddd;`)保全、受理時の数値文字参照(`&#dddd;` / `&#xhhhh;`)展開(contracts/compat-api.md §受け口)— src/web/compat/sjis.rs(新規)
+- [X] T054 [US6] 読み出し系エンドポイントを実装: `GET /{board}/subject.txt`(`<key>.dat<>タイトル (レス数)`)・`GET /{board}/SETTING.TXT`(BBS_TITLE 等 + 拡張キー BBS_MAX_RES、単位は文字数)・`GET /{board}/head.txt`(ローカルルール Markdown を平文のまま)・未知の板/保持しない dat は定型 404(FR-027)— src/web/compat/mod.rs
+- [X] T055 [US6] dat 出力を実装: `GET /{board}/dat/{key}.dat` — 確定済みレスのみ・1 レス 1 行(`名前<>メール<>日付 ID:xxxxxxxx<>本文<>スレタイトル`)・エスケープ一意規則(`&` `<` `>` `"` の順で実体参照・改行 `<br>`)・板鍵由来の短縮 ID 8 文字(表示専用)・名無し名はレス確定時点で固定・**追記不変性(MUST)**・`Last-Modified`/304・`Range`/206/416・gzip なし(contracts/compat-api.md §HTTP メタデータ)— src/web/compat/dat.rs(新規)
+- [X] T056 [US6] bbs.cgi を実装: `POST /test/bbs.cgi` — SJIS フォーム解析(bbs/key/time/FROM/mail/MESSAGE)・数値文字参照展開・名前欄 `#` 除去・板鍵自動署名(なければ生成 + 初回 PoW 計算)・**通常経路と同一の検証・送信(FR-028 抜け道禁止)**・確認画面なし/Cookie なし/Referer 不使用・`subject` 付き(スレ立て)は定型拒否・成功 `<title>書きこみました。</title>` / エラー `<title>ERROR!</title>` + `ERROR:<定型>`(内部情報非漏洩 — FR-030)— src/web/compat/bbs_cgi.rs(新規)
+- [X] T057 [US6] 板 URL(`http://127.0.0.1:7183/<board_id>/`)のコピー可能な UI 表示を src/web/livechat.rs に追加し、US6 の cucumber ステップ + quickstart §5 の curl 手動確認(一覧 → 書き込み → dat 反映・loopback 外拒否)を tests/steps/livechat.rs で実装して全パス
 
 **Checkpoint**: 全ユーザーストーリー完了
 

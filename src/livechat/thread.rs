@@ -328,6 +328,17 @@ pub struct Thread {
     pub state: ThreadState,
     /// 確定レス列(res_no 1..=res_limit の順)。
     pub res: Vec<Res>,
+    /// **ホスト時計基準**の最終確定時刻(unix 秒。互換 API の dat `Last-Modified` の
+    /// 単調性を保証する根拠 — T055 レビュー対応)。初期値はスレ作成秒(`key`)。
+    ///
+    /// [`Res::created_at`] は投稿者(リモート参加者の板鍵)が申告する未検証の値であり、
+    /// ホスト検証 1〜7(thread-events.md)に時刻検査がないため、これを直接
+    /// `Last-Modified` に使うと過去日時を申告する書き込みでキャッシュ汚染
+    /// (以後の新着が `If-Modified-Since` 比較で恒久的に 304 化する)を許してしまう。
+    /// 本フィールドは [`Self::confirm`] 成功時に呼び出し側([`crate::livechat::registry`])
+    /// が `max(既存値, ホスト受信時刻)` で更新することで単調性を構造的に保証する
+    /// (`Thread::confirm` 自体はホスト時計を持たないため、更新は呼び出し側の責務)。
+    pub last_confirmed_at: i64,
 }
 
 impl Thread {
@@ -349,6 +360,18 @@ impl Thread {
             res_limit,
             state: ThreadState::Active,
             res: Vec::new(),
+            last_confirmed_at: key as i64,
+        }
+    }
+
+    /// [`Self::last_confirmed_at`] をホスト受信時刻で単調に更新する(T055 レビュー対応)。
+    ///
+    /// `host_received_at` はレジストリが `accept_write`/`seed_confirmed_res` の
+    /// `created_at` 引数(ホストのローカル時計)として受け取った値。既存値より小さければ
+    /// 何もしない(単調性 — 過去日時の書き込みが Last-Modified を後退させない)。
+    pub fn bump_last_confirmed_at(&mut self, host_received_at: i64) {
+        if host_received_at > self.last_confirmed_at {
+            self.last_confirmed_at = host_received_at;
         }
     }
 

@@ -23,6 +23,7 @@ use peca_p2p_yp::event::publish::{EventSink, PublishEngine};
 use peca_p2p_yp::event::schema::{ChannelListing, VerifyConfig};
 use peca_p2p_yp::event::store::StoreConfig;
 use peca_p2p_yp::identity::{IdentityManager, Keystore, KeystoreHealth, keystore};
+use peca_p2p_yp::livechat::board::BoardKeyManager;
 use peca_p2p_yp::p2p::hub::GossipHub;
 use peca_p2p_yp::p2p::peers::{PeerManager, PeerManagerConfig, ReachabilityState};
 use peca_p2p_yp::p2p::runtime::{P2pRuntime, bind_listener};
@@ -273,6 +274,18 @@ async fn run() -> Result<(), i32> {
     //(発行開始の予約)・AppState(status 表示)へ同一インスタンスを配布し、発行開始と
     // selected 変更を単一ロックで相互排他にする。
     let broadcast = Arc::new(BroadcastState::new());
+
+    // 14a. 板鍵管理(006-livechat-thread T012/T056)。ペルソナとは別系統の keystore
+    //      インスタンスを用いる(`board_keys` テーブルはペルソナと識別子・テーブルを
+    //      共有しない — FR-016)。`keystore` は直後に IdentityManager へ move するため、
+    //      ここで独立した 2 本目を開く(unix は master.key の再読込のみ・パーミッション
+    //      是正は 5b で済んでいるため再実行しない — 冪等な読み込み操作)。失敗時は
+    //      互換 API の書き込み機能のみ縮退させる(発見・伝搬・閲覧は継続 — Principle I)。
+    let board_keystore = Keystore::open(&data_dir, has_encrypted_personas)
+        .map(|(ks, _)| ks)
+        .unwrap_or_else(|_| Keystore::ephemeral());
+    let board_keys = Arc::new(BoardKeyManager::new(Arc::clone(&store), board_keystore));
+
     let identity = Arc::new(
         IdentityManager::new_with_health(Arc::clone(&store), keystore, keystore_health)
             .with_broadcast_state(Arc::clone(&broadcast)),
@@ -466,6 +479,66 @@ async fn run() -> Result<(), i32> {
             })
             .await;
         }));
+    }
+
+    // 15e. 2ch 互換 API(006-livechat-thread T052)専用 loopback リスナー。
+    //      `compat_bbs_bind` は起動時に Settings::validate() 済み(空文字 = 機能無効・
+    //      非空は loopback のみ受理 — 非 loopback は既に手順 0 で起動拒否済み)。index.txt
+    //      LAN リスナーと異なり、compat_bbs_bind は loopback しか許容しないため bind 失敗を
+    //      「縮退継続」として扱う(致命エラーにしない — 互換 API はブリッジ機能であり
+    //      本体の発見・伝搬・掲載を道連れにしない)。`livechat_enabled=false` のときは
+    //      registry が空(全板 404)になるだけで、リスナー自体は起動時設定どおりに動く。
+    if !settings.compat_bbs_bind.is_empty() {
+        match settings.compat_bbs_bind.parse::<SocketAddr>() {
+            Ok(compat_addr) => match TcpListener::bind(compat_addr).await {
+                Ok(listener) => {
+                    let registry = runtime.livechat().cloned().unwrap_or_else(|| {
+                        peca_p2p_yp::livechat::registry::LivechatRegistry::new(
+                            settings.thread_max_participants as usize,
+                        )
+                    });
+                    let compat_state = peca_p2p_yp::web::compat::CompatState {
+                        registry,
+                        board_keys: Arc::clone(&board_keys),
+                        security: Arc::clone(&security),
+                        allowed_hosts: Arc::new(peca_p2p_yp::web::loopback_hosts(
+                            compat_addr.port(),
+                        )),
+                        rate_limiter: Arc::new(peca_p2p_yp::web::RateLimiter::per_second(
+                            peca_p2p_yp::web::compat::RATE_LIMIT_PER_SEC,
+                        )),
+                    };
+                    let compat_app = peca_p2p_yp::web::compat::routes(compat_state);
+                    let sd = shutdown_rx.clone();
+                    handles.push(tokio::spawn(async move {
+                        let _ = axum::serve(
+                            listener,
+                            compat_app.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(async move {
+                            let mut sd = sd;
+                            let _ = sd.changed().await;
+                        })
+                        .await;
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "startup",
+                        compat_bbs_bind = %settings.compat_bbs_bind,
+                        error = %e.kind().to_string(),
+                        "互換 API のリスナーにバインドできませんでした(本体は継続します)"
+                    );
+                }
+            },
+            Err(_) => {
+                tracing::warn!(
+                    target: "startup",
+                    compat_bbs_bind = %settings.compat_bbs_bind,
+                    "compat_bbs_bind の書式を解釈できませんでした(本体は継続します)"
+                );
+            }
+        }
     }
 
     // 16. 起動サマリ(バインドアドレス・既知ピア数のみ。内部情報なし)。

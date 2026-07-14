@@ -24,6 +24,7 @@ use peca_p2p_yp::livechat::participant::{
 use peca_p2p_yp::livechat::registry::{AcceptOutcome, LivechatRegistry, sign_res};
 use peca_p2p_yp::livechat::session::{ParticipantSession, WelcomeOutcome};
 use peca_p2p_yp::livechat::thread::{BoardSettings, Res, Thread};
+use peca_p2p_yp::web::compat::{CompatState, routes as compat_routes, sjis};
 
 #[path = "../common/livechat_host.rs"]
 mod livechat_host;
@@ -115,6 +116,17 @@ pub struct LivechatWorld {
     us5_banned_key: Option<Keys>,
     /// 移行前後で is_conn_banned が引き継がれるか(板単位スコープ)。
     us5_migration_ban_outcome: Option<AcceptOutcome>,
+    // --- US6 状態(互換 API)---
+    /// 互換 API 専用状態(自ノードホスト板のレジストリを共有)。
+    us6_compat_state: Option<peca_p2p_yp::web::compat::CompatState>,
+    /// 対象板の board_id。
+    us6_board_id: Option<String>,
+    /// 直近の HTTP レスポンス(ステータス・ヘッダ)。
+    us6_last_status: Option<axum::http::StatusCode>,
+    /// 直近の HTTP レスポンス本文(SJIS 復号済み)。
+    us6_last_body: Option<String>,
+    /// アクセスに使う Host ヘッダ(loopback 外検証用)。
+    us6_request_host: Option<String>,
 }
 
 impl std::fmt::Debug for LivechatWorld {
@@ -1472,100 +1484,342 @@ async fn board_key_ng_ban_carry_over(world: &mut AppWorld) {
 // US6: 既存実況クライアントからの読み書き(互換 API)
 // ---------------------------------------------------------------------------
 
+/// 互換 API テスト用の CompatState を組み立てる(自ノードホスト板を対象)。
+fn build_compat_state(registry: std::sync::Arc<LivechatRegistry>) -> CompatState {
+    let board_keys = std::sync::Arc::new(peca_p2p_yp::livechat::board::BoardKeyManager::new(
+        std::sync::Arc::new(peca_p2p_yp::store::Store::open_in_memory().unwrap()),
+        peca_p2p_yp::identity::Keystore::ephemeral(),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let security = std::sync::Arc::new(
+        peca_p2p_yp::security::SecurityLog::new(dir.path().join("s.log")).unwrap(),
+    );
+    std::mem::forget(dir);
+    let mut hosts = std::collections::HashSet::new();
+    hosts.insert("127.0.0.1:7183".to_string());
+    hosts.insert("localhost:7183".to_string());
+    CompatState {
+        registry,
+        board_keys,
+        security,
+        allowed_hosts: std::sync::Arc::new(hosts),
+        rate_limiter: std::sync::Arc::new(peca_p2p_yp::web::RateLimiter::per_second(1000)),
+    }
+}
+
+/// 互換 API へ GET リクエストを送り、`(ステータス, SJIS 復号済み本文)` を返す。
+async fn compat_get(
+    state: &CompatState,
+    path: &str,
+    host: &str,
+) -> (axum::http::StatusCode, String) {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+    let app = compat_routes(state.clone());
+    let mut req = Request::builder()
+        .method(axum::http::Method::GET)
+        .uri(path)
+        .header(header::HOST, host)
+        .body(Body::empty())
+        .unwrap();
+    let addr: std::net::SocketAddr = "127.0.0.1:60100".parse().unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, sjis::decode(&bytes))
+}
+
+/// 互換 API へ bbs.cgi 相当の POST を送り、`(ステータス, SJIS 復号済み本文)` を返す。
+async fn compat_post_bbs_cgi(
+    state: &CompatState,
+    form_body: &str,
+    host: &str,
+) -> (axum::http::StatusCode, String) {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+    let app = compat_routes(state.clone());
+    let mut req = Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/test/bbs.cgi")
+        .header(header::HOST, host)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(form_body.as_bytes().to_vec()))
+        .unwrap();
+    let addr: std::net::SocketAddr = "127.0.0.1:60101".parse().unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, sjis::decode(&bytes))
+}
+
 #[given("自ノードがスレに接続済みである")]
 async fn own_node_connected_to_thread(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: 互換 API 前提のスレ接続")
+    // 「自ノードがスレに接続済み」= 自ノードがホストしている板が存在する状態
+    // (互換 API は自ノードホスト板のみを対象とする — web/compat/mod.rs モジュール doc)。
+    let registry = LivechatRegistry::new(128);
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    registry
+        .open_thread(
+            persona.clone(),
+            format!("30311:{board_id}:{GUID}"),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            BoardSettings {
+                first_post_pow_bits: 0,
+                ..Default::default()
+            },
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+    let compat_state = build_compat_state(registry);
+    let c = ctx(world);
+    c.us6_compat_state = Some(compat_state);
+    c.us6_board_id = Some(board_id);
+    c.us6_request_host = Some("127.0.0.1:7183".to_string());
 }
 
 #[when("互換クライアントがスレ一覧を取得する")]
 async fn compat_client_fetches_thread_list(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: GET /{{board}}/subject.txt 相当")
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c
+        .us6_request_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:7183".into());
+    let (status, body) = compat_get(state, &format!("/{board_id}/subject.txt"), &host).await;
+    c.us6_last_status = Some(status);
+    c.us6_last_body = Some(body);
 }
 
 #[then("板のアクティブスレが従来形式で返り板設定も従来の板設定提示形式で参照できる")]
 async fn compat_thread_list_and_settings_returned(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: FR-027 の従来形式応答検証")
+    let c = ctx(world);
+    assert_eq!(c.us6_last_status, Some(axum::http::StatusCode::OK));
+    let body = c.us6_last_body.as_ref().expect("subject.txt 本文");
+    // <key>.dat<>タイトル (レス数) 形式(FR-027)。
+    assert!(body.contains(".dat<>"), "subject.txt 形式: {body}");
+    assert!(body.contains("実況スレ"), "subject.txt 形式: {body}");
+
+    // 板設定も従来形式(SETTING.TXT)で参照できる。
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c.us6_request_host.clone().unwrap();
+    let (status, setting_body) =
+        compat_get(state, &format!("/{board_id}/SETTING.TXT"), &host).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(setting_body.contains("BBS_TITLE="));
+    assert!(setting_body.contains("BBS_MAX_RES="));
 }
 
 #[when("互換クライアントがスレ本文を取得する")]
 async fn compat_client_fetches_thread_body(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: GET /{{board}}/dat/{{key}}.dat 相当")
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c
+        .us6_request_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:7183".into());
+    let (status, body) = compat_get(state, &format!("/{board_id}/dat/1700000000.dat"), &host).await;
+    c.us6_last_status = Some(status);
+    c.us6_last_body = Some(body);
 }
 
 #[given("互換クライアントがスレ本文を取得する")]
 async fn given_compat_client_fetches_thread_body(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: dat 取得の前提")
+    // 前提: 自ノードホスト板が存在する状態を用意する(まだ取得は行わない — When で行う)。
+    own_node_connected_to_thread(world).await;
 }
 
 #[when("スレに新しい確定レスがある")]
 async fn thread_has_new_confirmed_res(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: 新規確定レスの発生")
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let board_key = Keys::generate();
+    let ev = sign_res(
+        &board_key,
+        &board_id,
+        &format!("30311:{board_id}:{GUID}"),
+        1,
+        "新しい確定レス",
+        1_700_000_050,
+    )
+    .unwrap();
+    state
+        .registry
+        .seed_confirmed_res(&board_id, &ev, 1_700_000_050)
+        .unwrap();
+
+    let host = c
+        .us6_request_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:7183".into());
+    let (status, body) = compat_get(state, &format!("/{board_id}/dat/1700000000.dat"), &host).await;
+    c.us6_last_status = Some(status);
+    c.us6_last_body = Some(body);
 }
 
 #[then("確定順序どおりのレスが従来形式で返る")]
 async fn compat_res_returned_in_order(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: dat 応答の確定順序検証")
+    let c = ctx(world);
+    assert_eq!(c.us6_last_status, Some(axum::http::StatusCode::OK));
+    let body = c.us6_last_body.as_ref().expect("dat 本文");
+    assert!(body.contains("新しい確定レス"), "dat 本文: {body}");
+    // 従来形式(1 レス 1 行、5 フィールド <> 区切り)。
+    let line = body.lines().next().expect("少なくとも 1 行");
+    assert_eq!(
+        line.split("<>").count(),
+        5,
+        "dat の 1 レス行は 5 フィールド: {line}"
+    );
 }
 
 #[given("互換クライアントが書き込みを送信する")]
 async fn compat_client_submits_write(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: POST /test/bbs.cgi 相当の準備")
+    // 前提として自ノードホスト板を用意する(まだ送信は行わない — When で行う)。
+    own_node_connected_to_thread(world).await;
 }
 
 #[when("自ノードが受理する")]
 async fn own_node_accepts_write(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: bbs.cgi 受理処理")
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c
+        .us6_request_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:7183".into());
+    let form = format!("bbs={board_id}&key=1700000000&FROM=&mail=&MESSAGE=%96%7B%95%B6");
+    let (status, body) = compat_post_bbs_cgi(state, &form, &host).await;
+    c.us6_last_status = Some(status);
+    c.us6_last_body = Some(body);
 }
 
 #[then(
     "板鍵で自動署名され通常経路と同一の検証を経てホストへ送信され採番確定後の再取得に反映される"
 )]
 async fn compat_write_follows_normal_path(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: FR-028 の経路一致検証")
+    let c = ctx(world);
+    assert_eq!(c.us6_last_status, Some(axum::http::StatusCode::OK));
+    let body = c.us6_last_body.as_ref().expect("bbs.cgi 応答本文");
+    assert!(
+        body.contains("<title>書きこみました。</title>"),
+        "成功応答: {body}"
+    );
+
+    // 採番確定後の再取得(dat)に反映されることを確認する(US6 シナリオ 3)。
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c.us6_request_host.clone().unwrap();
+    let (status, dat_body) =
+        compat_get(state, &format!("/{board_id}/dat/1700000000.dat"), &host).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        dat_body.lines().count(),
+        1,
+        "書き込みが反映され 1 レス確定: {dat_body}"
+    );
+
+    // 板鍵の自動署名を確認する(通常経路 = LivechatRegistry::accept_write を経由したため
+    // 板単位スコープの BAN 等も同じ検証パイプラインで機能する — FR-028)。
+    let snapshot = state.registry.board_snapshot(&board_id).unwrap();
+    assert_eq!(snapshot.active.res.len(), 1);
+    assert!(
+        peca_p2p_yp::security::is_lower_hex(&snapshot.active.res[0].board_key, 64),
+        "板鍵(hex64)で署名されている"
+    );
 }
 
 #[given("loopback以外の送信元がある")]
 async fn non_loopback_source_exists(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: 非 loopback 送信元の用意")
+    // 前提として自ノードホスト板を用意し、以後のリクエストで非 loopback の Host を使う。
+    own_node_connected_to_thread(world).await;
+    let c = ctx(world);
+    c.us6_request_host = Some("evil.example.com:7183".to_string());
 }
 
 #[when("互換APIにアクセスする")]
 async fn access_compat_api(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: 互換 API アクセスの実行")
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c.us6_request_host.clone().expect("host");
+    let (status, body) = compat_get(state, &format!("/{board_id}/subject.txt"), &host).await;
+    c.us6_last_status = Some(status);
+    c.us6_last_body = Some(body);
 }
 
 #[then("拒否される")]
 async fn access_is_rejected(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: FR-026 の loopback 限定検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us6_last_status,
+        Some(axum::http::StatusCode::FORBIDDEN),
+        "非 loopback の Host ヘッダは定型 403 で拒否される(FR-026)"
+    );
+    // 内部情報を含まない(本文は空 — error_response は本文なしのステータスのみ)。
+    let body = c.us6_last_body.as_deref().unwrap_or("");
+    assert!(body.is_empty() || !body.contains(".rs:"));
 }
 
 #[given("凍結またはクローズ済みのスレがある")]
 async fn frozen_or_closed_thread_exists(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T027 以降で実装: 凍結/クローズ済みスレの用意")
+    own_node_connected_to_thread(world).await;
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    // クローズ済みスレとして用意する(明示クローズ — FR-014)。
+    state
+        .registry
+        .close_thread(&board_id, 1_700_000_500)
+        .unwrap();
 }
 
 #[when("互換クライアントが書き込みを送信する")]
 async fn compat_client_writes_to_closed_thread(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: 凍結/クローズ済みスレへの書き込み")
+    let c = ctx(world);
+    let state = c.us6_compat_state.as_ref().expect("CompatState");
+    let board_id = c.us6_board_id.clone().expect("board_id");
+    let host = c
+        .us6_request_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:7183".into());
+    let form = format!("bbs={board_id}&key=1700000000&MESSAGE=%96%7B%95%B6");
+    let (status, body) = compat_post_bbs_cgi(state, &form, &host).await;
+    c.us6_last_status = Some(status);
+    c.us6_last_body = Some(body);
 }
 
 #[then("従来クライアントが解釈できる形式のエラーが返り内部情報は漏洩しない")]
 async fn compat_error_is_conventional_and_safe(world: &mut AppWorld) {
-    let _ = ctx(world);
-    unimplemented!("T028 以降で実装: FR-030 のエラー形式・非漏洩検証")
+    let c = ctx(world);
+    assert_eq!(
+        c.us6_last_status,
+        Some(axum::http::StatusCode::OK),
+        "bbs.cgi は常に 200 でエラーページを返す(FR-030)"
+    );
+    let body = c.us6_last_body.as_ref().expect("bbs.cgi エラー応答");
+    assert!(
+        body.contains("<title>ERROR!</title>"),
+        "従来形式のエラー: {body}"
+    );
+    assert!(body.contains("ERROR:"), "従来形式のエラー: {body}");
+    // 内部情報(パス・スタックトレース・BAN の事実)を含めない(FR-030 MUST NOT)。
+    assert!(!body.contains("panic"));
+    assert!(!body.contains(".rs:"));
+    assert!(!body.to_lowercase().contains("ban"));
 }
