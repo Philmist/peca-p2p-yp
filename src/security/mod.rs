@@ -143,6 +143,19 @@ pub fn strip_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// 制御文字を除去するが、Markdown の意味を持つ改行(`\n`)とタブ(`\t`)は残す。
+///
+/// `strip_control_chars` は `char::is_control()` が `true` を返す `\n`/`\r`/`\t` も
+/// 削ってしまうため、Markdown 原文(板のローカルルール — data-model §BoardSettings)を
+/// 正規化する用途には使えない。ここでは行構造を保つため `\n` と `\t` を残し、
+/// `\r` は除去して CRLF を LF へ正規化する。描画時の XSS 対策は
+/// [`crate::web::livechat::render_local_rules_html`] 側が担う。
+pub fn strip_control_chars_keep_markdown(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
+        .collect()
+}
+
 /// 制御文字を含むか。
 pub fn contains_control_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
@@ -417,6 +430,24 @@ mod tests {
         assert_eq!(strip_control_chars("改行\nタブ\t"), "改行タブ");
         assert!(contains_control_chars("a\nb"));
         assert!(!contains_control_chars("普通の文字列"));
+    }
+
+    #[test]
+    fn markdown_keep_preserves_newlines_and_tabs() {
+        // Markdown 用は \n / \t を残し、他の制御文字は除去する。
+        assert_eq!(
+            strip_control_chars_keep_markdown("改行\nタブ\t"),
+            "改行\nタブ\t"
+        );
+        assert_eq!(
+            strip_control_chars_keep_markdown("a\x00b\x1fc\x7fd"),
+            "abcd"
+        );
+        // \r は除去され CRLF は LF へ正規化される。
+        assert_eq!(
+            strip_control_chars_keep_markdown("# 見出し\r\n\r\n本文"),
+            "# 見出し\n\n本文"
+        );
     }
 
     #[test]

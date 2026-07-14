@@ -18,7 +18,7 @@
 //!   実装しない)。
 //! - **T3**: 確定レスの `res_no` は 1 から欠番なく単調増加し、`res_limit` を超えない。
 
-use crate::security::strip_control_chars;
+use crate::security::{strip_control_chars, strip_control_chars_keep_markdown};
 use crate::store::BoardSettingsRow;
 
 // ---------------------------------------------------------------------------
@@ -127,12 +127,16 @@ impl BoardSettings {
     }
 
     /// 制御文字を除去した新しい値で構成する(受信・保存前の正規化)。
+    ///
+    /// `title`/`noname_name` は 1 行値なので改行を含む全制御文字を除去するが、
+    /// `local_rules` は Markdown 原文であり改行に意味があるため、`\n`/`\t` を残す
+    /// [`strip_control_chars_keep_markdown`] を用いる(全除去すると改行が消える)。
     pub fn sanitized(&self) -> Self {
         BoardSettings {
             title: strip_control_chars(&self.title),
             res_limit: self.res_limit,
             noname_name: strip_control_chars(&self.noname_name),
-            local_rules: strip_control_chars(&self.local_rules),
+            local_rules: strip_control_chars_keep_markdown(&self.local_rules),
             first_post_pow_bits: self.first_post_pow_bits,
         }
     }
@@ -764,6 +768,21 @@ mod tests {
         assert_eq!(sanitized.title, "タイトル制御");
         assert_eq!(sanitized.noname_name, "名無しさん");
         assert_eq!(sanitized.local_rules, "ルール");
+    }
+
+    #[test]
+    fn board_settings_sanitized_preserves_local_rules_newlines() {
+        // local_rules は Markdown 原文。改行を残さないと描画で段落が潰れる(回帰防止)。
+        let s = BoardSettings {
+            title: "見出し\n改行".to_string(),
+            local_rules: "# にゃーご\r\n\r\nにゃーん\x07".to_string(),
+            ..Default::default()
+        };
+        let sanitized = s.sanitized();
+        // local_rules は改行を保持し、\r は LF へ正規化・他の制御文字のみ除去。
+        assert_eq!(sanitized.local_rules, "# にゃーご\n\nにゃーん");
+        // 1 行値の title は従来どおり改行も含めて除去する。
+        assert_eq!(sanitized.title, "見出し改行");
     }
 
     // --- BoardSettings <-> BoardSettingsRow 相互変換 ---------------------------
