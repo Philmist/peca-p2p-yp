@@ -387,6 +387,7 @@ pub fn board_settings_json(settings: &BoardSettings) -> Value {
         "noname_name": settings.noname_name,
         "local_rules": settings.local_rules,
         "first_post_pow_bits": settings.first_post_pow_bits,
+        "first_post_template": settings.first_post_template,
     })
 }
 

@@ -1518,6 +1518,7 @@ fn build_compat_state(registry: std::sync::Arc<LivechatRegistry>) -> CompatState
         security,
         allowed_hosts: std::sync::Arc::new(hosts),
         rate_limiter: std::sync::Arc::new(peca_p2p_yp::web::RateLimiter::per_second(1000)),
+        enforce_lan_source: false,
     }
 }
 

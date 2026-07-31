@@ -40,6 +40,10 @@ pub const LOCAL_RULES_MAX_CHARS: usize = 2048;
 /// first_post_pow_bits の上限(0〜32、既定 20 — research R6)。
 pub const FIRST_POST_POW_BITS_MAX: u8 = 32;
 const FIRST_POST_POW_BITS_DEFAULT: u8 = 20;
+/// first_post_template(固定 >>1 テンプレ)の上限(2048 文字 / 32 行 —
+/// contracts/fixed-first-post.md §2。kind 1311 レス本文の検証と同一)。
+pub const FIRST_POST_TEMPLATE_MAX_CHARS: usize = 2048;
+pub const FIRST_POST_TEMPLATE_MAX_LINES: usize = 32;
 
 /// 板設定の検証エラー。`Display` は内部情報を漏らさない(Principle II)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +58,10 @@ pub enum BoardSettingsError {
     LocalRulesTooLong,
     /// first_post_pow_bits が範囲外(0〜32)。
     PowBitsOutOfRange,
+    /// first_post_template が文字数上限(2048)を超える。
+    FirstPostTemplateTooLong,
+    /// first_post_template が行数上限(32)を超える。
+    FirstPostTemplateTooManyLines,
 }
 
 impl std::fmt::Display for BoardSettingsError {
@@ -69,6 +77,12 @@ impl std::fmt::Display for BoardSettingsError {
             BoardSettingsError::LocalRulesTooLong => write!(f, "ローカルルールが長すぎます"),
             BoardSettingsError::PowBitsOutOfRange => {
                 write!(f, "first_post_pow_bits は 0〜32 の範囲で指定してください")
+            }
+            BoardSettingsError::FirstPostTemplateTooLong => {
+                write!(f, "固定 >>1 テンプレは 2048 文字以内で指定してください")
+            }
+            BoardSettingsError::FirstPostTemplateTooManyLines => {
+                write!(f, "固定 >>1 テンプレは 32 行以内で指定してください")
             }
         }
     }
@@ -89,6 +103,10 @@ pub struct BoardSettings {
     pub local_rules: String,
     /// 初回書き込み PoW ビット数(0〜32、既定 20 — research R6)。即時反映。
     pub first_post_pow_bits: u8,
+    /// 固定 >>1(スレ頭)テンプレ本文(≤ 2048 文字・≤ 32 行。プレーンテキスト。既定 `""`)。
+    /// **次スレから**反映(変更は遡及しない — FR-017)。空なら開設時にシステム既定テンプレを
+    /// 生成する(contracts/fixed-first-post.md §3)。
+    pub first_post_template: String,
 }
 
 impl Default for BoardSettings {
@@ -99,6 +117,7 @@ impl Default for BoardSettings {
             noname_name: NONAME_NAME_DEFAULT.to_string(),
             local_rules: String::new(),
             first_post_pow_bits: FIRST_POST_POW_BITS_DEFAULT,
+            first_post_template: String::new(),
         }
     }
 }
@@ -123,6 +142,13 @@ impl BoardSettings {
         if self.first_post_pow_bits > FIRST_POST_POW_BITS_MAX {
             return Err(BoardSettingsError::PowBitsOutOfRange);
         }
+        // 固定 >>1 テンプレは kind 1311 レス本文と同一の値域(2048 文字 / 32 行)。
+        if self.first_post_template.chars().count() > FIRST_POST_TEMPLATE_MAX_CHARS {
+            return Err(BoardSettingsError::FirstPostTemplateTooLong);
+        }
+        if self.first_post_template.lines().count() > FIRST_POST_TEMPLATE_MAX_LINES {
+            return Err(BoardSettingsError::FirstPostTemplateTooManyLines);
+        }
         Ok(())
     }
 
@@ -138,6 +164,8 @@ impl BoardSettings {
             noname_name: strip_control_chars(&self.noname_name),
             local_rules: strip_control_chars_keep_markdown(&self.local_rules),
             first_post_pow_bits: self.first_post_pow_bits,
+            // >>1 テンプレは複数行の案内文。改行(\n/\t)を保持し他の制御文字のみ除去する。
+            first_post_template: strip_control_chars_keep_markdown(&self.first_post_template),
         }
     }
 
@@ -158,6 +186,7 @@ impl BoardSettings {
             noname_name: row.noname_name.clone(),
             local_rules: row.local_rules.clone(),
             first_post_pow_bits,
+            first_post_template: row.first_post_template.clone(),
         }
     }
 
@@ -170,6 +199,7 @@ impl BoardSettings {
             noname_name: self.noname_name.clone(),
             local_rules: self.local_rules.clone(),
             first_post_pow_bits: i64::from(self.first_post_pow_bits),
+            first_post_template: self.first_post_template.clone(),
         }
     }
 }
@@ -756,6 +786,60 @@ mod tests {
         assert!(boundary.validate().is_ok());
     }
 
+    // --- BoardSettings: first_post_template(007 T025 — fixed-first-post.md §2)---
+
+    #[test]
+    fn board_settings_default_first_post_template_is_empty() {
+        assert_eq!(BoardSettings::default().first_post_template, "");
+    }
+
+    #[test]
+    fn board_settings_rejects_first_post_template_too_long() {
+        let s = BoardSettings {
+            first_post_template: "あ".repeat(FIRST_POST_TEMPLATE_MAX_CHARS + 1),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.validate(),
+            Err(BoardSettingsError::FirstPostTemplateTooLong)
+        );
+        let boundary = BoardSettings {
+            first_post_template: "あ".repeat(FIRST_POST_TEMPLATE_MAX_CHARS),
+            ..Default::default()
+        };
+        assert!(boundary.validate().is_ok(), "上限ちょうどは許容");
+    }
+
+    #[test]
+    fn board_settings_rejects_first_post_template_too_many_lines() {
+        let too_many = vec!["x"; FIRST_POST_TEMPLATE_MAX_LINES + 1].join("\n");
+        let s = BoardSettings {
+            first_post_template: too_many,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.validate(),
+            Err(BoardSettingsError::FirstPostTemplateTooManyLines)
+        );
+        let boundary = vec!["x"; FIRST_POST_TEMPLATE_MAX_LINES].join("\n");
+        let s = BoardSettings {
+            first_post_template: boundary,
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok(), "32 行ちょうどは許容");
+    }
+
+    #[test]
+    fn board_settings_sanitized_first_post_template_keeps_newlines() {
+        // >>1 テンプレは複数行の案内文。改行を保持し制御文字のみ除去する(FR-013)。
+        let s = BoardSettings {
+            first_post_template: "配信URL\r\n\r\nhttp://例\x07".to_string(),
+            ..Default::default()
+        };
+        let sanitized = s.sanitized();
+        assert_eq!(sanitized.first_post_template, "配信URL\n\nhttp://例");
+    }
+
     #[test]
     fn board_settings_sanitized_strips_control_chars() {
         let s = BoardSettings {
@@ -795,12 +879,17 @@ mod tests {
             noname_name: "名無しさん".to_string(),
             local_rules: "荒らし禁止".to_string(),
             first_post_pow_bits: 16,
+            first_post_template: "配信URL: http://example/\n実況しましょう".to_string(),
         };
         let board_id = board_id();
         let row = s.to_row(&board_id);
         assert_eq!(row.board_id, board_id);
         assert_eq!(row.res_limit, 500);
         assert_eq!(row.first_post_pow_bits, 16);
+        assert_eq!(
+            row.first_post_template,
+            "配信URL: http://example/\n実況しましょう"
+        );
         let restored = BoardSettings::from_row(&row);
         assert_eq!(restored, s);
     }
@@ -814,6 +903,7 @@ mod tests {
             noname_name: "n".to_string(),
             local_rules: String::new(),
             first_post_pow_bits: 200, // u8 範囲外
+            first_post_template: String::new(),
         };
         let restored = BoardSettings::from_row(&row);
         assert_eq!(restored.res_limit, RES_LIMIT_DEFAULT);

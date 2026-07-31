@@ -328,9 +328,10 @@ async fn get_settings_returns_all_keys_with_defaults() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    // 20 キー(data-model §Settings — ADR-0012 で index_bind 追加 13→14、
-    // 006-livechat-thread T009 で livechat 系 6 キー追加 14→20)
-    assert_eq!(json.as_object().unwrap().len(), 20);
+    // 22 キー(data-model §Settings — ADR-0012 で index_bind 追加 13→14、
+    // 006-livechat-thread T009 で livechat 系 6 キー追加 14→20、007 ADR-0015 で
+    // http_lan_consent / compat_bbs_lan_consent 追加 20→22)
+    assert_eq!(json.as_object().unwrap().len(), 22);
     assert_eq!(json["pcp_bind"], "127.0.0.1:7146");
     assert_eq!(json["http_bind"], "127.0.0.1:7180");
     assert_eq!(json["p2p_bind"], "0.0.0.0:7147,[::]:7147");
@@ -339,6 +340,9 @@ async fn get_settings_returns_all_keys_with_defaults() {
     assert_eq!(json["index_txt_encoding"], "utf-8");
     // index_bind の既定は空文字(機能無効)。
     assert_eq!(json["index_bind"], "");
+    // LAN 公開の明示同意は既定 false(007 ADR-0015 — 2 要素オプトイン)。
+    assert_eq!(json["http_lan_consent"], false);
+    assert_eq!(json["compat_bbs_lan_consent"], false);
     // livechat 系 6 キーの既定(006 data-model §Settings)。
     assert_eq!(json["livechat_enabled"], true);
     assert_eq!(json["thread_max_participants"], 128);
@@ -1205,4 +1209,325 @@ async fn status_includes_broadcasting_flag() {
     assert!(engine.publish_listing(&ch_listing()).unwrap());
     let r = send(&state, Method::GET, "/api/v1/status", None, Body::empty()).await;
     assert_eq!(r["body"]["broadcasting"], true);
+}
+
+// ---------------------------------------------------------------------------
+// 板詳細 API の compat_bbs_port(T004 — contracts/web-ui.md §5.1)
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::livechat::thread::BoardSettings as LcBoardSettings;
+use peca_p2p_yp::web::livechat::{
+    BoardSettingsView, LivechatDirectory, ThreadDetail, ThreadSummary,
+};
+
+/// `compat_bbs_port` の往復を検証する最小フェイク供給元。既知 board のみ詳細を返し、
+/// `compat_bbs_port` は注入値をそのまま載せる(互換 API 有効時 = ポート番号 / 無効時 = None)。
+struct PortDirectory {
+    board_id: String,
+    compat_bbs_port: Option<u16>,
+}
+
+impl LivechatDirectory for PortDirectory {
+    fn threads(&self) -> Vec<ThreadSummary> {
+        Vec::new()
+    }
+    fn thread(&self, board_id: &str) -> Option<ThreadDetail> {
+        (board_id == self.board_id).then(|| ThreadDetail {
+            settings: BoardSettingsView::from_settings(&LcBoardSettings::default()),
+            res: Vec::new(),
+            pending: Vec::new(),
+            compat_bbs_port: self.compat_bbs_port,
+        })
+    }
+    fn next_thread(&self, _board_id: &str) -> Option<u32> {
+        None
+    }
+    fn close_thread(&self, _board_id: &str) -> bool {
+        false
+    }
+}
+
+/// フェイク供給元を注入して板詳細 JSON を取得する。
+async fn thread_detail_json(compat_bbs_port: Option<u16>) -> Value {
+    let (security, _p, _d) = temp_security_log();
+    let board_id = "ab".repeat(32);
+    let state = test_state(security).with_livechat_directory(Arc::new(PortDirectory {
+        board_id: board_id.clone(),
+        compat_bbs_port,
+    }));
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            &format!("/api/v1/livechat/threads/{board_id}"),
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// 互換 API 有効時は `compat_bbs_port` にポート番号が載る。
+#[tokio::test]
+async fn get_thread_includes_compat_bbs_port_when_enabled() {
+    let json = thread_detail_json(Some(7183)).await;
+    assert_eq!(json["compat_bbs_port"], 7183);
+}
+
+/// 互換 API 無効時も `compat_bbs_port` キーは存在し、値は null。
+#[tokio::test]
+async fn get_thread_compat_bbs_port_is_null_when_disabled() {
+    let json = thread_detail_json(None).await;
+    assert!(
+        json.as_object().unwrap().contains_key("compat_bbs_port"),
+        "無効時もキーは存在するべき: {json}"
+    );
+    assert!(json["compat_bbs_port"].is_null(), "無効時は null: {json}");
+}
+
+// ---------------------------------------------------------------------------
+// Web UI 面の LAN 公開: Host ホワイトリスト + 送信元 IP 検証
+// (T014 — contracts/lan-exposure.md §3/§4)
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::web::host_allowlist;
+
+/// 非 loopback bind の Host ホワイトリストは loopback 3 形式 + `{bind_ip}:{port}` を含む。
+#[test]
+fn host_allowlist_adds_lan_literal_for_non_loopback_bind() {
+    let set = host_allowlist("192.168.1.10:7180".parse().unwrap());
+    assert!(set.contains("192.168.1.10:7180"), "bind リテラルを含む");
+    assert!(set.contains("127.0.0.1:7180"));
+    assert!(set.contains("localhost:7180"));
+    assert!(set.contains("[::1]:7180"));
+}
+
+/// loopback bind の Host ホワイトリストは loopback 3 形式のみ(LAN リテラルを足さない)。
+#[test]
+fn host_allowlist_is_loopback_only_for_loopback_bind() {
+    let set = host_allowlist("127.0.0.1:7180".parse().unwrap());
+    assert_eq!(set.len(), 3);
+    assert!(!set.iter().any(|h| h.starts_with("192.")));
+}
+
+/// LAN 公開中(Host に bind リテラルを許可)なら `{bind_ip}:{port}` Host は通り、
+/// ホワイトリスト外・欠落 Host は 403。
+#[tokio::test]
+async fn lan_bind_host_is_accepted_offlist_is_403() {
+    let (security, _p, _d) = temp_security_log();
+    let mut state = test_state(security);
+    state.allowed_hosts = Arc::new(host_allowlist("192.168.1.10:7180".parse().unwrap()));
+    let app = web::build_router(state.clone());
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            "/api/v1/token",
+            Some("192.168.1.10:7180"),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "LAN bind リテラル Host は通る"
+    );
+
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            "/api/v1/token",
+            Some("evil.example:7180"),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// 送信元 IP 検証: 有効時、LAN 外送信元は 403、LAN 内送信元は通る。無効時(既定)は
+/// 送信元を検査しない(loopback 運用の非退行)。
+#[tokio::test]
+async fn source_ip_guard_rejects_non_lan_when_enabled() {
+    // 有効化 + グローバル送信元 → 403。
+    let (security, _p, _d) = temp_security_log();
+    let mut state = test_state(security);
+    state.enforce_lan_source = true;
+    let app = web::build_router(state);
+    let mut req = build_request(
+        Method::GET,
+        "/api/v1/token",
+        Some(GOOD_HOST),
+        None,
+        Body::empty(),
+    );
+    req.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+        "203.0.113.9:40000".parse().unwrap(),
+    ));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "LAN 外送信元は 403");
+
+    // 有効化 + LAN 送信元 → 通る。
+    let (security, _p, _d) = temp_security_log();
+    let mut state = test_state(security);
+    state.enforce_lan_source = true;
+    let app = web::build_router(state);
+    let mut req = build_request(
+        Method::GET,
+        "/api/v1/token",
+        Some(GOOD_HOST),
+        None,
+        Body::empty(),
+    );
+    req.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+        "192.168.1.50:40000".parse().unwrap(),
+    ));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "LAN 内送信元は通る");
+}
+
+// ---------------------------------------------------------------------------
+// 板設定 API の first_post_template(T027 — contracts/web-ui.md §5.2 /
+// fixed-first-post.md §2)
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+use peca_p2p_yp::livechat::thread::BoardSettings;
+use peca_p2p_yp::web::livechat::{BoardSettingsInput, LivechatOpError};
+
+/// 板設定の検証・保持を行う最小フェイク供給元(T027 — PUT の値域検証 400 と GET 往復を確認)。
+struct SettingsDirectory {
+    board_id: String,
+    stored: Mutex<BoardSettings>,
+}
+
+impl LivechatDirectory for SettingsDirectory {
+    fn threads(&self) -> Vec<ThreadSummary> {
+        Vec::new()
+    }
+    fn thread(&self, board_id: &str) -> Option<ThreadDetail> {
+        (board_id == self.board_id).then(|| ThreadDetail {
+            settings: BoardSettingsView::from_settings(&self.stored.lock().unwrap()),
+            res: Vec::new(),
+            pending: Vec::new(),
+            compat_bbs_port: None,
+        })
+    }
+    fn next_thread(&self, _board_id: &str) -> Option<u32> {
+        None
+    }
+    fn close_thread(&self, _board_id: &str) -> bool {
+        false
+    }
+    fn update_settings(
+        &self,
+        _board_id: &str,
+        input: BoardSettingsInput,
+    ) -> Result<(), LivechatOpError> {
+        // registry と同一の写像: sanitize → validate。上限超過は Invalid(400)。
+        let s: BoardSettings = input.into();
+        let s = s.sanitized();
+        s.validate().map_err(|_| LivechatOpError::Invalid)?;
+        *self.stored.lock().unwrap() = s;
+        Ok(())
+    }
+}
+
+fn settings_state(board_id: &str) -> AppState {
+    let (security, _p, _d) = temp_security_log();
+    test_state(security).with_livechat_directory(Arc::new(SettingsDirectory {
+        board_id: board_id.to_string(),
+        stored: Mutex::new(BoardSettings::default()),
+    }))
+}
+
+/// JSON ボディ付き PUT(Json 抽出器のため `Content-Type: application/json` を付与する)。
+fn put_json(uri: &str, body: String) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::PUT)
+        .uri(uri)
+        .header(header::HOST, GOOD_HOST)
+        .header("X-Api-Token", TOKEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
+
+/// PUT で first_post_template を設定し、GET で往復して取得できる。
+#[tokio::test]
+async fn put_get_first_post_template_roundtrip() {
+    let board_id = "ab".repeat(32);
+    let state = settings_state(&board_id);
+    let body = serde_json::json!({
+        "title": "実況スレ",
+        "res_limit": 1000,
+        "noname_name": "名無しさん",
+        "local_rules": "",
+        "first_post_pow_bits": 20,
+        "first_post_template": "配信URL: http://example/\n実況しましょう"
+    })
+    .to_string();
+    let app = web::build_router(state.clone());
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/livechat/threads/{board_id}/settings"),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "適用は 204");
+
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            &format!("/api/v1/livechat/threads/{board_id}"),
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["settings"]["first_post_template"],
+        "配信URL: http://example/\n実況しましょう"
+    );
+}
+
+/// 2048 文字を超える first_post_template は 400(板設定検証エラー)。
+#[tokio::test]
+async fn put_first_post_template_over_limit_is_400() {
+    let board_id = "ab".repeat(32);
+    let state = settings_state(&board_id);
+    let too_long: String = "あ".repeat(2049);
+    let body = serde_json::json!({
+        "title": "実況スレ",
+        "res_limit": 1000,
+        "noname_name": "名無しさん",
+        "local_rules": "",
+        "first_post_pow_bits": 20,
+        "first_post_template": too_long
+    })
+    .to_string();
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/livechat/threads/{board_id}/settings"),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "上限超過は 400");
 }

@@ -1,0 +1,101 @@
+# Data Model: 007-web-bbs-write
+
+**Date**: 2026-07-31 | **Plan**: [plan.md](plan.md) | **Research**: [research.md](research.md)
+
+006 のデータモデル(`specs/006-livechat-thread/data-model.md`)への**差分**のみを記す。
+006 のエンティティ(スレ・レス・OrderInfo・板鍵・NG/BAN)は変更しない。
+
+## 永続化の方針(差分)
+
+| データ | 置き場所 | 変更 |
+|--------|----------|------|
+| 板設定(固定 >>1 テンプレ含む) | SQLite `board_settings` テーブル | 列追加 + production 配線(006 で定義済み・未配線 — research R4) |
+| LAN 公開設定(bind・同意キー) | 設定ファイル(`Settings`) | キー追加 |
+| 固定 >>1 の確定レス | インメモリ(確定レス列) | 006 どおり揮発。>>1 も通常レスとして扱う |
+
+## エンティティ
+
+### BoardSettings(拡張)— `src/livechat/thread.rs`
+
+006 既存フィールド(`title` / `res_limit` / `noname_name` / `local_rules` /
+`first_post_pow_bits`)に以下を追加する。
+
+| フィールド | 型 | 検証 | 意味 |
+|-----------|-----|------|------|
+| `first_post_template` | `String`(既定 `""`) | ≤ 2048 文字・≤ 32 行・制御文字除去(改行は保持)— kind 1311 本文検証と同一(research R2) | 固定 >>1(スレ頭テンプレ)本文。空 = 未設定(システム既定テンプレを使用) |
+
+- **検証**: `BoardSettings::validate` に値域チェックを追加。`sanitized()` は
+  `local_rules` と同様に改行保持の制御文字除去を適用する。
+- **配布**: 006 の板設定配布(SETTING.TXT / JSON API の settings)と同じ経路。
+  互換 API の SETTING.TXT へ新項目は出さない(専ブラ互換性に影響しないため)。
+- **反映規則**: テンプレ変更は**次に開始するスレから**適用(FR-017)。確定済みスレの
+  >>1 は不変(006 FR-023)。`res_limit` の「次スレから反映」と同じ規則。
+
+### 固定 >>1(自動投稿レス)— 新規エンティティではない
+
+自動投稿された >>1 は **006 の「レス(kind 1311)」そのもの**であり、専用の型を持たない。
+
+| 属性 | 値 |
+|------|-----|
+| res_no | 1(スレ開設・次スレ移行の直後にホストが採番) |
+| 本文 | 投稿時点の `first_post_template`。空なら**システム既定テンプレ**: 板タイトルと対象チャンネル名の案内(1〜数行の固定文言 — contracts/fixed-first-post.md) |
+| 名前・メール | 空(表示は `noname_name`) |
+| 署名 | 板鍵(ホスト管理)による kind 1311 署名 — 通常書き込みと同一(research R3) |
+| PoW | 課さない(ホスト自身の採番 — FR-016) |
+| res_limit カウント | 含む(res_no=1 を占有 — FR-019) |
+
+**状態遷移**: スレ開設(`open_thread`)/ 次スレ移行(自動・明示)→ >>1 採番・確定 →
+通常配布。参加者側は通常レスとして受理(変更なし)。
+
+### Settings(拡張)— `src/config.rs`
+
+| キー | 型 / 既定 | 検証 | 意味 |
+|------|-----------|------|------|
+| `http_bind` | 既存(既定 `127.0.0.1:7180`) | `require_loopback` → **`require_lan_or_loopback` へ変更**(loopback / RFC 1918 / リンクローカル / ULA。グローバル・未指定・CGNAT 拒否。`to_canonical()` 正規化後判定) | Web UI + JSON API の待受 |
+| `compat_bbs_bind` | 既存(既定 `127.0.0.1:7183`) | 同上 | 2ch 互換 API の待受 |
+| `http_lan_consent` | `bool` / `false` | `http_bind` が非 loopback のとき `true` 必須(でなければ設定エラー) | Web UI 面の LAN 公開への明示同意(FR-010) |
+| `compat_bbs_lan_consent` | `bool` / `false` | `compat_bbs_bind` が非 loopback のとき `true` 必須 | 互換 API 面の LAN 公開への明示同意 |
+
+- 既定はいずれも loopback のみ(現状維持 — FR-007)。
+- CLI 上書き(`CliOverrides`)にも同意キーを追加する(config と同じ検証)。
+
+### board_settings テーブル(拡張)— `src/store/mod.rs`
+
+`BoardSettingsRow` に `first_post_template` 列を追加。既存テーブルにはマイグレーション
+(`ALTER TABLE ... ADD COLUMN ... DEFAULT ''`)で追加する。`get/set_board_settings` を
+production 経路(起動時読込・settings PUT 適用時保存)へ配線する(research R4)。
+
+### Web UI ページ(表現層 — コード上の新規型なし)
+
+| ページ | ルート | 構成要素 |
+|--------|--------|----------|
+| 板ページ | `#/board/{board_id}` | スレ一覧(番号・タイトル・レス数)/ 新規スレ作成欄 / ローカルルール掲示(安全描画)/ 板タイトル・名無し名の提示 |
+| スレページ | `#/thread/{board_id}/{thread_key}` | レス列(`{res_no} :{名前}:{日付} ID:{id}` + 本文、既定最新 50)/ `>>n` アンカー(ジャンプ + ポップアップ、解決不能表示)/ 書き込み欄(名前・メール・本文)/ 全部読む・更新 |
+
+詳細は contracts/web-ui.md。
+
+## SecurityEvent 追加カテゴリ — `src/security/mod.rs`
+
+006 時点 21 カテゴリ → **23 カテゴリ**。
+
+| カテゴリ | 記録タイミング |
+|----------|----------------|
+| `WebUiLanExposed` | `http_bind` が非 loopback で待受に成功した起動時に 1 件(`IndexTxtLanExposed` と同パターン) |
+| `CompatBbsLanExposed` | `compat_bbs_bind` が非 loopback で待受に成功した起動時に 1 件 |
+
+拒否系(ホワイトリスト外 Host・許可範囲外送信元・レート超過)は既存カテゴリ
+(`forbidden_host` / `compat_bbs_denied` / `http_rate_limited` 等)を流用する。
+
+## JSON API 差分(概要 — 詳細は contracts/web-ui.md)
+
+- 板詳細レスポンスに `compat_bbs_port`(number | null)を追加(UI が互換 API の板 URL を
+  閲覧元 hostname から動的生成するため — research R5)。
+- 板設定 PUT/GET に `first_post_template` を追加。
+- それ以外のエンドポイント・認証(トークン)・レート制限は変更なし。
+
+## 原則参照
+
+- 許可リスト検証・同意キー・SecurityEvent: Principle I(ユーザー安全)・II(Security by
+  Design)
+- 固定 >>1 が通常検証を満たす経路で確定すること(検証の抜け道なし): Principle II
+- テーブルマイグレーションと配線の明示: Principle III(保守可能性)

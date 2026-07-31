@@ -16,17 +16,20 @@
     #msg.ok { background: #e6f4ea; display: block; }
     #msg.err { background: #fce8e6; display: block; }
     #restart { background: #fff4d6; padding: .6rem; border-radius: 4px; margin: .75rem 0; display: none; }
-    #index-warning { background: #fce8e6; border: 1px solid #d93025; padding: .6rem; border-radius: 4px; margin: .75rem 0; display: none; }
-    #index-warning .ack { display: flex; align-items: flex-start; gap: .5rem; margin-top: .5rem; }
-    #index-warning .ack input { margin-top: .2rem; }
+    #index-warning, #http-warning, #compat-warning { background: #fce8e6; border: 1px solid #d93025; padding: .6rem; border-radius: 4px; margin: .75rem 0; display: none; }
+    .ack { display: flex; align-items: flex-start; gap: .5rem; margin-top: .5rem; }
+    .ack input { margin-top: .2rem; }
     button { padding: .4rem 1rem; }
   </style>
 </head>
 <body>
   <h1>設定</h1>
   <p class="note"><a href="/">← 一覧へ戻る</a> — data-model §Settings の全キーを閲覧・変更できます。</p>
-  <p class="note bind">IPアドレス系の設定(pcp_bind / http_bind / p2p_bind / index_bind)の変更は再起動後に反映されます。
-  pcp_bind / http_bind は loopback アドレス(127.0.0.1 等)のみ指定できます。
+  <p class="note bind">IPアドレス系の設定(pcp_bind / http_bind / p2p_bind / index_bind / compat_bbs_bind)の変更は再起動後に反映されます。
+  pcp_bind は loopback アドレス(127.0.0.1 等)のみ指定できます。
+  http_bind / compat_bbs_bind は loopback または LAN 内のプライベートアドレスを指定でき、
+  非 loopback 値(LAN 公開)を保存するときはリスク確認を求めます(確認で <code>http_lan_consent</code> /
+  <code>compat_bbs_lan_consent</code> を有効化して保存します)。
   p2p_bind はカンマ区切りで複数アドレスを指定でき、IPv4/IPv6 を同時に待ち受けられます
   (例: <code>0.0.0.0:7147,[::]:7147</code>)。空文字にすると待受無効(外向き接続のみ)になります。
   複数指定時、他ピアへ申告されるポートは先頭アドレスのポートのみのため、全アドレスで同一ポートの使用を推奨します。
@@ -44,6 +47,25 @@
       <span>上記のリスク(平文・無認証で取得・改ざんされうること)を理解しました。</span>
     </label>
   </div>
+  <div id="http-warning">
+    <strong>Web UI / JSON API(http_bind)を LAN へ公開しようとしています。</strong>
+    <p>Web UI と JSON API が LAN 内で<strong>平文</strong>のまま読み書きに使われ、
+    セッショントークンも同じ LAN 上の端末に共有されうること(=実質的に LAN 内は誰でも
+    書き込み可能になりうること)を理解した上で有効化してください。</p>
+    <label class="ack">
+      <input type="checkbox" id="http-ack">
+      <span>上記のリスク(平文・LAN 内トークン共有で読み書きされうること)を理解しました。</span>
+    </label>
+  </div>
+  <div id="compat-warning">
+    <strong>2ch 互換 API(compat_bbs_bind)を LAN へ公開しようとしています。</strong>
+    <p>互換 API は<strong>無認証</strong>で、LAN 内の任意の端末(専ブラ等)が<strong>平文</strong>で
+    書き込み可能になります。信頼できる LAN 内でのみ有効化してください。</p>
+    <label class="ack">
+      <input type="checkbox" id="compat-ack">
+      <span>上記のリスク(無認証・平文で LAN 内から書き込まれうること)を理解しました。</span>
+    </label>
+  </div>
 
   <form id="form"></form>
   <div class="row">
@@ -55,10 +77,10 @@
     const BIND_KEYS = ["pcp_bind", "http_bind", "p2p_bind", "index_bind"];
     let token = null;
 
-    // index_bind が非空かつ非 loopback か(警告ゲートの発動判定)。
+    // bind 値が非空かつ非 loopback か(LAN 公開の警告ゲート発動判定)。
     // バックエンドの正規判定(loopback/LAN 許可リスト)に対する安全側の近似:
     // loopback 接頭辞(127. / [::1])以外はすべて警告する(過剰警告は許容、過小警告は不可)。
-    function indexBindNeedsWarning(value) {
+    function bindNeedsWarning(value) {
       const v = (value || "").trim();
       if (v === "") return false;
       if (v.startsWith("127.") || v.startsWith("[::1]")) return false;
@@ -130,20 +152,45 @@
       m.className = ok ? "ok" : "err";
     }
 
-    async function save() {
-      const body = collect();
-      const warning = document.getElementById("index-warning");
-      const ack = document.getElementById("index-ack");
-      // index_bind が非空かつ非 loopback なら、明示確認(チェック)まで送信をブロックする。
-      if (indexBindNeedsWarning(body.index_bind)) {
-        warning.style.display = "block";
-        if (!ack.checked) {
-          showMsg("LAN 公開のリスクを確認し、チェックを入れてから保存してください。", false);
-          return;
-        }
-      } else {
+    // LAN 公開の警告ゲート(2 要素オプトイン — ADR-0015)。bind が非 loopback かつ
+    // 同意が未成立のときだけ警告を表示し、明示確認(ack)まで送信をブロックする。
+    // ack 済み、または既に同意が有効(永続化済み/この場でチェック済み)なら consentKey を
+    // true にして警告を隠したまま通す(保存済みなら再保存で再ナグしない)。
+    // consentKey が null の面(index_bind)は永続同意を持たないため毎回 ack を求める。
+    function lanGate(body, bindKey, warnId, ackId, consentKey) {
+      const warning = document.getElementById(warnId);
+      const ack = document.getElementById(ackId);
+      // LAN 公開しない → 警告を隠す(同意撤回はバックエンド検証に委ねる)。
+      if (!bindNeedsWarning(body[bindKey])) {
         warning.style.display = "none";
         ack.checked = false;
+        return true;
+      }
+      // 既に同意が有効なら追加確認なしで通し、警告は隠す。
+      if (consentKey && body[consentKey] === true) {
+        warning.style.display = "none";
+        return true;
+      }
+      // 未同意 → 明示確認が済むまで警告を出してブロックする。
+      if (!ack.checked) {
+        warning.style.display = "block";
+        return false;
+      }
+      // ack 済み → 同意を立てて通し、警告を隠す。
+      if (consentKey) body[consentKey] = true;
+      warning.style.display = "none";
+      return true;
+    }
+
+    async function save() {
+      const body = collect();
+      // 各公開面ごとに独立にゲートする(片面のみの LAN 公開が可能 — ADR-0015)。
+      const okIndex = lanGate(body, "index_bind", "index-warning", "index-ack", null);
+      const okHttp = lanGate(body, "http_bind", "http-warning", "http-ack", "http_lan_consent");
+      const okCompat = lanGate(body, "compat_bbs_bind", "compat-warning", "compat-ack", "compat_bbs_lan_consent");
+      if (!okIndex || !okHttp || !okCompat) {
+        showMsg("LAN 公開のリスクを確認し、該当するチェックを入れてから保存してください。", false);
+        return;
       }
       const r = await fetch("/api/v1/settings", {
         method: "PUT",
@@ -163,6 +210,8 @@
       } else {
         restart.style.display = "none";
       }
+      // 永続化された同意値をフォームへ反映する(再読込後も再ナグしないため)。
+      await loadSettings();
     }
 
     document.getElementById("save").addEventListener("click", save);

@@ -467,15 +467,38 @@ async fn run() -> Result<(), i32> {
             pcp_listening: true,
             max_clock_skew_sec: settings.max_clock_skew_sec as i64,
         }))
-        .with_broadcast(Arc::clone(&broadcast));
+        .with_broadcast(Arc::clone(&broadcast))
+        // http_bind の LAN 公開(ADR-0015)。非 loopback なら Host ホワイトリスト拡張 +
+        // 送信元 IP の LAN 限定検証を有効化する(loopback では no-op)。
+        .with_http_lan(http_addr);
     if let Some(status) = index_lan_status {
         state = state.with_index_lan(status);
+    }
+    // Web UI + JSON API を LAN 公開した起動時の監査(ADR-0015 決定 6 — http は手順 15 で
+    // bind 済み。非 loopback のときのみ 1 件記録する)。
+    if !http_addr.ip().to_canonical().is_loopback() {
+        security.log(
+            peca_p2p_yp::security::SecurityCategory::WebUiLanExposed,
+            &http_addr.to_string(),
+            "web ui / json api exposed to LAN",
+        );
     }
     // 実況スレの供給元 + 操作(T063/T065/T067/T068 — web/livechat.rs の LivechatDirectory)。
     // 自板 = ホストレジストリ、他ノード板 = gossip 受信 announce、変更系 = 掲載ペルソナ・板鍵
     // 管理へ配線する。livechat_enabled=false(registry なし)のときは未配線のままで、スレ一覧は
     // 空・詳細/操作は 404 を返す(機能無効を内部開示しない)。
     if let Some(livechat_reg) = runtime.livechat().cloned() {
+        // 互換 API 板 URL 生成用のポート(007 T005)。`compat_bbs_bind` が空(無効)・
+        // 書式不正なら None(UI は専ブラ URL を非表示)。有効時は待受ポートを載せる。
+        let compat_bbs_port = if settings.compat_bbs_bind.is_empty() {
+            None
+        } else {
+            settings
+                .compat_bbs_bind
+                .parse::<SocketAddr>()
+                .ok()
+                .map(|a| a.port())
+        };
         state = state.with_livechat_directory(Arc::new(LivechatAdapter {
             registry: livechat_reg,
             hub: Arc::clone(&hub),
@@ -483,7 +506,9 @@ async fn run() -> Result<(), i32> {
             channels: Arc::clone(&registry),
             board_keys: Arc::clone(&board_keys),
             manager: Arc::clone(&participant_manager),
+            store: Arc::clone(&store),
             listen_port,
+            compat_bbs_port,
         }));
     }
     let app = build_router(state.clone());
@@ -522,18 +547,29 @@ async fn run() -> Result<(), i32> {
                             settings.thread_max_participants as usize,
                         )
                     });
+                    // 非 loopback bind(LAN 公開 — ADR-0015)なら Host ホワイトリストを
+                    // `{bind_ip}:{port}` まで拡張し、送信元 IP の LAN 限定検証を有効化する。
+                    let compat_lan = !compat_addr.ip().to_canonical().is_loopback();
                     let compat_state = peca_p2p_yp::web::compat::CompatState {
                         registry,
                         board_keys: Arc::clone(&board_keys),
                         manager: Arc::clone(&participant_manager),
                         security: Arc::clone(&security),
-                        allowed_hosts: Arc::new(peca_p2p_yp::web::loopback_hosts(
-                            compat_addr.port(),
-                        )),
+                        allowed_hosts: Arc::new(peca_p2p_yp::web::host_allowlist(compat_addr)),
                         rate_limiter: Arc::new(peca_p2p_yp::web::RateLimiter::per_second(
                             peca_p2p_yp::web::compat::RATE_LIMIT_PER_SEC,
                         )),
+                        enforce_lan_source: compat_lan,
                     };
+                    // LAN 公開に成功した起動時、面ごとに SecurityEvent を 1 件記録する
+                    // (ADR-0015 決定 6 — bind 成功後・非 loopback のときのみ)。
+                    if compat_lan {
+                        security.log(
+                            peca_p2p_yp::security::SecurityCategory::CompatBbsLanExposed,
+                            &compat_addr.to_string(),
+                            "compat bbs api exposed to LAN",
+                        );
+                    }
                     let compat_app = peca_p2p_yp::web::compat::routes(compat_state);
                     let sd = shutdown_rx.clone();
                     handles.push(tokio::spawn(async move {
@@ -718,8 +754,15 @@ struct LivechatAdapter {
     board_keys: Arc<BoardKeyManager>,
     /// 他ノード板の常駐セッション(T064 — 「スレを開く」で起動・詳細供給・書き込み)。
     manager: Arc<ParticipantManager>,
+    /// 板設定の永続化ストア(007 T003 — 板設定 PUT 適用時に保存し、スレ開設時に再読込して
+    /// 再起動をまたいで保持する。SQLite `board_settings` テーブル)。
+    store: Arc<Store>,
     /// 自ノード P2P 待受ポート(tip の port 成分 — スレ開設時に channel tracker の IP と合成)。
     listen_port: u16,
+    /// 互換 API(2ch 互換 bbs.cgi)の待受ポート(007 T005 — 板詳細 API `compat_bbs_port`)。
+    /// `compat_bbs_bind` を parse したポート。互換 API 無効(空文字)・書式不正時は `None`。
+    /// UI が専ブラ向け板 URL を動的生成するために板詳細へ載せる(contracts/web-ui.md §5.1)。
+    compat_bbs_port: Option<u16>,
 }
 
 impl LivechatAdapter {
@@ -800,6 +843,7 @@ impl LivechatDirectory for LivechatAdapter {
                 settings: BoardSettingsView::from_settings(&snap.settings),
                 res,
                 pending: Vec::new(),
+                compat_bbs_port: self.compat_bbs_port,
             });
         }
         // 他ノード板は開いている常駐セッション(T064)が確定レス・板設定・送信中を供給する。
@@ -820,6 +864,7 @@ impl LivechatDirectory for LivechatAdapter {
             settings: BoardSettingsView::from_settings(&settings),
             res,
             pending,
+            compat_bbs_port: self.compat_bbs_port,
         })
     }
 
@@ -858,18 +903,42 @@ impl LivechatDirectory for LivechatAdapter {
         let tip = self
             .derive_tip(ch.tracker.as_deref())
             .ok_or(LivechatOpError::Unavailable)?;
-        // 4. 板設定(省略時は既定。title は req.title 優先)。制御文字除去 + 値域検証。
-        let mut settings: BoardSettings = req.settings.map(Into::into).unwrap_or_default();
+        // 4. 板設定を決める(007 T003 — 永続化配線の load 経路)。
+        //    優先順: リクエスト明示指定 > 永続化済み設定(再起動をまたいだ保持) > 既定。
+        //    title は常に req.title 優先。永続化設定の読み込み失敗・未保存は既定へフォールバック
+        //    (板設定は付加情報であり、開設可否を左右しない — Principle I の縮退継続)。
+        let mut settings: BoardSettings = match req.settings {
+            Some(s) => s.into(),
+            None => self
+                .store
+                .get_board_settings(&persona_pubkey)
+                .ok()
+                .flatten()
+                .map(|row| BoardSettings::from_row(&row))
+                .unwrap_or_default(),
+        };
         if let Some(t) = req.title {
             settings.title = t;
         }
         let settings = settings.sanitized();
         settings.validate().map_err(|_| LivechatOpError::Invalid)?;
+        // 4.5 ホスト板鍵(固定 >>1 の署名鍵 — 007 T033)。get-or-create。利用不可なら
+        //     >>1 を投稿できないため開設を中止する(res_no=1 常在の不変条件を守る — FR-014)。
+        let board_key = self
+            .board_keys
+            .signing_keys(&persona_pubkey)
+            .map_err(|_| LivechatOpError::Unavailable)?;
         // 5. 開設(gen=1・key=現在秒)。channel は `30311:<persona>:<guid>`。
         let channel = format!("30311:{persona_pubkey}:{}", req.channel_id);
         let title = settings.title.clone();
+        let now = Self::now();
         self.registry
-            .open_thread(persona, channel, 1, Self::now(), title, settings, tip)
+            .open_thread(persona, channel, 1, now, title, settings, tip)
+            .map_err(|_| LivechatOpError::Invalid)?;
+        // 5.5 固定 >>1 の自動投稿を有効化し res_no=1 を確定する(007 T031/T033)。以後の
+        //     次スレ移行(自動・明示)でも同じ板鍵で >>1 が自動投稿される(registry が保持)。
+        self.registry
+            .arm_first_post(&persona_pubkey, board_key, now)
             .map_err(|_| LivechatOpError::Invalid)?;
         Ok(OpenThreadResult {
             board_id: persona_pubkey,
@@ -883,7 +952,20 @@ impl LivechatDirectory for LivechatAdapter {
         settings: BoardSettingsInput,
     ) -> Result<(), LivechatOpError> {
         match self.registry.update_settings(board_id, settings.into()) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // 007 T003 — 永続化配線の save 経路。適用に成功した板設定(registry 側で
+                // sanitize + 値域検証済みの現行値)を SQLite へ保存し、再起動をまたいで
+                // 保持する。保存失敗は配布済みの適用結果を覆さない(付加処理のため best-effort
+                // でログのみ — Principle I の縮退継続)。
+                if let Some(snap) = self.registry.board_snapshot(board_id)
+                    && let Err(e) = self
+                        .store
+                        .set_board_settings(&snap.settings.to_row(board_id))
+                {
+                    tracing::warn!(board_id, error = %e, "板設定の永続化に失敗(適用は継続)");
+                }
+                Ok(())
+            }
             Err(peca_p2p_yp::livechat::registry::RegistryError::UnknownBoard) => {
                 Err(LivechatOpError::NotFound)
             }

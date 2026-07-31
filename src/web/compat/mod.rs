@@ -71,10 +71,14 @@ pub struct CompatState {
     pub manager: Arc<ParticipantManager>,
     /// セキュリティイベントログ(`compat_bbs_denied` の記録先)。
     pub security: Arc<SecurityLog>,
-    /// 受理する `Host` ヘッダのホワイトリスト(バインドポート由来)。
+    /// 受理する `Host` ヘッダのホワイトリスト(バインドポート由来。LAN 公開時は
+    /// [`crate::web::host_allowlist`] で `{bind_ip}:{port}` まで拡張される — 007 ADR-0015)。
     pub allowed_hosts: Arc<std::collections::HashSet<String>>,
     /// 接続元ごとのレート制限器。
     pub rate_limiter: Arc<RateLimiter>,
+    /// 送信元 IP の LAN 限定検証を有効化するか(007 ADR-0015 — `compat_bbs_bind` 非 loopback 時
+    /// true)。false(既定)のとき送信元は検査しない(loopback 運用の非退行)。lan-exposure.md §4。
+    pub enforce_lan_source: bool,
 }
 
 /// 自板(registry)優先、無ければ他ノード板の常駐セッション(manager)から板スナップショットを
@@ -143,6 +147,8 @@ pub fn routes(state: CompatState) -> Router {
         .fallback(compat_not_found)
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
+        // 送信元 IP の LAN 限定検証(007 — 非 loopback 待受時のみ有効。最外周で最初に評価)。
+        .layer(middleware::from_fn_with_state(state.clone(), source_guard))
         .with_state(state)
 }
 
@@ -176,6 +182,28 @@ async fn host_guard(State(state): State<CompatState>, req: Request, next: Next) 
             SecurityCategory::CompatBbsDenied,
             &ip.to_string(),
             "invalid host header",
+        );
+        error_response(StatusCode::FORBIDDEN)
+    }
+}
+
+/// 送信元 IP の LAN 限定検証(007 ADR-0015 / lan-exposure.md §4 — 多層防御)。
+///
+/// [`CompatState::enforce_lan_source`] が false(既定 = loopback 運用)なら素通しする。有効時は
+/// 送信元 IP を [`crate::web::ip_is_lan_or_loopback`] で判定し、LAN 外は 403 + `compat_bbs_denied`
+/// 記録で拒否する(bind 先が LAN でもルータのポート転送誤設定に対する多層防御)。
+async fn source_guard(State(state): State<CompatState>, req: Request, next: Next) -> Response {
+    if !state.enforce_lan_source {
+        return next.run(req).await;
+    }
+    let ip = client_ip(&req);
+    if crate::web::ip_is_lan_or_loopback(ip) {
+        next.run(req).await
+    } else {
+        state.security.log(
+            SecurityCategory::CompatBbsDenied,
+            &ip.to_string(),
+            "source ip not in LAN",
         );
         error_response(StatusCode::FORBIDDEN)
     }
@@ -484,6 +512,7 @@ mod tests {
             security,
             allowed_hosts: Arc::new(hosts),
             rate_limiter: Arc::new(RateLimiter::with_clock(1000, Box::new(|| 1_000))),
+            enforce_lan_source: false,
         }
     }
 

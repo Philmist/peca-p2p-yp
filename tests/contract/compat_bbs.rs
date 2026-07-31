@@ -59,6 +59,7 @@ fn test_state() -> CompatState {
         security,
         allowed_hosts: Arc::new(hosts),
         rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
+        enforce_lan_source: false,
     }
 }
 
@@ -884,4 +885,113 @@ async fn dat_last_modified_does_not_regress_with_backdated_created_at() {
         "過去日時を申告するレスが確定しても Last-Modified は後退しない \
          (キャッシュ汚染攻撃の防止): before={unix_1} after={unix_2}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 互換 API 面の LAN 公開: Host ホワイトリスト拡張・送信元 IP 検証・レート同一
+// (T015 — contracts/lan-exposure.md §4/§5)
+// ---------------------------------------------------------------------------
+
+/// 送信元 IP を差し替えた GET リクエスト(LAN/グローバルの検証用)。
+fn get_req_from(uri: &str, host: Option<&str>, src: &str) -> Request<Body> {
+    let mut req = get_req(uri, host);
+    let addr: SocketAddr = src.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
+
+/// 非 loopback bind の Host ホワイトリストは `{bind_ip}:{port}` を許可し、外は 403。
+#[tokio::test]
+async fn compat_lan_host_accepted_offlist_403() {
+    let mut state = test_state();
+    state.allowed_hosts = Arc::new(peca_p2p_yp::web::host_allowlist(
+        "192.168.1.10:7183".parse().unwrap(),
+    ));
+    let app = routes(state);
+    // LAN bind リテラル Host は通る(板未知で 404 = Host 検証は通過)。
+    let resp = app
+        .clone()
+        .oneshot(get_req_from(
+            "/unknownboard/subject.txt",
+            Some("192.168.1.10:7183"),
+            "192.168.1.20:60000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // ホワイトリスト外 Host は 403。
+    let resp = app
+        .oneshot(get_req_from(
+            "/unknownboard/subject.txt",
+            Some("evil.example:7183"),
+            "192.168.1.20:60000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// 送信元 IP 検証(有効時): LAN 外は 403、LAN 内は通る(板未知で 404)。
+#[tokio::test]
+async fn compat_source_guard_rejects_non_lan() {
+    let mut state = test_state();
+    state.enforce_lan_source = true;
+    let app = routes(state);
+    // グローバル送信元 → 403。
+    let resp = app
+        .clone()
+        .oneshot(get_req_from(
+            "/unknownboard/subject.txt",
+            Some(GOOD_HOST),
+            "203.0.113.9:60000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // LAN 送信元 → Host/送信元検証を通過し 404(板未知)。
+    let resp = app
+        .oneshot(get_req_from(
+            "/unknownboard/subject.txt",
+            Some(GOOD_HOST),
+            "192.168.1.20:60000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// レート上限は LAN 公開時も loopback と同一(20 req/秒)。
+#[tokio::test]
+async fn compat_rate_limit_is_20_on_lan() {
+    assert_eq!(RATE_LIMIT_PER_SEC, 20, "契約上の上限は 20 req/秒");
+    let mut state = test_state();
+    state.enforce_lan_source = true;
+    state.rate_limiter = Arc::new(RateLimiter::with_clock(
+        RATE_LIMIT_PER_SEC,
+        Box::new(|| 1_000),
+    ));
+    let app = routes(state);
+    // LAN 送信元から 20 件は通過(板未知で 404)。
+    for i in 0..RATE_LIMIT_PER_SEC {
+        let resp = app
+            .clone()
+            .oneshot(get_req_from(
+                "/unknownboard/subject.txt",
+                Some(GOOD_HOST),
+                "192.168.1.20:60000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{i} 件目は通過");
+    }
+    // 21 件目は 429。
+    let resp = app
+        .oneshot(get_req_from(
+            "/unknownboard/subject.txt",
+            Some(GOOD_HOST),
+            "192.168.1.20:60000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }

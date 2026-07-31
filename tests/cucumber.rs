@@ -22,8 +22,12 @@ pub(crate) mod mock_peer;
 #[path = "common/log_capture.rs"]
 pub(crate) mod log_capture;
 
+#[path = "steps/fixed_first_post.rs"]
+mod fixed_first_post;
 #[path = "steps/keystore.rs"]
 mod keystore;
+#[path = "steps/lan_exposure.rs"]
+mod lan_exposure;
 #[path = "steps/livechat.rs"]
 mod livechat;
 #[path = "steps/outbound_only.rs"]
@@ -58,6 +62,10 @@ pub struct AppWorld {
     persona_selection: Option<persona_selection::PersonaSelectionWorld>,
     /// 配信実況スレ(006-livechat-thread)シナリオの状態。各シナリオの Given で初期化する(T016)。
     livechat: Option<livechat::LivechatWorld>,
+    /// LAN 公開の境界(007 ADR-0015)シナリオの状態。各シナリオの Given で初期化する(T017)。
+    lan_exposure: Option<lan_exposure::LanExposureWorld>,
+    /// 固定 >>1(007)シナリオの状態。各シナリオの Given で初期化する(T028)。
+    fixed_first_post: Option<fixed_first_post::FixedFirstPostWorld>,
 }
 
 /// ステップの async 未来型は debug ビルドで巨大になり、Windows 既定の main スレッド

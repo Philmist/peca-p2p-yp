@@ -78,5 +78,6 @@ CREATE TABLE IF NOT EXISTS board_settings (
     res_limit            INTEGER NOT NULL,  -- 100〜4000(既定 1000)
     noname_name          TEXT NOT NULL,     -- 1〜64 文字
     local_rules          TEXT NOT NULL,     -- ≤ 2048 文字(Markdown)
-    first_post_pow_bits  INTEGER NOT NULL   -- 0〜32(既定 20)。唯一の正式名(ノード Settings には置かない)
+    first_post_pow_bits  INTEGER NOT NULL,  -- 0〜32(既定 20)。唯一の正式名(ノード Settings には置かない)
+    first_post_template  TEXT NOT NULL DEFAULT ''  -- 固定 >>1 テンプレ(007。≤ 2048 文字 / ≤ 32 行)
 );

@@ -63,6 +63,145 @@ mod index_bind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// http_bind / compat_bbs_bind の LAN 公開 + 2 要素オプトイン(T013 — ADR-0015 /
+// contracts/lan-exposure.md §2。全プラットフォーム共通)
+// ---------------------------------------------------------------------------
+//
+// `http_bind` / `compat_bbs_bind` は loopback または LAN 内プライベートアドレスを
+// 許可する(許可リスト方式)。非 loopback アドレスには対応する `*_lan_consent` を
+// 必須とする(明示確認なしに公開されない — 2 要素オプトイン)。判定は必ず
+// `to_canonical()` 正規化後に行う。
+mod lan_exposure {
+    use peca_p2p_yp::config::{CliOverrides, ConfigError, Settings};
+
+    /// loopback bind は同意キーなしで受理される(既定運用の非退行)。
+    #[test]
+    fn loopback_needs_no_consent() {
+        for addr in ["127.0.0.1:7180", "[::1]:7180"] {
+            let s = Settings {
+                http_bind: addr.to_string(),
+                compat_bbs_bind: addr.to_string(),
+                http_lan_consent: false,
+                compat_bbs_lan_consent: false,
+                ..Default::default()
+            };
+            assert!(s.validate().is_ok(), "{addr} は同意不要で許容されるべき");
+        }
+    }
+
+    /// LAN プライベートアドレス + 同意 true は受理される。
+    #[test]
+    fn lan_bind_with_consent_accepted() {
+        let s = Settings {
+            http_bind: "192.168.1.10:7180".to_string(),
+            http_lan_consent: true,
+            compat_bbs_bind: "10.0.0.5:7183".to_string(),
+            compat_bbs_lan_consent: true,
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+    }
+
+    /// LAN プライベートアドレス + 同意 false は設定エラー(明示確認なしに公開しない)。
+    #[test]
+    fn lan_bind_without_consent_is_config_error() {
+        let s = Settings {
+            http_bind: "192.168.1.10:7180".to_string(),
+            http_lan_consent: false,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                s.validate(),
+                Err(ConfigError::LanConsentRequired { key: "http_bind" })
+            ),
+            "同意なし LAN bind は LanConsentRequired で拒否されるべき: {:?}",
+            s.validate()
+        );
+
+        let s = Settings {
+            compat_bbs_bind: "192.168.1.10:7183".to_string(),
+            compat_bbs_lan_consent: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate(),
+            Err(ConfigError::LanConsentRequired {
+                key: "compat_bbs_bind"
+            })
+        ));
+    }
+
+    /// unspecified / グローバル / CGNAT は同意の有無に関わらず NonLanBind で拒否。
+    #[test]
+    fn non_lan_values_rejected_even_with_consent() {
+        for value in [
+            "0.0.0.0:7180",
+            "203.0.113.5:7180",
+            "100.64.0.1:7180",
+            "[::]:7180",
+        ] {
+            let s = Settings {
+                http_bind: value.to_string(),
+                http_lan_consent: true,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    s.validate(),
+                    Err(ConfigError::NonLanBind { key: "http_bind" })
+                ),
+                "{value} は NonLanBind で拒否されるべき"
+            );
+        }
+    }
+
+    /// v4-mapped プライベートアドレスは正規化後にプライベートと判定され、同意 true で許可。
+    #[test]
+    fn v4_mapped_private_is_normalized_and_allowed() {
+        let s = Settings {
+            http_bind: "[::ffff:192.168.1.10]:7180".to_string(),
+            http_lan_consent: true,
+            ..Default::default()
+        };
+        assert!(
+            s.validate().is_ok(),
+            "v4-mapped プライベートは許可: {:?}",
+            s.validate()
+        );
+    }
+
+    /// CLI 上書きに同意キー(`--http-lan-consent` / `--compat-bbs-lan-consent`)と
+    /// `--compat-bbs-bind` が対応する。
+    #[test]
+    fn cli_parses_consent_and_compat_bind() {
+        let o = CliOverrides::parse(
+            [
+                "--http-bind",
+                "192.168.1.10:7180",
+                "--http-lan-consent",
+                "true",
+                "--compat-bbs-bind",
+                "192.168.1.10:7183",
+                "--compat-bbs-lan-consent",
+                "true",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(o.http_bind.as_deref(), Some("192.168.1.10:7180"));
+        assert_eq!(o.http_lan_consent, Some(true));
+        assert_eq!(o.compat_bbs_bind.as_deref(), Some("192.168.1.10:7183"));
+        assert_eq!(o.compat_bbs_lan_consent, Some(true));
+
+        let mut settings = Settings::default();
+        settings.apply_overrides(&o);
+        assert!(settings.validate().is_ok(), "CLI 経由 LAN + 同意は起動可");
+    }
+}
+
 // unix 専用機能のため全体を cfg で囲む。
 // Windows ビルドでは本モジュール全体がコンパイル対象外になり dead_code 警告が出ない。
 #[cfg(unix)]

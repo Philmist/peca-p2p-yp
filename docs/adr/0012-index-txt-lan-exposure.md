@@ -7,6 +7,9 @@ Principle IV (Behavior-Driven Testing), Principle V (Formal Verification),
 Principle VI (Principle Traceability)
 **Supersedes**: ADR-0006 決定 4 を**部分的に** supersede(read-only index.txt に限る。
 HTTP API / UI / PCP の loopback 強制は不変)
+**Extended-by**: [ADR-0015](0015-web-bbs-lan-write.md) が本 ADR の許可リスト方式
+(`require_lan_or_loopback`)を、書き込みを含む Web UI + JSON API・2ch 互換 API へ拡張する
+(2026-07-31 — 面別の明示同意キー + 送信元 IP 検証を追加)
 
 ## 背景
 

@@ -6,7 +6,8 @@
 //! - `/api/v1/livechat` エンドポイント群(`routes()` — `super::api_router` が merge):
 //!   - 閲覧(T024): `GET /threads`(announce 由来のスレ一覧)/
 //!     `GET /threads/{board_id}`(板設定参照・確定レス閲覧・自分の送信中投稿
-//!     `pending` — 閲覧に板鍵は不要 = FR-016)。
+//!     `pending` — 閲覧に板鍵は不要 = FR-016)。板詳細は `compat_bbs_port`
+//!     (互換 API 有効時はポート番号・無効時は null — 007 T005)を含む。
 //!   - スレ開設(T063 — FR-001): `POST /threads`(掲載中チャンネルのペルソナ限定)。
 //!   - スレを開く/抜ける(T064 — FR-004): `POST /threads/{board_id}/join` / `leave`
 //!     (他ノード板の常駐セッションを起動/停止。接続は明示操作起点のみ)。
@@ -14,7 +15,8 @@
 //!     [`route_write`] — 自板はホスト採番経路(互換 bbs.cgi と同一)、他ノード板は
 //!     常駐セッション経由の RES 送信。
 //!   - 次スレ/クローズ(T065 — FR-013/FR-014): `POST /threads/{board_id}/next` / `close`。
-//!   - 板設定変更(T068 — FR-022): `PUT /threads/{board_id}/settings`。
+//!   - 板設定変更(T068 — FR-022): `PUT /threads/{board_id}/settings`。設定は固定 >>1 の
+//!     テンプレ `first_post_template`(≤2048 文字・≤32 行 — 007 T033)を含む。
 //!   - モデレーション(T067 — FR-017/FR-019): `POST /threads/{board_id}/ban` /
 //!     `unban` / `connban` / `unconnban`、`POST /boards/{board_id}/rotate-key`
 //!     (板鍵ローテーション。初回書き込みには `first_post_pow_bits` の PoW が課される)。
@@ -135,6 +137,8 @@ pub struct BoardSettingsView {
     /// [`render_local_rules_html`] で描画した安全な HTML(UI が直接挿入する値 — FR-025)。
     pub local_rules_html: String,
     pub first_post_pow_bits: u8,
+    /// 固定 >>1 テンプレ(007 — 板主向け設定表示用。contracts/web-ui.md §5.1)。
+    pub first_post_template: String,
 }
 
 impl BoardSettingsView {
@@ -148,6 +152,7 @@ impl BoardSettingsView {
             local_rules: settings.local_rules.clone(),
             local_rules_html: render_local_rules_html(&settings.local_rules),
             first_post_pow_bits: settings.first_post_pow_bits,
+            first_post_template: settings.first_post_template.clone(),
         }
     }
 }
@@ -227,6 +232,10 @@ pub struct ThreadDetail {
     /// 自分の送信中投稿(FR-008)。自板・未オープンは空。
     #[serde(default)]
     pub pending: Vec<PendingResView>,
+    /// 互換 API(2ch 互換 bbs.cgi)の待受ポート(007 T005 — contracts/web-ui.md §5.1)。
+    /// UI が専ブラ向け板 URL(`http://{hostname}:{port}/{board}/`)を動的生成するための値。
+    /// 互換 API 無効(`compat_bbs_bind` 空)のときは `None`(JSON では null)= UI は非表示。
+    pub compat_bbs_port: Option<u16>,
 }
 
 /// 操作 API(変更系)の失敗理由(定型 — 内部情報を漏らさない Principle II)。
@@ -274,6 +283,8 @@ pub struct BoardSettingsInput {
     pub noname_name: String,
     pub local_rules: String,
     pub first_post_pow_bits: u8,
+    /// 固定 >>1 テンプレ(007 — 省略可。既定 `""`。検証は BoardSettings::validate で行う)。
+    pub first_post_template: String,
 }
 
 impl Default for BoardSettingsInput {
@@ -285,6 +296,7 @@ impl Default for BoardSettingsInput {
             noname_name: d.noname_name,
             local_rules: d.local_rules,
             first_post_pow_bits: d.first_post_pow_bits,
+            first_post_template: d.first_post_template,
         }
     }
 }
@@ -297,6 +309,7 @@ impl From<BoardSettingsInput> for crate::livechat::thread::BoardSettings {
             noname_name: i.noname_name,
             local_rules: i.local_rules,
             first_post_pow_bits: i.first_post_pow_bits,
+            first_post_template: i.first_post_template,
         }
     }
 }
@@ -834,6 +847,7 @@ mod tests {
             noname_name: "名無しさん".into(),
             local_rules: "# ルール\n\n**荒らし禁止**".into(),
             first_post_pow_bits: 20,
+            first_post_template: String::new(),
         };
         let view = BoardSettingsView::from_settings(&settings);
         assert_eq!(view.title, "実況スレ");
@@ -926,6 +940,7 @@ mod tests {
                         ResView::from_res(&confirmed_res(Some(1), None), "名無しさん").unwrap(),
                     ],
                     pending: Vec::new(),
+                    compat_bbs_port: None,
                 })
             } else {
                 None

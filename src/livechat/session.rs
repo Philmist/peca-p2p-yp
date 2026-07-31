@@ -650,6 +650,7 @@ pub fn parse_and_validate_settings(
         },
         local_rules: parse_str("local_rules"),
         first_post_pow_bits: parse_u8("first_post_pow_bits", defaults.first_post_pow_bits),
+        first_post_template: parse_str("first_post_template"),
     };
     let sanitized = candidate.sanitized();
     sanitized

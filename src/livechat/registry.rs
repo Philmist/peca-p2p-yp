@@ -14,6 +14,12 @@
 //! - **採番(シーケンサ — T030)**: 参加者からの RES を受信検証後に一意採番し
 //!   ([`LivechatRegistry::accept_write`])、ORDER(kind 21311)を発行して RES + ORDER を
 //!   全接続参加者の outbox へ配布する(FR-007・不変条件 T3/O1 — PlusCal モデル対応)。
+//! - **固定 >>1(007 — FR-013〜019)**: [`LivechatRegistry::arm_first_post`] が開設時に
+//!   ホスト板鍵を登録し、板設定 `first_post_template`(空なら [`default_first_post_body`] の
+//!   システム既定)を kind 1311 として res_no=1 に自動確定・配布する
+//!   ([`confirm_first_post_locked`])。次スレ移行(自動・明示)でも投稿時点のテンプレで新スレ
+//!   res_no=1 へ自動投稿し、テンプレ変更は既存スレへ遡及しない。PoW 免除(ホスト内部採番)で、
+//!   通常採番経路と同一の確定処理を通す。
 //! - **非責務**: トランスポート I/O(TCP)は配線側(runtime)。本レジストリは参加者の outbox
 //!   ([`tokio::sync::mpsc::UnboundedSender`])を保持し、そこへメッセージを流すところまで。
 //!
@@ -80,6 +86,11 @@ struct HostEntry {
     /// このため直近 1 世代のみを保持するベストエフォート実装とし、2 世代以上前へ遡る
     /// dat 要求は 404 になる(スレデータは揮発 — FR-015 の精神とも整合する)。
     frozen_snapshot: Option<Thread>,
+    /// ホスト自身の板鍵(007 — 固定 >>1 の自動署名用)。[`LivechatRegistry::arm_first_post`]
+    /// で開設時に登録する。`Some` のとき、次スレ移行(自動・明示)でも新スレの res_no=1 へ
+    /// テンプレを自動投稿する(contracts/fixed-first-post.md §3.1)。テスト等で未登録(`None`)の
+    /// 板は >>1 を自動投稿しない(006 の採番セマンティクスを保つ)。
+    host_board_key: Option<Keys>,
 }
 
 /// スレ seed(確定レス投入)・接続受理の失敗理由。`Display` は内部情報を漏らさない。
@@ -233,9 +244,102 @@ impl LivechatRegistry {
                 banned_keys: HashSet::new(),
                 conn_banned: HashSet::new(),
                 frozen_snapshot: None,
+                host_board_key: None,
             },
         );
         Ok(())
+    }
+
+    /// 固定 >>1(スレ頭)の自動投稿を有効化し、現行スレの res_no=1 へテンプレを確定する
+    /// (007 T031 — contracts/fixed-first-post.md §3)。
+    ///
+    /// `board_key` はホスト自身の板鍵([`crate::livechat::board::BoardKeyManager::signing_keys`])。
+    /// 以後この板の次スレ移行(自動・明示)でも同じ鍵で新スレ res_no=1 へ自動投稿する
+    /// (板設定 `first_post_template`。空ならシステム既定テンプレ)。PoW・レート・BAN の
+    /// 検査は課さない(ホスト内部採番 — FR-016)。既に res があるスレでは呼ばない前提
+    /// (開設直後のみ)。未知 board は [`RegistryError::UnknownBoard`]。
+    pub fn arm_first_post(
+        &self,
+        board_id: &str,
+        board_key: Keys,
+        created_at: u64,
+    ) -> Result<u16, RegistryError> {
+        let mut hosts = lock(&self.hosts);
+        let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
+        entry.host_board_key = Some(board_key.clone());
+        Self::confirm_first_post_locked(board_id, entry, &board_key, created_at)
+    }
+
+    /// 固定 >>1 を現行スレの res_no=1 として確定・配布する内部ヘルパー(T031/T032)。
+    ///
+    /// 板設定の `first_post_template`(空なら [`default_first_post_body`] のシステム既定)を
+    /// 本文に、ホスト板鍵で kind 1311 を署名し、通常採番経路と同一の確定処理
+    /// (`Thread::confirm` → ORDER 署名 → RES/ORDER キャッシュ → outbox 配布)を行う。
+    /// PoW・レート・BAN・重複検査は課さない(ホスト内部採番)。
+    fn confirm_first_post_locked(
+        board_id: &str,
+        entry: &mut HostEntry,
+        board_key: &Keys,
+        created_at: u64,
+    ) -> Result<u16, RegistryError> {
+        let generation = entry.host.thread.generation;
+        let channel = entry.host.thread.channel.clone();
+        let template = entry.host.settings.first_post_template.clone();
+        let body = if template.trim().is_empty() {
+            default_first_post_body(&entry.host.settings.title, &channel)
+        } else {
+            template
+        };
+        let res_event = sign_res(board_key, board_id, &channel, generation, &body, created_at)
+            .map_err(RegistryError::Build)?;
+
+        let event_id = res_event.id.to_hex();
+        let res_no = entry.host.thread.next_res_no();
+        // 名前・メールは空 → 確定時点の noname_name を焼き込む(通常レスと同一)。
+        let name = resolve_display_name(None, &entry.host.settings.noname_name);
+        let domain = Res {
+            event_id: event_id.clone(),
+            board_key: res_event.pubkey.to_hex(),
+            name,
+            mail: None,
+            body,
+            created_at: res_event.created_at.as_secs() as i64,
+            res_no: None,
+            pending: false,
+        };
+        entry
+            .host
+            .thread
+            .confirm(domain, res_no)
+            .map_err(RegistryError::Confirm)?;
+        entry.host.thread.bump_last_confirmed_at(created_at as i64);
+
+        let order = entry.host.record_order(vec![(res_no, event_id.clone())]);
+        let order_env = OrderEnvelope {
+            board_id: board_id.to_string(),
+            generation,
+            seq: order.seq,
+            entries: vec![OrderEntry {
+                res_no,
+                event_id: event_id.clone(),
+            }],
+        };
+        let order_event = order_env
+            .sign(&entry.persona, created_at)
+            .map_err(RegistryError::Build)?;
+        entry.assigned_ids.insert(event_id.clone());
+        entry.res_events.insert(event_id.clone(), res_event.clone());
+        entry.order_events.insert(order.seq, order_event.clone());
+        // >>1 の板鍵(=ホスト板鍵)を既知にする(以後ホストの通常書き込みへ PoW を課さない)。
+        entry.known_board_keys.insert(res_event.pubkey.to_hex());
+        // 接続中参加者へ配布(開設直後は参加者ゼロ = no-op。次スレ移行時は既存参加者へ届く)。
+        let res_msg = res_event_to_message(&res_event);
+        let order_msg = order_event_to_message(&order_event);
+        for tx in entry.outboxes.values() {
+            let _ = tx.send(res_msg.clone());
+            let _ = tx.send(order_msg.clone());
+        }
+        Ok(res_no)
     }
 
     /// 開設中の board_id 一覧(status・診断用)。
@@ -924,6 +1028,14 @@ impl LivechatRegistry {
         for tx in entry.outboxes.values() {
             let _ = tx.send(msg.clone());
         }
+
+        // 5. 固定 >>1 の自動投稿(007 T032 — FR-015/FR-017)。ホスト板鍵が登録済み
+        //    (arm_first_post 済みの production 板)なら、新スレの res_no=1 へ**その時点の**
+        //    テンプレを自動投稿する(変更は次スレから反映・遡及なし)。未登録(テスト等)は
+        //    投稿しない(006 の採番セマンティクスを保つ)。時刻源は新スレ key(created_at)。
+        if let Some(board_key) = entry.host_board_key.clone() {
+            Self::confirm_first_post_locked(board_id, entry, &board_key, new_key)?;
+        }
         Ok(new_generation)
     }
 
@@ -1061,6 +1173,20 @@ fn order_event_to_message(event: &Event) -> WireMessage {
 ///
 /// 板鍵で署名するのが本来だが(FR-016)、seed 用途では任意の署名鍵を受け取れるよう
 /// 分離する。`board_id`(スレ主 pubkey)と `channel` は封筒の必須フィールド。
+/// システム既定の固定 >>1 本文(007 — `first_post_template` が空の板で使う)。
+///
+/// 空の >>1 を生じさせないため、板タイトルと対象チャンネルの案内を含む最小テンプレを返す
+/// (contracts/fixed-first-post.md §3.3 — 本文は必ず非空)。title が空の板でも非空になるよう
+/// フォールバック文言を用いる。
+pub fn default_first_post_body(title: &str, channel: &str) -> String {
+    let title = if title.trim().is_empty() {
+        "実況"
+    } else {
+        title
+    };
+    format!("{title} 実況スレ\n対象チャンネル: {channel}")
+}
+
 pub fn sign_res(
     board_key: &Keys,
     board_id: &str,

@@ -91,14 +91,28 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE peers ADD COLUMN resolved_ip TEXT", [])
             .map_err(map_sqlite)?;
     }
+    // 007: 既存 DB の board_settings に first_post_template 列を補う(既存行は '' 既定)。
+    if !table_has_column(conn, "board_settings", "first_post_template")? {
+        conn.execute(
+            "ALTER TABLE board_settings ADD COLUMN first_post_template TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(map_sqlite)?;
+    }
     Ok(())
 }
 
 /// `peers` テーブルに指定名の列が存在するか(`PRAGMA table_info`)。
 fn peers_has_column(conn: &Connection, name: &str) -> Result<bool> {
-    let mut stmt = conn
-        .prepare("SELECT 1 FROM pragma_table_info('peers') WHERE name = ?1")
-        .map_err(map_sqlite)?;
+    table_has_column(conn, "peers", name)
+}
+
+/// 指定テーブルに指定名の列が存在するか(`PRAGMA table_info`)。`table` は内部定数のみを
+/// 渡す(PRAGMA はテーブル名をバインドできないため文字列へ埋め込む — SQL インジェクション
+/// にならないよう外部入力を渡さないこと)。
+fn table_has_column(conn: &Connection, table: &str, name: &str) -> Result<bool> {
+    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1");
+    let mut stmt = conn.prepare(&sql).map_err(map_sqlite)?;
     let exists = stmt.exists([name]).map_err(map_sqlite)?;
     Ok(exists)
 }
@@ -313,6 +327,8 @@ pub struct BoardSettingsRow {
     pub noname_name: String,
     pub local_rules: String,
     pub first_post_pow_bits: i64,
+    /// 固定 >>1(スレ頭)テンプレ本文(007 — ≤ 2048 文字 / ≤ 32 行。既定 `""`)。
+    pub first_post_template: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -823,7 +839,7 @@ impl Store {
     pub fn get_board_settings(&self, board_id: &str) -> Result<Option<BoardSettingsRow>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT board_id, title, res_limit, noname_name, local_rules, first_post_pow_bits
+            "SELECT board_id, title, res_limit, noname_name, local_rules, first_post_pow_bits, first_post_template
              FROM board_settings WHERE board_id = ?1",
             [board_id],
             row_to_board_settings,
@@ -836,14 +852,15 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO board_settings
-                 (board_id, title, res_limit, noname_name, local_rules, first_post_pow_bits)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (board_id, title, res_limit, noname_name, local_rules, first_post_pow_bits, first_post_template)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(board_id) DO UPDATE SET
                  title = excluded.title,
                  res_limit = excluded.res_limit,
                  noname_name = excluded.noname_name,
                  local_rules = excluded.local_rules,
-                 first_post_pow_bits = excluded.first_post_pow_bits",
+                 first_post_pow_bits = excluded.first_post_pow_bits,
+                 first_post_template = excluded.first_post_template",
             rusqlite::params![
                 row.board_id,
                 row.title,
@@ -851,6 +868,7 @@ impl Store {
                 row.noname_name,
                 row.local_rules,
                 row.first_post_pow_bits,
+                row.first_post_template,
             ],
         )
         .map_err(map_sqlite)?;
@@ -935,6 +953,7 @@ fn row_to_board_settings(row: &Row<'_>) -> rusqlite::Result<BoardSettingsRow> {
         noname_name: row.get(3)?,
         local_rules: row.get(4)?,
         first_post_pow_bits: row.get(5)?,
+        first_post_template: row.get(6)?,
     })
 }
 
@@ -1395,6 +1414,7 @@ mod tests {
             noname_name: "名無しさん".to_string(),
             local_rules: "# ローカルルール".to_string(),
             first_post_pow_bits: 20,
+            first_post_template: "配信URL: http://example/".to_string(),
         };
         s.set_board_settings(&row).unwrap();
         assert_eq!(s.get_board_settings(PK1).unwrap().unwrap(), row);

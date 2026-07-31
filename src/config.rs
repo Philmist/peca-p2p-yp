@@ -5,9 +5,14 @@
 //! - 読込([`Settings::load`])は settings テーブル(T012)から取得し、未保存・解釈不能な
 //!   キーは既定値へフォールバックする(lenient)。
 //! - 保存([`Settings::save`])は全キーを settings テーブルへ書き出す。
-//! - 検証([`Settings::validate`])は唯一の厳格ゲート。**`pcp_bind` / `http_bind` は
-//!   loopback アドレスのみ受理**し、非 loopback 値は拒否する(ADR-0006 決定 4。
-//!   LAN 公開オプトインは v1 非実装)。`p2p_bind` は任意バインド可+空文字で待受無効。
+//! - 検証([`Settings::validate`])は唯一の厳格ゲート(config ロード・CLI 上書き・設定 UI
+//!   適用の全経路が通る)。**`pcp_bind` は loopback アドレスのみ受理**する(ADR-0006 決定 4)。
+//!   **`http_bind` / `compat_bbs_bind` / `index_bind` は loopback または LAN 内プライベート
+//!   アドレスを受理**([`require_lan_or_loopback`] — グローバル/未指定/CGNAT は構造的に拒否)。
+//!   このうち書き込み面 `http_bind` / `compat_bbs_bind` は非 loopback 時に面ごとの明示同意
+//!   キー(`http_lan_consent` / `compat_bbs_lan_consent`・既定 false)を必須とする(2 要素
+//!   オプトイン — ADR-0015。read-only の `index_bind` は同意キーなし・UI 警告のみ — ADR-0012)。
+//!   `p2p_bind` は任意バインド可 + 空文字で待受無効。
 //! - コマンドライン上書き([`CliOverrides`])は quickstart 手順 2 の同一 PC 多ノード起動用。
 //!   外部クレートを増やさず std の args パースで実装する。
 
@@ -46,8 +51,11 @@ const DEFAULT_THREAD_WRITE_RATE: u32 = 4;
 // 接続あたり msg/秒(制御メッセージ込み — FR-021)。
 const DEFAULT_THREAD_MSG_RATE: u32 = 16;
 const DEFAULT_ANNOUNCE_STORE_QUOTA: u64 = 2048;
-// 空文字 = 互換 API の待受無効(既定)。非空は loopback のみ受理(research R5)。
+// 空文字 = 互換 API の待受無効(既定)。非空は loopback / LAN 内プライベート受理(ADR-0015)。
 const DEFAULT_COMPAT_BBS_BIND: &str = "127.0.0.1:7183";
+// LAN 公開の明示同意(2 要素オプトイン — ADR-0015)。既定は false(loopback のまま)。
+const DEFAULT_HTTP_LAN_CONSENT: bool = false;
+const DEFAULT_COMPAT_BBS_LAN_CONSENT: bool = false;
 
 // settings テーブルのキー名(data-model §Settings と一致)。
 const KEY_PCP_BIND: &str = "pcp_bind";
@@ -70,6 +78,8 @@ const KEY_THREAD_WRITE_RATE: &str = "thread_write_rate";
 const KEY_THREAD_MSG_RATE: &str = "thread_msg_rate";
 const KEY_ANNOUNCE_STORE_QUOTA: &str = "announce_store_quota";
 const KEY_COMPAT_BBS_BIND: &str = "compat_bbs_bind";
+const KEY_HTTP_LAN_CONSENT: &str = "http_lan_consent";
+const KEY_COMPAT_BBS_LAN_CONSENT: &str = "compat_bbs_lan_consent";
 
 // ---------------------------------------------------------------------------
 // エラー
@@ -85,6 +95,8 @@ pub enum ConfigError {
     NonLoopbackBind { key: &'static str },
     /// LAN 外バインドの拒否(ADR-0012。loopback / LAN 内プライベートアドレス以外)。
     NonLanBind { key: &'static str },
+    /// 非 loopback bind に対する明示同意(`*_lan_consent`)の欠如(ADR-0015 — 2 要素オプトイン)。
+    LanConsentRequired { key: &'static str },
     /// バインドアドレスの書式不正。
     InvalidBind { key: &'static str },
     /// 不明なコマンドライン引数・値の欠落。
@@ -104,6 +116,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::NonLanBind { key } => write!(
                 f,
                 "{key} は loopback または LAN 内のプライベートアドレスのみ指定できます"
+            ),
+            ConfigError::LanConsentRequired { key } => write!(
+                f,
+                "{key} を LAN 公開するには対応する同意キー(*_lan_consent)を有効にしてください"
             ),
             ConfigError::InvalidBind { key } => {
                 write!(f, "{key} のアドレス書式が不正です")
@@ -164,6 +180,11 @@ pub struct Settings {
     /// index.txt の LAN 公開バインド先(ADR-0012)。空文字 = 機能無効(既定)。
     /// 非空時は loopback または LAN 内プライベートアドレスのみ受理する。
     pub index_bind: String,
+    /// `http_bind` を非 loopback(LAN 内)にする際の明示同意(ADR-0015 — 2 要素オプトイン)。
+    /// 既定 false。非 loopback bind かつ false は `validate` で設定エラーになる。
+    pub http_lan_consent: bool,
+    /// `compat_bbs_bind` を非 loopback(LAN 内)にする際の明示同意(ADR-0015)。既定 false。
+    pub compat_bbs_lan_consent: bool,
 
     // --- 006-livechat-thread data-model §Settings 追加分 ---
     /// false でスレ機能全体を無効化する(announce は検証のみ行い不可視 — 006 data-model)。
@@ -198,6 +219,8 @@ impl Default for Settings {
             event_store_max: DEFAULT_EVENT_STORE_MAX,
             index_txt_encoding: DEFAULT_INDEX_TXT_ENCODING.to_string(),
             index_bind: DEFAULT_INDEX_BIND.to_string(),
+            http_lan_consent: DEFAULT_HTTP_LAN_CONSENT,
+            compat_bbs_lan_consent: DEFAULT_COMPAT_BBS_LAN_CONSENT,
             livechat_enabled: DEFAULT_LIVECHAT_ENABLED,
             thread_max_participants: DEFAULT_THREAD_MAX_PARTICIPANTS,
             thread_write_rate: DEFAULT_THREAD_WRITE_RATE,
@@ -242,6 +265,12 @@ impl Settings {
             event_store_max: parse_or(&stored, KEY_EVENT_STORE_MAX, d.event_store_max),
             index_txt_encoding: s(KEY_INDEX_TXT_ENCODING, &d.index_txt_encoding),
             index_bind: s(KEY_INDEX_BIND, &d.index_bind),
+            http_lan_consent: parse_bool_or(&stored, KEY_HTTP_LAN_CONSENT, d.http_lan_consent),
+            compat_bbs_lan_consent: parse_bool_or(
+                &stored,
+                KEY_COMPAT_BBS_LAN_CONSENT,
+                d.compat_bbs_lan_consent,
+            ),
             livechat_enabled: parse_bool_or(&stored, KEY_LIVECHAT_ENABLED, d.livechat_enabled),
             thread_max_participants: parse_or(
                 &stored,
@@ -284,6 +313,11 @@ impl Settings {
         store.set_setting(KEY_EVENT_STORE_MAX, &self.event_store_max.to_string())?;
         store.set_setting(KEY_INDEX_TXT_ENCODING, &self.index_txt_encoding)?;
         store.set_setting(KEY_INDEX_BIND, &self.index_bind)?;
+        store.set_setting(KEY_HTTP_LAN_CONSENT, bool_to_str(self.http_lan_consent))?;
+        store.set_setting(
+            KEY_COMPAT_BBS_LAN_CONSENT,
+            bool_to_str(self.compat_bbs_lan_consent),
+        )?;
         store.set_setting(KEY_LIVECHAT_ENABLED, bool_to_str(self.livechat_enabled))?;
         store.set_setting(
             KEY_THREAD_MAX_PARTICIPANTS,
@@ -313,6 +347,15 @@ impl Settings {
         if let Some(v) = &overrides.index_bind {
             self.index_bind = v.clone();
         }
+        if let Some(v) = overrides.http_lan_consent {
+            self.http_lan_consent = v;
+        }
+        if let Some(v) = &overrides.compat_bbs_bind {
+            self.compat_bbs_bind = v.clone();
+        }
+        if let Some(v) = overrides.compat_bbs_lan_consent {
+            self.compat_bbs_lan_consent = v;
+        }
     }
 
     /// 設定の厳格検証(唯一のゲート)。
@@ -327,7 +370,10 @@ impl Settings {
     ///   (006-livechat-thread data-model §Settings — research R5)。
     pub fn validate(&self) -> Result<(), ConfigError> {
         require_loopback(KEY_PCP_BIND, &self.pcp_bind)?;
-        require_loopback(KEY_HTTP_BIND, &self.http_bind)?;
+        // http_bind: loopback または LAN 内プライベート許可(ADR-0015)。非 loopback は
+        // 明示同意 `http_lan_consent` を必須とする(2 要素オプトイン)。
+        require_lan_or_loopback(KEY_HTTP_BIND, &self.http_bind)?;
+        require_lan_consent(KEY_HTTP_BIND, &self.http_bind, self.http_lan_consent)?;
         // p2p_bind: 空は待受無効、非空はカンマ区切り各要素がパース可能であること
         // (loopback 強制なし — ADR-0008)。
         parse_bind_list(KEY_P2P_BIND, &self.p2p_bind)?;
@@ -336,9 +382,15 @@ impl Settings {
         if !self.index_bind.is_empty() {
             require_lan_or_loopback(KEY_INDEX_BIND, &self.index_bind)?;
         }
-        // compat_bbs_bind: 空は機能無効(検証スキップ)、非空は loopback のみ受理。
+        // compat_bbs_bind: 空は機能無効(検証スキップ)、非空は LAN/loopback 許可リスト検証 +
+        // 非 loopback は明示同意 `compat_bbs_lan_consent` を必須とする(ADR-0015)。
         if !self.compat_bbs_bind.is_empty() {
-            require_loopback(KEY_COMPAT_BBS_BIND, &self.compat_bbs_bind)?;
+            require_lan_or_loopback(KEY_COMPAT_BBS_BIND, &self.compat_bbs_bind)?;
+            require_lan_consent(
+                KEY_COMPAT_BBS_BIND,
+                &self.compat_bbs_bind,
+                self.compat_bbs_lan_consent,
+            )?;
         }
         Ok(())
     }
@@ -384,6 +436,12 @@ pub struct CliOverrides {
     pub p2p_bind: Option<String>,
     /// index.txt の LAN 公開バインド先(ADR-0012)。検証は `Settings::validate` で実施。
     pub index_bind: Option<String>,
+    /// `http_bind` の LAN 公開明示同意(ADR-0015)。`--http-lan-consent true|false`。
+    pub http_lan_consent: Option<bool>,
+    /// 互換 API の待受アドレス(ADR-0015)。`--compat-bbs-bind`。
+    pub compat_bbs_bind: Option<String>,
+    /// `compat_bbs_bind` の LAN 公開明示同意(ADR-0015)。`--compat-bbs-lan-consent true|false`。
+    pub compat_bbs_lan_consent: Option<bool>,
     /// データディレクトリ(`app.db` の配置先)。未指定ならプラットフォーム別の
     /// 既定パスを使う(解決順は `--help` / cli-config.md §1 を参照)。
     pub data_dir: Option<PathBuf>,
@@ -415,6 +473,11 @@ impl CliOverrides {
                 "--http-bind" => out.http_bind = Some(value),
                 "--p2p-bind" => out.p2p_bind = Some(value),
                 "--index-bind" => out.index_bind = Some(value),
+                "--http-lan-consent" => out.http_lan_consent = Some(parse_cli_bool(&value)?),
+                "--compat-bbs-bind" => out.compat_bbs_bind = Some(value),
+                "--compat-bbs-lan-consent" => {
+                    out.compat_bbs_lan_consent = Some(parse_cli_bool(&value)?)
+                }
                 "--data-dir" => out.data_dir = Some(PathBuf::from(value)),
                 _ => return Err(ConfigError::InvalidArgument),
             }
@@ -452,6 +515,15 @@ fn parse_bool_or(
 
 fn bool_to_str(b: bool) -> &'static str {
     if b { "1" } else { "0" }
+}
+
+/// CLI 引数の真偽値(`true`/`false`/`1`/`0` を受理。それ以外は [`ConfigError::InvalidArgument`])。
+fn parse_cli_bool(value: &str) -> Result<bool, ConfigError> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(ConfigError::InvalidArgument),
+    }
 }
 
 fn parse_bind(key: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
@@ -517,6 +589,19 @@ fn require_lan_or_loopback(key: &'static str, value: &str) -> Result<(), ConfigE
         Ok(())
     } else {
         Err(ConfigError::NonLanBind { key })
+    }
+}
+
+/// 非 loopback bind には対応する明示同意(`*_lan_consent`)を要求する(ADR-0015 —
+/// 2 要素オプトイン)。loopback は同意不要。書式不正・LAN 外は先に
+/// [`require_lan_or_loopback`] で弾かれている前提のため、ここでは
+/// [`IpAddr::to_canonical`] 正規化後の loopback 判定のみ行う(v4-mapped 誤判定防止)。
+fn require_lan_consent(key: &'static str, value: &str, consent: bool) -> Result<(), ConfigError> {
+    let addr = parse_bind(key, value)?;
+    if addr.ip().to_canonical().is_loopback() || consent {
+        Ok(())
+    } else {
+        Err(ConfigError::LanConsentRequired { key })
     }
 }
 
@@ -626,14 +711,30 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_http_bind_rejected() {
+    fn lan_http_bind_without_consent_rejected() {
+        // ADR-0015: http_bind は LAN 内プライベートを許可するが、非 loopback は
+        // 明示同意(http_lan_consent)を必須とする(2 要素オプトイン)。
         let s = Settings {
             http_bind: "192.168.1.10:7180".to_string(),
+            http_lan_consent: false,
             ..Default::default()
         };
         assert!(matches!(
             s.validate(),
-            Err(ConfigError::NonLoopbackBind { key: "http_bind" })
+            Err(ConfigError::LanConsentRequired { key: "http_bind" })
+        ));
+    }
+
+    #[test]
+    fn global_http_bind_rejected_even_with_consent() {
+        let s = Settings {
+            http_bind: "203.0.113.5:7180".to_string(),
+            http_lan_consent: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate(),
+            Err(ConfigError::NonLanBind { key: "http_bind" })
         ));
     }
 
@@ -959,14 +1060,38 @@ mod tests {
     }
 
     #[test]
-    fn compat_bbs_bind_rejects_non_loopback() {
+    fn compat_bbs_bind_rejects_unspecified_and_global() {
+        // ADR-0015: compat_bbs_bind は LAN 内プライベートを許可するが、unspecified・
+        // グローバルは許可リストで NonLanBind として弾く(同意の有無に依らない)。
+        for addr in ["0.0.0.0:7183", "203.0.113.5:7183"] {
+            let s = Settings {
+                compat_bbs_bind: addr.to_string(),
+                compat_bbs_lan_consent: true,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    s.validate(),
+                    Err(ConfigError::NonLanBind {
+                        key: "compat_bbs_bind"
+                    })
+                ),
+                "{addr} は NonLanBind"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_bbs_bind_lan_requires_consent() {
+        // 非 loopback(LAN)値は同意キーがなければ設定エラー(2 要素オプトイン)。
         let s = Settings {
-            compat_bbs_bind: "0.0.0.0:7183".to_string(),
+            compat_bbs_bind: "192.168.1.10:7183".to_string(),
+            compat_bbs_lan_consent: false,
             ..Default::default()
         };
         assert!(matches!(
             s.validate(),
-            Err(ConfigError::NonLoopbackBind {
+            Err(ConfigError::LanConsentRequired {
                 key: "compat_bbs_bind"
             })
         ));
@@ -1002,6 +1127,9 @@ mod tests {
             http_bind: Some("127.0.0.1:7190".to_string()),
             pcp_bind: None,
             index_bind: None,
+            http_lan_consent: None,
+            compat_bbs_bind: None,
+            compat_bbs_lan_consent: None,
             data_dir: None,
         };
         s.apply_overrides(&o);

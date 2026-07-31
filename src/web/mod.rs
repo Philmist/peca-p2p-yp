@@ -5,7 +5,12 @@
 //! (T021/T030/T040/T041/T062)が [`api_router`] に追加する。
 //!
 //! 保護層(`/api/v1` に対し、外側から順に評価):
-//! 1. **Host 検証** — バインド由来のホワイトリスト以外は 403(DNS rebinding / CSRF 対策)
+//! 0. **送信元 IP の LAN 限定検証** — `http_bind` 非 loopback(LAN 公開 — 007 ADR-0015)時のみ
+//!    有効化([`AppState::enforce_lan_source`])。`to_canonical()` 正規化後に loopback / RFC 1918
+//!    / リンクローカル / ULA 以外の送信元は 403 + `forbidden_source`(多層防御 — lan-exposure.md
+//!    §4)。loopback 運用では素通し(非退行)
+//! 1. **Host 検証** — バインド由来のホワイトリスト以外は 403(DNS rebinding / CSRF 対策)。
+//!    非 loopback bind 時はホワイトリストへ `{bind_ip}:{port}` を追加する(007 — [`host_allowlist`])
 //! 2. **レート制限** — 同一接続元 20 req/秒超過は 429 + `http_rate_limited` ログ
 //! 3. **トークン検証** — 変更系(POST/PUT/DELETE)は起動時生成の `X-Api-Token` 必須(欠落/不一致は 401)
 //! 4. **ボディサイズ上限** — 64KB 超は 413(ボディ読取前に認証を通すため token 検証の後段)
@@ -89,6 +94,9 @@ pub struct AppState {
     /// 実況スレ一覧・詳細の供給元(T024 — 006-livechat-thread)。未配線時は空一覧
     /// (`GET /livechat/threads`)・`not_found`(`GET /livechat/threads/{board_id}`)。
     pub livechat_directory: Option<Arc<dyn crate::web::livechat::LivechatDirectory>>,
+    /// 送信元 IP の LAN 限定検証を有効化するか(007 ADR-0015 — `http_bind` 非 loopback 時 true)。
+    /// false(既定)のとき送信元は検査しない(loopback 運用の非退行)。lan-exposure.md §4。
+    pub enforce_lan_source: bool,
 }
 
 /// index.txt LAN 公開の実行時状態(data-model §3)。起動時に一度だけ確定する不変値。
@@ -125,6 +133,7 @@ impl AppState {
             broadcast: None,
             index_lan: None,
             livechat_directory: None,
+            enforce_lan_source: false,
         }
     }
 
@@ -150,7 +159,21 @@ impl AppState {
             broadcast: None,
             index_lan: None,
             livechat_directory: None,
+            enforce_lan_source: false,
         }
+    }
+
+    /// `http_bind` の LAN 公開を配線する(007 ADR-0015 — 起動時に main.rs から呼ぶ)。
+    ///
+    /// bind が非 loopback のとき Host ホワイトリストを `{bind}` リテラルまで拡張し
+    /// ([`host_allowlist`])、送信元 IP の LAN 限定検証を有効化する。loopback bind では
+    /// 何もしない(既定運用の非退行)。
+    pub fn with_http_lan(mut self, bind: SocketAddr) -> Self {
+        if !bind.ip().to_canonical().is_loopback() {
+            self.allowed_hosts = Arc::new(host_allowlist(bind));
+            self.enforce_lan_source = true;
+        }
+        self
     }
 
     /// チャンネル一覧の供給元を配線する(起動配線・テストで使用)。
@@ -212,6 +235,34 @@ pub fn loopback_hosts(port: u16) -> HashSet<String> {
     set.insert(format!("localhost:{port}"));
     set.insert(format!("[::1]:{port}"));
     set
+}
+
+/// Host ヘッダのホワイトリスト(007 ADR-0015 / lan-exposure.md §3)。
+///
+/// 常に loopback 3 形式([`loopback_hosts`])を含み、bind が非 loopback(LAN 公開)なら
+/// `{bind_ip}:{port}`(IPv6 は `[{ip}]:{port}` — [`SocketAddr`] の Display に一致)を追加する。
+/// これにより LAN 公開後も DNS rebinding / CSRF 対策(Host 検証)を維持する。判定は
+/// [`IpAddr::to_canonical`] 正規化後(v4-mapped 誤判定防止)。
+pub fn host_allowlist(bind: SocketAddr) -> HashSet<String> {
+    let mut set = loopback_hosts(bind.port());
+    if !bind.ip().to_canonical().is_loopback() {
+        set.insert(bind.to_string());
+    }
+    set
+}
+
+/// 送信元 IP が loopback / RFC 1918 / リンクローカル / ULA のいずれかか(007 ADR-0015 /
+/// lan-exposure.md §4 — LAN 限定の送信元検証)。判定は [`IpAddr::to_canonical`] 正規化後に
+/// 行う(v4-mapped 誤判定防止)。[`crate::config`] の bind 許可リストと同一基準。
+pub fn ip_is_lan_or_loopback(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.segments()[0] & 0xfe00 == 0xfc00
+                || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
+    }
 }
 
 /// 起動時セッショントークン(乱数 32 バイトの hex 表現)。
@@ -372,7 +423,9 @@ pub(crate) fn api_router(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn(body_limit))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
-        .layer(middleware::from_fn_with_state(state, host_guard))
+        .layer(middleware::from_fn_with_state(state.clone(), host_guard))
+        // 送信元 IP の LAN 限定検証(007 — 非 loopback 待受時のみ有効。最外周で最初に評価)。
+        .layer(middleware::from_fn_with_state(state, lan_source_guard))
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +495,28 @@ async fn host_guard(State(state): State<AppState>, req: Request, next: Next) -> 
         next.run(req).await
     } else {
         error_response(StatusCode::FORBIDDEN, "forbidden_host")
+    }
+}
+
+/// 送信元 IP の LAN 限定検証(007 ADR-0015 / lan-exposure.md §4 — 多層防御)。
+///
+/// [`AppState::enforce_lan_source`] が false(既定 = loopback 運用)なら素通しする。
+/// 有効時は接続の送信元 IP を [`ip_is_lan_or_loopback`] で判定し、LAN 外(グローバル・CGNAT 等)
+/// からのリクエストは 403 で拒否する。bind 先が LAN でもルータのポート転送誤設定に対する
+/// 安価な多層防御になる。ConnectInfo 欠落(取得不能)は安全側で拒否する。
+async fn lan_source_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if !state.enforce_lan_source {
+        return next.run(req).await;
+    }
+    let allowed = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| ip_is_lan_or_loopback(c.0.ip()))
+        .unwrap_or(false);
+    if allowed {
+        next.run(req).await
+    } else {
+        error_response(StatusCode::FORBIDDEN, "forbidden_source")
     }
 }
 

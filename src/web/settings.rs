@@ -1,18 +1,17 @@
 //! 設定 API(T062 — contracts/local-api.md `GET/PUT /settings`)
 //!
-//! - `GET /api/v1/settings`: data-model §Settings の全 19 キー(001 の 13 +
-//!   006-livechat-thread 追加分 6)を返す。
-//! - `PUT /api/v1/settings`: 検証つき更新。`pcp_bind` / `http_bind` / `compat_bbs_bind`
-//!   の非 loopback 値は 400 で拒否する(ADR-0006 決定 4 —
-//!   [`crate::config::Settings::validate`] を活用)。
+//! - `GET /api/v1/settings`: data-model §Settings の全 22 キー(001 の 13 +
+//!   006-livechat-thread 追加分 6 + ADR-0012 の index_bind + ADR-0015 の
+//!   http_lan_consent / compat_bbs_lan_consent)を返す。
+//! - `PUT /api/v1/settings`: 検証つき更新。`pcp_bind` は非 loopback を 400 で拒否
+//!   (`non_loopback_bind`)。`http_bind` / `compat_bbs_bind` は LAN 内プライベートを許可し、
+//!   非 loopback かつ対応する `*_lan_consent` が false なら 400(`lan_consent_required`)で
+//!   拒否する(ADR-0015 — 2 要素オプトイン。[`crate::config::Settings::validate`] を活用)。
 //!   バインド系キー(`pcp_bind` / `http_bind` / `p2p_bind` / `compat_bbs_bind`)の変更は
 //!   保存のうえ応答に再起動要求(`restart_required` / `restart_keys`)を含める。
 //!
 //! ルートは [`super::api_router`] へ登録され、4 層の保護(Host 検証・レート制限・
 //! トークン検証・ボディ上限)を自動継承する。エラー応答は `{"error":"<code>"}` のみ。
-//!
-//! LAN 公開オプトインは v1 非実装のため、§保護方針の警告 2 項目は扱わない
-//! (ADR-0006 決定 4)。
 
 use axum::Json;
 use axum::body::Bytes;
@@ -81,6 +80,7 @@ fn validation_error_response(e: ConfigError) -> Response {
     let code = match e {
         ConfigError::NonLoopbackBind { .. } => "non_loopback_bind",
         ConfigError::NonLanBind { .. } => "non_lan_bind",
+        ConfigError::LanConsentRequired { .. } => "lan_consent_required",
         ConfigError::InvalidBind { .. } => "invalid_bind",
         ConfigError::InvalidEncoding => "invalid_encoding",
         ConfigError::InvalidArgument => "invalid_request",
@@ -130,6 +130,8 @@ fn settings_to_json(s: &Settings) -> serde_json::Value {
         "event_store_max": s.event_store_max,
         "index_txt_encoding": s.index_txt_encoding,
         "index_bind": s.index_bind,
+        "http_lan_consent": s.http_lan_consent,
+        "compat_bbs_lan_consent": s.compat_bbs_lan_consent,
         "livechat_enabled": s.livechat_enabled,
         "thread_max_participants": s.thread_max_participants,
         "thread_write_rate": s.thread_write_rate,
@@ -157,6 +159,8 @@ struct SettingsUpdate {
     event_store_max: Option<u64>,
     index_txt_encoding: Option<String>,
     index_bind: Option<String>,
+    http_lan_consent: Option<bool>,
+    compat_bbs_lan_consent: Option<bool>,
     livechat_enabled: Option<bool>,
     thread_max_participants: Option<u32>,
     thread_write_rate: Option<u32>,
@@ -209,6 +213,12 @@ impl SettingsUpdate {
         }
         if let Some(v) = self.index_bind {
             base.index_bind = v;
+        }
+        if let Some(v) = self.http_lan_consent {
+            base.http_lan_consent = v;
+        }
+        if let Some(v) = self.compat_bbs_lan_consent {
+            base.compat_bbs_lan_consent = v;
         }
         if let Some(v) = self.livechat_enabled {
             base.livechat_enabled = v;

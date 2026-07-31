@@ -1094,6 +1094,7 @@ async fn compat_api_serves_remote_board_via_session() {
         security,
         allowed_hosts: Arc::new(hosts),
         rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
+        enforce_lan_source: false,
     };
 
     // subject.txt: リモート板がセッション経由で解決され、アクティブスレ 1 行が返る。
@@ -1132,4 +1133,212 @@ async fn compat_api_serves_remote_board_via_session() {
     assert!(text.contains("二つ目"), "dat に 2 件目が載る: {text}");
 
     manager.leave(&board_id);
+}
+
+// ===========================================================================
+// US3(T026): 固定 >>1 の自動投稿(contracts/fixed-first-post.md)
+//
+// registry を直接駆動し、開設・次スレ移行(自動/明示)・遡及なし・既定テンプレ・
+// res_limit カウント・PoW 免除・再起動相当の永続化反映を end-to-end で固定する。
+// ===========================================================================
+mod fixed_first_post {
+    use nostr::Keys;
+    use peca_p2p_yp::livechat::registry::{LivechatRegistry, sign_res};
+    use peca_p2p_yp::livechat::thread::BoardSettings;
+    use peca_p2p_yp::store::Store;
+
+    const GUID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn open_and_arm(reg: &LivechatRegistry, settings: BoardSettings) -> (String, String, Keys) {
+        let persona = Keys::generate();
+        let board_id = persona.public_key().to_hex();
+        let channel = format!("30311:{board_id}:{GUID}");
+        reg.open_thread(
+            persona,
+            channel.clone(),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let board_key = Keys::generate();
+        reg.arm_first_post(&board_id, board_key.clone(), 1_700_000_001)
+            .unwrap();
+        (board_id, channel, board_key)
+    }
+
+    /// スレ開設 + arm で res_no=1 がテンプレ本文・板鍵署名で自動確定する。
+    #[test]
+    fn open_posts_first_post_at_res_no_1() {
+        let reg = LivechatRegistry::new(128);
+        let (board_id, _ch, board_key) = open_and_arm(
+            &reg,
+            BoardSettings {
+                first_post_template: "配信URL: http://example/".into(),
+                ..Default::default()
+            },
+        );
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.res.len(), 1, ">>1 が 1 件確定している");
+        let first = &snap.active.res[0];
+        assert_eq!(first.res_no, Some(1), "res_no=1 を占有する");
+        assert_eq!(first.body, "配信URL: http://example/");
+        assert_eq!(
+            first.board_key,
+            board_key.public_key().to_hex(),
+            ">>1 はホスト板鍵で署名される"
+        );
+    }
+
+    /// テンプレ未設定の板は板タイトル + チャンネルを含む既定テンプレで自動投稿する(空 >>1 禁止)。
+    #[test]
+    fn empty_template_uses_non_empty_default() {
+        let reg = LivechatRegistry::new(128);
+        let (board_id, channel, _k) = open_and_arm(
+            &reg,
+            BoardSettings {
+                title: "ゲーム実況".into(),
+                first_post_template: String::new(),
+                ..Default::default()
+            },
+        );
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        let body = &snap.active.res[0].body;
+        assert!(!body.is_empty(), "既定テンプレは非空(空 >>1 禁止)");
+        assert!(body.contains("ゲーム実況"), "板タイトルを含む: {body}");
+        assert!(body.contains(&channel), "対象チャンネルを含む: {body}");
+    }
+
+    /// 明示次スレ移行でも新スレ res_no=1 にテンプレが自動投稿される。
+    #[test]
+    fn explicit_next_generation_reposts_first_post() {
+        let reg = LivechatRegistry::new(128);
+        let (board_id, _ch, _k) = open_and_arm(
+            &reg,
+            BoardSettings {
+                first_post_template: "テンプレ本文".into(),
+                ..Default::default()
+            },
+        );
+        let gen2 = reg
+            .start_next_generation(&board_id, 1_700_001_000, "実況スレ")
+            .unwrap();
+        assert_eq!(gen2, 2);
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.generation, 2);
+        assert_eq!(snap.active.res.len(), 1, "新スレも >>1 を持つ");
+        assert_eq!(snap.active.res[0].res_no, Some(1));
+        assert_eq!(snap.active.res[0].body, "テンプレ本文");
+    }
+
+    /// テンプレ変更は遡及しない(新スレ = 新テンプレ、既存(凍結)スレ = 旧テンプレ)。
+    #[test]
+    fn template_change_is_not_retroactive() {
+        let reg = LivechatRegistry::new(128);
+        let (board_id, _ch, _k) = open_and_arm(
+            &reg,
+            BoardSettings {
+                first_post_template: "旧テンプレ".into(),
+                ..Default::default()
+            },
+        );
+        // テンプレを変更してから次スレへ。
+        reg.update_settings(
+            &board_id,
+            BoardSettings {
+                first_post_template: "新テンプレ".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        reg.start_next_generation(&board_id, 1_700_001_000, "実況スレ")
+            .unwrap();
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.res[0].body, "新テンプレ", "新スレは新テンプレ");
+        let frozen = snap.frozen.expect("直近凍結スレを保持");
+        assert_eq!(frozen.res[0].body, "旧テンプレ", "既存スレの >>1 は不変");
+    }
+
+    /// >>1 は res_limit にカウントされ、移行判定に含まれる(res_limit=3 なら 2 件の参加者書き込みで移行)。
+    #[test]
+    fn first_post_counts_toward_res_limit_and_triggers_migration() {
+        let reg = LivechatRegistry::new(128);
+        // open_thread は validate を通さないため小さい res_limit を直接指定できる。
+        let (board_id, channel, _k) = open_and_arm(
+            &reg,
+            BoardSettings {
+                res_limit: 3,
+                first_post_pow_bits: 0,
+                first_post_template: "頭".into(),
+                ..Default::default()
+            },
+        );
+        // >>1 が res_no=1。参加者が res_no=2, 3 を書く → res_no=3=res_limit で自動移行。
+        let writer = Keys::generate();
+        for (i, ts) in [1_700_000_010u64, 1_700_000_011].iter().enumerate() {
+            let res = sign_res(&writer, &board_id, &channel, 1, &format!("参加{i}"), *ts).unwrap();
+            reg.accept_write(&board_id, &res, *ts).unwrap();
+        }
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.generation, 2, ">>1 込み 3 件で次スレへ移行した");
+        assert_eq!(snap.active.res.len(), 1, "新スレは >>1 のみ");
+        assert_eq!(snap.active.res[0].body, "頭");
+    }
+
+    /// 自動 >>1 には初回 PoW を課さない(first_post_pow_bits が高くても確定する)。
+    #[test]
+    fn auto_first_post_is_exempt_from_pow() {
+        let reg = LivechatRegistry::new(128);
+        let (board_id, _ch, _k) = open_and_arm(
+            &reg,
+            BoardSettings {
+                first_post_pow_bits: 32, // 通常書き込みには重い PoW を要求
+                first_post_template: "PoW 免除の頭".into(),
+                ..Default::default()
+            },
+        );
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.res.len(), 1, "PoW なしで >>1 が確定する");
+        assert_eq!(snap.active.res[0].body, "PoW 免除の頭");
+    }
+
+    /// board_settings に保存したテンプレが store 経由の再読込(再起動相当)後も >>1 に反映される。
+    #[test]
+    fn persisted_template_reflected_after_reload() {
+        let store = Store::open_in_memory().unwrap();
+        let persona = Keys::generate();
+        let board_id = persona.public_key().to_hex();
+        // 板設定(テンプレ入り)を永続化する。
+        let saved = BoardSettings {
+            first_post_template: "永続テンプレ: http://live/".into(),
+            ..Default::default()
+        };
+        store.set_board_settings(&saved.to_row(&board_id)).unwrap();
+
+        // 再起動相当: store から読み直して開設する。
+        let reloaded =
+            BoardSettings::from_row(&store.get_board_settings(&board_id).unwrap().unwrap());
+        assert_eq!(reloaded.first_post_template, "永続テンプレ: http://live/");
+
+        let reg = LivechatRegistry::new(128);
+        reg.open_thread(
+            persona,
+            format!("30311:{board_id}:{GUID}"),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            reloaded,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        reg.arm_first_post(&board_id, Keys::generate(), 1_700_000_001)
+            .unwrap();
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(
+            snap.active.res[0].body, "永続テンプレ: http://live/",
+            "再起動後も保存済みテンプレが >>1 に反映される"
+        );
+    }
 }

@@ -1,7 +1,7 @@
 //! セキュリティ共通部(T014)
 //!
 //! - 入力検証ヘルパ(サイズ・制御文字・URL 警告判定 — FR-012)
-//! - SecurityEvent カテゴリの一元定義(data-model.md §SecurityEvent を正とする全 21 カテゴリ。
+//! - SecurityEvent カテゴリの一元定義(data-model.md §SecurityEvent を正とする全 23 カテゴリ。
 //!   うち 6 件は 006-livechat-thread data-model §SecurityEvent 追加カテゴリ — T008)
 //! - セキュリティイベントログ: サイズローテーション(10MB × 5 世代)+
 //!   同一 `(category, source)` の高頻度イベントの 10 秒間隔件数集約
@@ -67,11 +67,18 @@ pub enum SecurityCategory {
     LivechatSettingsInvalid,
     /// 互換 API への loopback 外アクセス・Host 検証失敗・レート違反(FR-026)
     CompatBbsDenied,
+    /// Web UI + JSON API(`http_bind`)を LAN へ公開した(007 ADR-0015)。[`IndexTxtLanExposed`]
+    /// と同様、入力違反の拒否ではなく**利用者が明示的に選んだ露出状態の監査**。起動時に
+    /// 非 loopback かつ bind 成功のとき 1 件だけ記録する(loopback・bind 失敗・無効では記録しない)。
+    WebUiLanExposed,
+    /// 2ch 互換 API(`compat_bbs_bind`)を LAN へ公開した(007 ADR-0015)。記録条件は
+    /// [`WebUiLanExposed`] と同じ(面ごとに 1 件 — どの面を公開したか監査ログから判別可能)。
+    CompatBbsLanExposed,
 }
 
 impl SecurityCategory {
-    /// 全カテゴリ(データモデルの全量 21 件)。リリース前ゲート(T035)の一致確認に使う。
-    pub const ALL: [SecurityCategory; 21] = [
+    /// 全カテゴリ(データモデルの全量 23 件)。リリース前ゲート(T035)の一致確認に使う。
+    pub const ALL: [SecurityCategory; 23] = [
         SecurityCategory::PcpReject,
         SecurityCategory::P2pInvalidFrame,
         SecurityCategory::P2pOversize,
@@ -93,6 +100,8 @@ impl SecurityCategory {
         SecurityCategory::LivechatWriteRejected,
         SecurityCategory::LivechatSettingsInvalid,
         SecurityCategory::CompatBbsDenied,
+        SecurityCategory::WebUiLanExposed,
+        SecurityCategory::CompatBbsLanExposed,
     ];
 
     /// ログに書き出すカテゴリ名(data-model.md の表記と一致させる)。
@@ -119,6 +128,8 @@ impl SecurityCategory {
             SecurityCategory::LivechatWriteRejected => "livechat_write_rejected",
             SecurityCategory::LivechatSettingsInvalid => "livechat_settings_invalid",
             SecurityCategory::CompatBbsDenied => "compat_bbs_denied",
+            SecurityCategory::WebUiLanExposed => "web_ui_lan_exposed",
+            SecurityCategory::CompatBbsLanExposed => "compat_bbs_lan_exposed",
         }
     }
 }
@@ -387,9 +398,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn all_21_categories_have_unique_names() {
+    fn all_23_categories_have_unique_names() {
         let names: HashSet<&str> = SecurityCategory::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 23);
         assert!(names.contains("pcp_reject"));
         assert!(names.contains("p2p_invalid_frame"));
         assert!(names.contains("p2p_oversize"));
@@ -411,6 +422,8 @@ mod tests {
         assert!(names.contains("livechat_write_rejected"));
         assert!(names.contains("livechat_settings_invalid"));
         assert!(names.contains("compat_bbs_denied"));
+        assert!(names.contains("web_ui_lan_exposed"));
+        assert!(names.contains("compat_bbs_lan_exposed"));
     }
 
     #[test]

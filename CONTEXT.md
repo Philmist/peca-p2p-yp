@@ -33,11 +33,11 @@ contracts / research)、設計判断は `docs/adr/` を正とする。
 | `p2p/` | gossip フレーミング・セッション状態機械・受信パイプライン・接続時同期・ピア管理・PEX・UPnP・ハブ。HELLO `features` の `livechat1` でスレ配送セッション(THREAD_JOIN 等)を同一待受に多重化(1 TCP 接続 = 1 用途) | contracts/p2p-gossip.md、contracts/thread-delivery.md |
 | `livechat/` | 実況スレのホスト(採番シーケンサ・次スレ移行・明示クローズ)・参加者セッション・スレ状態機械・板鍵管理・NG/BAN。援用境界の外(nostr はイベント封筒のみ — ADR-0002 §3) | contracts/thread-delivery.md、data-model.md(006) |
 | `yp/` | index.txt 生成(18 フィールド・Shift_JIS) | contracts/http-yp.md |
-| `web/` | axum ルーター・ローカル JSON API・UI 静的配信・保護層(Host/トークン/レート/ボディ上限)。`web/livechat.rs` はスレ一覧・板設定・NG/BAN の操作 API。`web/compat/` は実況スレの 2ch 形式互換 API(subject.txt/dat/SETTING.TXT/head.txt/bbs.cgi)専用の第 2 loopback リスナー(`/api/v1` とは独立した状態・自ノードホスト板のみが対象) | contracts/local-api.md、contracts/compat-api.md |
+| `web/` | axum ルーター・ローカル JSON API・UI 静的配信・保護層(送信元 LAN 限定/Host/トークン/レート/ボディ上限)。`web/livechat.rs` はスレ一覧・板設定・NG/BAN の操作 API。`web/compat/` は実況スレの 2ch 形式互換 API(subject.txt/dat/SETTING.TXT/head.txt/bbs.cgi)専用の第 2 loopback リスナー(`/api/v1` とは独立した状態・自ノードホスト板のみが対象) | contracts/local-api.md、contracts/compat-api.md |
 | `identity/` | ペルソナ鍵管理(DPAPI 保管・nsec エクスポート・破棄) | ADR-0003 |
 | `store/` | SQLite 永続化(personas / peers / mutes / settings / board_keys / livechat_moderation / board_settings) | data-model.md |
-| `security/` | 入力検証ヘルパ・SecurityEvent 21 カテゴリ・ローテーション付きログ | data-model §SecurityEvent |
-| `config.rs` | Settings 既定値と検証(バインド系は loopback 強制 — ADR-0006 決定 4。例外: `index_bind` のみ loopback / LAN 許可 — ADR-0012。`compat_bbs_bind` は loopback 強制) | data-model §Settings |
+| `security/` | 入力検証ヘルパ・SecurityEvent 23 カテゴリ・ローテーション付きログ | data-model §SecurityEvent |
+| `config.rs` | Settings 既定値と検証(`pcp_bind` は loopback 強制 — ADR-0006 決定 4。`http_bind` / `compat_bbs_bind` / `index_bind` は loopback / LAN 内プライベート許可。書き込み面 `http_bind` / `compat_bbs_bind` の非 loopback は面別同意キー必須 — ADR-0015、read-only `index_bind` は UI 警告のみ — ADR-0012) | data-model §Settings |
 | `main.rs` | 起動配線と graceful shutdown | — |
 
 `ui/` は Web UI 静的アセット(ビルド時埋め込み)。`event/`(スキーマ)と `p2p/`(伝送)の
@@ -51,10 +51,10 @@ contracts / research)、設計判断は `docs/adr/` を正とする。
 |------|------|----------|
 | **P2P gossip(`p2p/`)** | インターネット(既定 `0.0.0.0:7147`。唯一の外部露出) | 最大の攻撃面。フレーム長 64KB → レート(256KB/s・200msg/s)→ JSON → イベント検証(サイズ 16KB→署名→形式→時刻→内容→PoW)の多段検証。違反は破棄+切断+セキュリティイベント |
 | **PCP(`pcp/`)** | loopback のみ(`127.0.0.1:7146`、非 loopback は検証拒否) | 利用者自身の PeerCastStation が相手。atom ネスト ≤8・≤64KB、文字列は切詰め許容 |
-| **ローカル HTTP(`web/` `yp/`)** | loopback のみ(`127.0.0.1:7180`) | Host 検証(DNS rebinding 対策)・変更系は `X-Api-Token`・レート制限・ボディ ≤64KB・定型エラー(内部情報漏洩禁止) |
+| **ローカル HTTP(`web/` `yp/`)** | 既定 loopback(`127.0.0.1:7180`)。`http_bind` を LAN 内プライベートアドレスへ変更するオプトイン公開が可能(面別同意キー `http_lan_consent` 必須 — ADR-0015) | Host 検証(DNS rebinding 対策)・変更系は `X-Api-Token`・レート制限・ボディ ≤64KB・定型エラー(内部情報漏洩禁止)。LAN 公開時は Host ホワイトリストに `{bind_ip}:{port}` を追加し、送信元 IP を LAN 限定検証(`to_canonical()` 後・LAN 外は 403)、非 loopback 待受成功で `WebUiLanExposed` を監査記録 |
 | **index.txt(オプトイン時)** | LAN(`index_bind` 非空時のみ。既定は無効 — ADR-0012) | 読み取り専用 index.txt の GET/HEAD 専用の第 2 受け口。バインドは loopback / LAN 内プライベートアドレスのみ受理・それ以外は起動拒否。API/UI は物理的に非搭載(それ以外は定型 404)・サイズ上限とレート制限は loopback 側と共有・非 loopback 露出は監査イベント記録 |
 | **スレ配送(`livechat/`)** | P2P gossip と同一ポート(既定 `0.0.0.0:7147`。HELLO `features` の `livechat1` で多重化) | announce(kind 31311)はチャンネル掲載ペルソナと同一署名必須(FR-003)。接続はスレを開く明示操作のみ起点(announce 受信のみでは接続しない — FR-004)。接続時チャレンジで接続先の真正性を検証(FR-005)。レス(kind 1311)はホストが多段検証(署名→形式→スレ状態→BAN→PoW→レート)後に採番、順序確定情報(kind 21311)はスレ主署名必須(FR-011) |
-| **互換 API(`web/compat/`)** | loopback のみ(既定 `127.0.0.1:7183`、`compat_bbs_bind` 空文字で無効化・非 loopback は起動拒否) | `/api/v1` とは物理的に分離した専用リスナー(トークン保護を持たない代わりに Host 検証・レート制限・ボディ ≤64KB)。書き込み(bbs.cgi)は通常の書き込み経路(`LivechatRegistry::accept_write`)と完全に同一の検証を経る(FR-028 — 抜け道禁止)。**自ノードホスト板のみが対象**(リモート板は非対応) |
+| **互換 API(`web/compat/`)** | 既定 loopback(`127.0.0.1:7183`、`compat_bbs_bind` 空文字で無効化)。LAN 内プライベートアドレスへのオプトイン公開が可能(面別同意キー `compat_bbs_lan_consent` 必須 — ADR-0015) | `/api/v1` とは物理的に分離した専用リスナー(トークン保護を持たない代わりに Host 検証・レート制限・ボディ ≤64KB)。書き込み(bbs.cgi)は通常の書き込み経路(`LivechatRegistry::accept_write`)と完全に同一の検証を経る(FR-028 — 抜け道禁止)。LAN 公開時も Host 検証 + 送信元 IP LAN 限定 + `CompatBbsLanExposed` 監査を上乗せし、保護水準は loopback と同一(無認証だが緩和なし)。**自ノードホスト板のみが対象**(リモート板は非対応) |
 
 横断原則: 「真に信頼できるのは自分だけ」— 他ノード由来の情報(イベント・PEX アドレス・
 HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015 / Principle II)。
@@ -76,6 +76,7 @@ HELLO 申告値)はすべて自ノードで検証してから使用する(FR-015
 - ADR-0012: read-only index.txt の LAN 公開オプトイン(ADR-0006 決定 4 の部分 supersede)
 - ADR-0013: PEX 破棄の良性/不審分類(`pex_rejected` は不審な破棄のみ記録・良性は debug 格下げ)
 - ADR-0014: 実況スレ脅威モデル追加(announce 反射攻撃・偽 ORDER・荒らし)・Principle V 該当判定(採番シーケンサ状態機械)・kind 1311/21311/31311 の採番根拠
+- ADR-0015: 書き込みを含む Web UI + JSON API(`http_bind`)・2ch 互換 API(`compat_bbs_bind`)の LAN 公開オプトイン(許可リスト + 面別 2 要素同意キー + 送信元 IP 検証 + 面別監査。ADR-0006 決定 4 をさらに部分 supersede・ADR-0012 を書き込み面へ拡張)
 - security-review-checklist.md: セキュリティ PR のレビュー観点(実装中ゲート 6)
 - release-gate-check-2026-07-04.md: リリース前ゲート 8〜10 の適用記録
 
