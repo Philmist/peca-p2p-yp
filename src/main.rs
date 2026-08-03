@@ -781,9 +781,29 @@ impl LivechatAdapter {
     /// [`SocketAddr`] パースで正しく port 差し替えする。
     fn derive_tip(&self, tracker: Option<&str>) -> Option<String> {
         if self.listen_port == 0 {
+            tracing::warn!(
+                target: "livechat",
+                cause = "p2p_not_listening",
+                "スレ開設不可: 自ノードの P2P が待受していません(listen_port=0)"
+            );
             return None;
         }
-        let mut addr: SocketAddr = tracker?.parse().ok()?;
+        let Some(tracker) = tracker else {
+            tracing::warn!(
+                target: "livechat",
+                cause = "tracker_unknown",
+                "スレ開設不可: チャンネルの tracker(配信元アドレス)が未確定です(firewalled 等)"
+            );
+            return None;
+        };
+        let Ok(mut addr) = tracker.parse::<SocketAddr>() else {
+            tracing::warn!(
+                target: "livechat",
+                cause = "tracker_unparsable",
+                "スレ開設不可: チャンネルの tracker を接続先アドレスとして解釈できません"
+            );
+            return None;
+        };
         addr.set_port(self.listen_port);
         Some(addr.to_string())
     }
@@ -895,11 +915,16 @@ impl LivechatDirectory for LivechatAdapter {
             .ok()
             .flatten()
             .ok_or(LivechatOpError::NotFound)?;
-        let persona = self
-            .identity
-            .signing_keys(&persona_pubkey)
-            .map_err(|_| LivechatOpError::Unavailable)?;
+        let persona = self.identity.signing_keys(&persona_pubkey).map_err(|_| {
+            tracing::warn!(
+                target: "livechat",
+                cause = "persona_key_unavailable",
+                "スレ開設不可: スレ主ペルソナの署名鍵を取得できません"
+            );
+            LivechatOpError::Unavailable
+        })?;
         // 3. tip(視聴者の接続先)。tracker の IP + 自ノード P2P ポート。
+        //    None の詳細要因(P2P 未待受 / tracker 未確定・不正)は derive_tip 内で warn する。
         let tip = self
             .derive_tip(ch.tracker.as_deref())
             .ok_or(LivechatOpError::Unavailable)?;
@@ -924,10 +949,14 @@ impl LivechatDirectory for LivechatAdapter {
         settings.validate().map_err(|_| LivechatOpError::Invalid)?;
         // 4.5 ホスト板鍵(固定 >>1 の署名鍵 — 007 T033)。get-or-create。利用不可なら
         //     >>1 を投稿できないため開設を中止する(res_no=1 常在の不変条件を守る — FR-014)。
-        let board_key = self
-            .board_keys
-            .signing_keys(&persona_pubkey)
-            .map_err(|_| LivechatOpError::Unavailable)?;
+        let board_key = self.board_keys.signing_keys(&persona_pubkey).map_err(|_| {
+            tracing::warn!(
+                target: "livechat",
+                cause = "board_key_unavailable",
+                "スレ開設不可: ホスト板鍵(固定 >>1 の署名鍵)を取得できません"
+            );
+            LivechatOpError::Unavailable
+        })?;
         // 5. 開設(gen=1・key=現在秒)。channel は `30311:<persona>:<guid>`。
         let channel = format!("30311:{persona_pubkey}:{}", req.channel_id);
         let title = settings.title.clone();

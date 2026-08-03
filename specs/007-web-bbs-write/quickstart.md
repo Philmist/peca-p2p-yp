@@ -72,8 +72,20 @@ cargo test --test lan_write      # LAN 公開時の非 loopback 読み書き(新
    - `0.0.0.0:7180`(未指定)
    - `100.64.1.2:7180`(CGNAT)
    - グローバルアドレス(例 `203.0.113.5:7180`)
-6. LAN 公開中に `curl -H "Host: evil.example:7180" http://192.168.1.10:7180/...` →
-   **期待**: 403(ホワイトリスト外 Host)
+6. LAN 公開中に **API パス**へホワイトリスト外 Host を付けて叩く →
+   **期待**: 403 `forbidden_host`
+   ```bash
+   curl -i -H "Host: evil.example:7180" http://192.168.1.10:7180/api/v1/token
+   ```
+   > **注意(検証者向け)**: Host 検証は `/api/v1/*`(保護層)にのみ適用される。
+   > `/` や `/livechat.html` 等の静的 UI HTML は保護層の外側で配信されるため、
+   > ホワイトリスト外 Host でも **200 が返るのが仕様どおり**(下記は失敗例)。
+   > UI HTML は Host 非依存でバイト単位に同一・シークレットを含まず、DNS rebinding /
+   > CSRF の標的は API であるため(`src/web/mod.rs` モジュール doc・ADR-0015)。
+   > ```bash
+   > # ✗ これは検証にならない — 静的 HTML なので 200 が正しい(403 ではない)
+   > curl -i -H "Host: evil.example:7180" http://192.168.1.10:7180/
+   > ```
 7. 既定設定(loopback)に戻す → **期待**: 別端末から到達できない(現状維持)
 
 ## V-4: LAN 公開 — 2ch 互換 API(US2 / SC-009)
@@ -91,6 +103,21 @@ cargo test --test lan_write      # LAN 公開時の非 loopback 読み書き(新
 
 1. LAN 公開中、別端末から同一送信元で 20 req/秒を超えるリクエストを送る →
    **期待**: 429(loopback と同一上限)
+   ```bash
+   # http_bind の API パスへ連投する(GET はトークン不要)
+   for i in $(seq 1 40); do curl -s -o /dev/null -w "%{http_code}\n" \
+     http://192.168.1.10:7180/api/v1/token; done   # 20 件目以降が 429
+   ```
+   > **注意(検証者向け)**: レート制限はリスナー/パスごとに適用範囲と上限が異なる。
+   > 「20 req/秒 → 429」がそのまま成り立つのは **`http_bind` の `/api/v1/*`** のみ
+   > (`src/web/mod.rs` の保護層 — `RATE_LIMIT_PER_SEC = 20`、超過ログ `http_rate_limited`)。
+   > - `http_bind` の**静的 HTML**(`/`・`/livechat.html` 等)は保護層の外側で配信され、
+   >   **レート制限がかからない**(いくら連投しても 429 にならないのが仕様どおり — V-3-6 と同根)。
+   > - `index_bind`(`/index.txt`)の上限は **10 req/秒**(20 ではない — `index_txt_rate_limiter`)。
+   > - `compat_bbs_bind` は独立の上限 **20 req/秒**で、超過ログは `compat_bbs_denied`。
+   >
+   > 「loopback と同一上限」とは各リスナーが**それぞれの** loopback 時上限を維持する
+   > (= 非緩和)意味であり、全リスナー横並びで 20 ではない。
 2. 過大ボディ(互換 API 64KB 超)を送る → **期待**: 拒否(loopback と同一)
 
 ## 完了条件
