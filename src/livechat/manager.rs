@@ -141,6 +141,18 @@ impl ParticipantManager {
             .is_some_and(|e| !lock(&e.shared).terminated)
     }
 
+    /// 生存中(未終端)の常駐セッションを持つ板 id 一覧(参加中=視聴中の板 — 007 FR-023c）。
+    ///
+    /// 互換 API の `boards.json`(ブラウザ SPA の板一覧)がホスト板に加えて列挙する。終端済み
+    /// (クローズ揮発・切断確定)エントリは除く。
+    pub fn board_ids(&self) -> Vec<String> {
+        lock(&self.sessions)
+            .iter()
+            .filter(|(_, e)| !lock(&e.shared).terminated)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// 現在のライブ状態(確定列・送信中・板設定・状態)を読み出す。未オープンは `None`。
     pub fn view(&self, board_id: &str) -> Option<SessionView> {
         lock(&self.sessions)

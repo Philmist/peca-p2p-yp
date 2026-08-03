@@ -1095,6 +1095,7 @@ async fn compat_api_serves_remote_board_via_session() {
         allowed_hosts: Arc::new(hosts),
         rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
         enforce_lan_source: false,
+        compat_bbs_port: Some(7183),
     };
 
     // subject.txt: リモート板がセッション経由で解決され、アクティブスレ 1 行が返る。

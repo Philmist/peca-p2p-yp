@@ -88,6 +88,9 @@ pub struct CompatState {
     /// 送信元 IP の LAN 限定検証を有効化するか(007 ADR-0015 — `compat_bbs_bind` 非 loopback 時
     /// true)。false(既定)のとき送信元は検査しない(loopback 運用の非退行)。lan-exposure.md §4。
     pub enforce_lan_source: bool,
+    /// 互換 API の待受ポート(007 FR-023a — `board.json` が板 URL 自己生成用に載せる）。
+    /// `compat_bbs_bind` 由来。`None` は不明(テスト等)。
+    pub compat_bbs_port: Option<u16>,
 }
 
 /// 自板(registry)優先、無ければ他ノード板の常駐セッション(manager)から板スナップショットを
@@ -152,6 +155,10 @@ pub fn routes(state: CompatState) -> Router {
         // 同一ポート・同一パス上でパスにより振り分ける(末尾スラッシュのみ = ブラウザ)。
         // 他面(http_bind)へはリダイレクトしない。
         .route("/{board}/", get(board_page))
+        // 互換名前空間 JSON(007 FR-023a/c — ブラウザ SPA の自己完結。`/api/v1` は生やさない）。
+        .route("/boards.json", get(boards_json))
+        .route("/{board}/board.json", get(board_json))
+        .route("/{board}/write.json", post(write_json))
         .route("/{board}/subject.txt", get(subject_txt))
         .route("/{board}/SETTING.TXT", get(setting_txt))
         .route("/{board}/head.txt", get(head_txt))
@@ -290,6 +297,212 @@ async fn board_page(Path(_board): Path<String>) -> Response {
         LIVECHAT_HTML,
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// FR-023a/c: 互換名前空間 JSON(007 — contracts/web-ui.md §7.1/§7.2/§7.3 / research R13)
+// ---------------------------------------------------------------------------
+//
+// ブラウザ SPA の自己完結を、**トークン保護 `/api/v1` を互換面へ生やさず**互換名前空間の
+// JSON で成立させる(不変条件「互換リスナーは `/api/v1` を物理的に持たない」の維持)。3 面とも
+// 既存の Host 検証 + 送信元 LAN 限定 + レート制限ミドルウェアを共有する(保護は非緩和)。
+// 内容は既存の公開 SJIS 読取(subject.txt/dat/SETTING.TXT/head.txt)の JSON 再エンコードに
+// 留め、新規のデータ種別・板鍵・秘密・トークン面を増やさない。
+
+/// `board.json` のペイロード(視聴者向け最小 `CompatBoardView`)。
+///
+/// 板主設定(`first_post_template`/`first_post_pow_bits`)・送信中投稿(`pending`)・原文
+/// `local_rules` は**含めない**(MUST NOT — FR-023a)。
+#[derive(serde::Serialize)]
+struct CompatBoardView {
+    title: String,
+    noname_name: String,
+    res_limit: u16,
+    /// サーバ側で安全 HTML 化済み(§4)。原文 Markdown は出さない。
+    local_rules_html: String,
+    res: Vec<CompatResView>,
+    thread: CompatThreadView,
+    compat_bbs_port: Option<u16>,
+}
+
+/// board.json の確定レス 1 件(dat 相当の公開情報の最小形)。板鍵・event_id・pending は出さない。
+#[derive(serde::Serialize)]
+struct CompatResView {
+    res_no: u16,
+    name: String,
+    mail: String,
+    body: String,
+    created_at: i64,
+}
+
+/// board.json のスレ記述子(SPA のスレルーティング用)。
+#[derive(serde::Serialize)]
+struct CompatThreadView {
+    generation: u32,
+    res_count: usize,
+}
+
+/// boards.json の 1 要素(最小フィールド — tip/channel/内部状態は出さない)。
+#[derive(serde::Serialize)]
+struct CompatBoardListItem {
+    board_id: String,
+    title: String,
+    res_count: usize,
+    is_local: bool,
+}
+
+/// write.json のリクエスト(トークンレス・board スコープ。`key` は取らない = ホストが現行スレへ採番)。
+#[derive(serde::Deserialize)]
+struct WriteJsonRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    mail: Option<String>,
+    body: String,
+}
+
+/// 値を `application/json; charset=utf-8` として返す。
+fn json_response(value: &impl serde::Serialize) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// board.json の確定レス列(res_no 確定分のみ)を最小形へ写す。
+fn compat_res_views(snapshot: &BoardSnapshot) -> Vec<CompatResView> {
+    snapshot
+        .active
+        .res
+        .iter()
+        .filter_map(|r| {
+            r.res_no.map(|res_no| CompatResView {
+                res_no,
+                name: r.name.clone().unwrap_or_default(),
+                mail: r.mail.clone().unwrap_or_default(),
+                body: r.body.clone(),
+                created_at: r.created_at,
+            })
+        })
+        .collect()
+}
+
+/// `GET /boards.json` — ホスト板 + 参加中(視聴)板の一覧(FR-023c)。
+///
+/// ホスト板(registry・`is_local=true`)を先に列挙し、続けて参加中板(manager・`is_local=false`)を
+/// 加える。ホストしている板は重複させない。最小フィールドのみ(tip/channel/内部状態は出さない)。
+async fn boards_json(State(state): State<CompatState>) -> Response {
+    let mut items: Vec<CompatBoardListItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for board_id in state.registry.board_ids() {
+        if let Some(snap) = state.registry.board_snapshot(&board_id) {
+            seen.insert(board_id.clone());
+            items.push(CompatBoardListItem {
+                title: snap.settings.title.clone(),
+                res_count: snap.active.res.len(),
+                is_local: true,
+                board_id,
+            });
+        }
+    }
+    for board_id in state.manager.board_ids() {
+        if seen.contains(&board_id) {
+            continue;
+        }
+        if let Some(snap) = resolve_snapshot(&state, &board_id) {
+            items.push(CompatBoardListItem {
+                title: snap.settings.title.clone(),
+                res_count: snap.active.res.len(),
+                is_local: false,
+                board_id,
+            });
+        }
+    }
+    json_response(&items)
+}
+
+/// `GET /{board}/board.json` — 視聴者向け最小板詳細 `CompatBoardView`(FR-023a)。未知板は定型 404。
+async fn board_json(State(state): State<CompatState>, Path(board): Path<String>) -> Response {
+    let Some(snapshot) = resolve_snapshot(&state, &board) else {
+        return error_response(StatusCode::NOT_FOUND);
+    };
+    let res = compat_res_views(&snapshot);
+    let res_count = res.len();
+    let s = &snapshot.settings;
+    let view = CompatBoardView {
+        title: s.title.clone(),
+        noname_name: s.noname_name.clone(),
+        res_limit: s.res_limit,
+        local_rules_html: crate::web::livechat::render_local_rules_html(&s.local_rules),
+        res,
+        thread: CompatThreadView {
+            generation: snapshot.active.generation,
+            res_count,
+        },
+        compat_bbs_port: state.compat_bbs_port,
+    };
+    json_response(&view)
+}
+
+/// `POST /{board}/write.json` — トークンレス書き込み(FR-023a/FR-022)。
+///
+/// 実体は専ブラ bbs.cgi と**同一の `submit`**(自板採番・未知板は常駐セッション経由)。受理は
+/// 202(BAN/PoW 不足/レート超過は非開示で受理扱い)、本文空・解析不能・サイズ超過等の形式違反は
+/// 400。他の互換面と同一の Host/送信元/レート保護をミドルウェアで共有する(非緩和)。
+async fn write_json(
+    State(state): State<CompatState>,
+    Path(board): Path<String>,
+    req: Request,
+) -> Response {
+    let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST),
+    };
+    let Ok(payload) = serde_json::from_slice::<WriteJsonRequest>(&bytes) else {
+        return error_response(StatusCode::BAD_REQUEST);
+    };
+    if payload.body.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST);
+    }
+
+    let form = bbs_cgi::BbsForm {
+        bbs: board,
+        key: None,
+        from: payload.name,
+        mail: payload.mail,
+        message: payload.body,
+        subject: None,
+    };
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match bbs_cgi::submit(&state.registry, &state.board_keys, &form, created_at) {
+        Ok(_) => StatusCode::ACCEPTED.into_response(),
+        // 形式違反(解析不能・本文長超過)は 400。
+        Err(bbs_cgi::BbsCgiError::MalformedForm | bbs_cgi::BbsCgiError::BuildFailed) => {
+            error_response(StatusCode::BAD_REQUEST)
+        }
+        // 未知板は常駐セッション経由(自ノードがホストしていない参加中板 — FR-028)。
+        Err(bbs_cgi::BbsCgiError::UnknownBoard) => {
+            match state.manager.write(
+                &form.bbs,
+                form.from.clone(),
+                form.mail.clone(),
+                form.message.clone(),
+            ) {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(_) => error_response(StatusCode::NOT_FOUND),
+            }
+        }
+        // BAN/PoW 不足/レート超過/満員/凍結等は非開示で受理扱い(202 — FR-022)。
+        Err(_) => StatusCode::ACCEPTED.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +761,7 @@ mod tests {
             allowed_hosts: Arc::new(hosts),
             rate_limiter: Arc::new(RateLimiter::with_clock(1000, Box::new(|| 1_000))),
             enforce_lan_source: false,
+            compat_bbs_port: Some(7183),
         }
     }
 

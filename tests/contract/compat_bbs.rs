@@ -60,6 +60,7 @@ fn test_state() -> CompatState {
         allowed_hosts: Arc::new(hosts),
         rate_limiter: Arc::new(RateLimiter::per_second(RATE_LIMIT_PER_SEC)),
         enforce_lan_source: false,
+        compat_bbs_port: Some(7183),
     }
 }
 
@@ -112,6 +113,23 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 
 async fn body_sjis_text(resp: axum::response::Response) -> String {
     sjis::decode(&body_bytes(resp).await)
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(&body_bytes(resp).await).expect("応答は JSON")
+}
+
+/// `application/json` の POST リクエスト(write.json 用)。
+fn post_json_req(uri: &str, host: Option<&str>, body: &str) -> Request<Body> {
+    let mut b = Request::builder().method(Method::POST).uri(uri);
+    if let Some(h) = host {
+        b = b.header(header::HOST, h);
+    }
+    b = b.header(header::CONTENT_TYPE, "application/json");
+    let mut req = b.body(Body::from(body.to_string())).unwrap();
+    let addr: SocketAddr = "127.0.0.1:60002".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,4 +1080,237 @@ async fn compat_rate_limit_is_20_on_lan() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------------------
+// FR-023a/c: 互換名前空間 JSON(board.json / boards.json / write.json)
+// (T051/T052/T053 — contracts/web-ui.md §7.1/§7.2/§7.3)
+// ---------------------------------------------------------------------------
+
+/// T051: `GET /{board}/board.json` は視聴者向け最小 `CompatBoardView` を UTF-8 JSON で返す。
+#[tokio::test]
+async fn board_json_returns_minimal_compat_view() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(
+        &state,
+        &persona,
+        BoardSettings {
+            title: "実況板".into(),
+            res_limit: 500,
+            noname_name: "名無しさん".into(),
+            local_rules: "# ルール\n**荒らし禁止**".into(),
+            first_post_template: "テンプレ >>1".into(),
+            first_post_pow_bits: 8,
+        },
+    );
+    let board_key = Keys::generate();
+    seed(&state, &board_id, &board_key, "本文", 1_700_000_001);
+    let app = routes(state);
+    let resp = app
+        .oneshot(get_req(&format!("/{board_id}/board.json"), Some(GOOD_HOST)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(content_type, "application/json; charset=utf-8");
+    let v = body_json(resp).await;
+
+    assert_eq!(v["title"], "実況板");
+    assert_eq!(v["noname_name"], "名無しさん");
+    assert_eq!(v["res_limit"], 500);
+    // ローカルルールは安全 HTML 化済み(原文 Markdown ではない)。
+    let html = v["local_rules_html"].as_str().unwrap();
+    assert!(html.contains('<'), "安全 HTML 化済み: {html}");
+    // 確定レス列(最小形)。
+    let res = v["res"].as_array().unwrap();
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0]["res_no"], 1);
+    assert_eq!(res[0]["body"], "本文");
+    assert!(res[0].get("name").is_some());
+    assert!(res[0].get("mail").is_some());
+    assert!(res[0].get("created_at").is_some());
+    // スレ記述子。
+    assert_eq!(v["thread"]["generation"], 1);
+    assert_eq!(v["thread"]["res_count"], 1);
+    assert!(v.get("compat_bbs_port").is_some());
+
+    // MUST NOT: 板主設定・送信中・原文 local_rules を含めない。
+    assert!(v.get("first_post_template").is_none(), "板主設定を含めない");
+    assert!(v.get("first_post_pow_bits").is_none(), "板主設定を含めない");
+    assert!(v.get("pending").is_none(), "送信中概念を含めない");
+    assert!(
+        v.get("local_rules").is_none(),
+        "原文 local_rules を含めない"
+    );
+    assert!(
+        res[0].get("pending").is_none(),
+        "レスにも送信中フラグを含めない"
+    );
+    assert!(
+        res[0].get("board_key").is_none() && res[0].get("event_id").is_none(),
+        "板鍵・イベント id を含めない"
+    );
+}
+
+/// T051: 未知/未ホスト板の board.json は定型 404(内部状態を開示しない)。
+#[tokio::test]
+async fn board_json_unknown_board_is_404() {
+    let state = test_state();
+    let app = routes(state);
+    let resp = app
+        .oneshot(get_req("/ff/board.json", Some(GOOD_HOST)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// T052: `GET /boards.json` はホスト板を最小フィールドで列挙する。
+#[tokio::test]
+async fn boards_json_lists_hosted_board_min_fields() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(
+        &state,
+        &persona,
+        BoardSettings {
+            title: "実況板".into(),
+            ..Default::default()
+        },
+    );
+    let board_key = Keys::generate();
+    seed(&state, &board_id, &board_key, "本文", 1_700_000_001);
+    let app = routes(state);
+    let resp = app
+        .oneshot(get_req("/boards.json", Some(GOOD_HOST)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(content_type, "application/json; charset=utf-8");
+    let v = body_json(resp).await;
+    let arr = v.as_array().unwrap();
+    let item = arr
+        .iter()
+        .find(|b| b["board_id"] == board_id)
+        .expect("ホスト板が列挙される");
+    assert_eq!(item["title"], "実況板");
+    assert_eq!(item["res_count"], 1);
+    assert_eq!(item["is_local"], true);
+    // 最小フィールドのみ(tip / channel / 内部状態は出さない)。
+    assert!(item.get("tip").is_none(), "tip を含めない");
+    assert!(item.get("channel").is_none(), "channel を含めない");
+    assert!(item.get("settings").is_none(), "内部状態を含めない");
+}
+
+/// T053: `POST /{board}/write.json`(トークンレス)は受理で 202 を返し、
+/// 書き込みが既存 bbs.cgi と同一の採番経路で確定する。
+#[tokio::test]
+async fn write_json_accepts_and_reflects_in_board() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(
+        &state,
+        &persona,
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let app = routes(state.clone());
+    let resp = app
+        .oneshot(post_json_req(
+            &format!("/{board_id}/write.json"),
+            Some(GOOD_HOST),
+            r#"{"name":"視聴者","mail":"","body":"ブラウザから"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // board.json 再取得で反映を確認する(採番確定は同期・自板採番)。
+    let app2 = routes(state);
+    let resp2 = app2
+        .oneshot(get_req(&format!("/{board_id}/board.json"), Some(GOOD_HOST)))
+        .await
+        .unwrap();
+    let v = body_json(resp2).await;
+    let res = v["res"].as_array().unwrap();
+    assert!(
+        res.iter().any(|r| r["body"] == "ブラウザから"),
+        "書き込みが確定レス列に反映される: {v}"
+    );
+}
+
+/// T053: 本文空(形式違反)は 400。
+#[tokio::test]
+async fn write_json_empty_body_is_400() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(
+        &state,
+        &persona,
+        BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        },
+    );
+    let app = routes(state);
+    let resp = app
+        .oneshot(post_json_req(
+            &format!("/{board_id}/write.json"),
+            Some(GOOD_HOST),
+            r#"{"body":""}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// T053: 壊れた JSON(形式違反)は 400。
+#[tokio::test]
+async fn write_json_malformed_json_is_400() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(&state, &persona, BoardSettings::default());
+    let app = routes(state);
+    let resp = app
+        .oneshot(post_json_req(
+            &format!("/{board_id}/write.json"),
+            Some(GOOD_HOST),
+            "{not json",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// T053: write.json も Host 検証を共有する(ホワイトリスト外は 403・非緩和)。
+#[tokio::test]
+async fn write_json_shares_host_guard() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(&state, &persona, BoardSettings::default());
+    let app = routes(state);
+    let resp = app
+        .oneshot(post_json_req(
+            &format!("/{board_id}/write.json"),
+            Some("evil.example:7183"),
+            r#"{"body":"x"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

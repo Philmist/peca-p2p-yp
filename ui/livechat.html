@@ -116,7 +116,7 @@
 
       <div class="paper">
         <!-- スレ開設(掲載中チャンネルのペルソナが配信者としてスレを立てる) -->
-        <details open>
+        <details id="home-open-wrap" open>
           <summary>スレを開設する(配信者)</summary>
           <div class="row">
             <label for="open-channel">チャンネル</label>
@@ -226,7 +226,7 @@
       </div>
 
       <!-- 管理操作(既存機能の温存 — 折りたたみ) -->
-      <details>
+      <details id="thread-ops-wrap">
         <summary>スレ操作(配信者・参加者)</summary>
         <div class="toolbar">
           <button id="next-btn">次スレ</button>
@@ -238,7 +238,7 @@
 
       <!-- 個別レスのモデレーション実行はスレページ起点(FR-006b)。板設定・BAN 一覧管理は
            板ページの板管理セクション(FR-006a)へ移設した。 -->
-      <details>
+      <details id="thread-mod-wrap">
         <summary>モデレーション(配信者)</summary>
         <div class="row"><label for="ban-key">板鍵 BAN</label>
           <input id="ban-key" type="text" size="40" placeholder="板鍵 pubkey hex">
@@ -257,6 +257,16 @@
   <script>
     'use strict';
     // =====================================================================
+    // 配信オリジンの検出(007 FR-023b — 互換名前空間 JSON による自己完結)
+    // =====================================================================
+    // 互換ポート(compat_bbs_bind)は板ページを `/{board64hex}/` で配信する。この経路で
+    // 開かれた場合(ON_COMPAT)、SPA は読取=board.json・一覧=boards.json・書込=write.json に
+    // 振り替え、ホスト管理(スレ開設・板設定・モデレーション・BAN 一覧・チャンネル選択・
+    // /api/v1/token 取得)を非表示化する(視聴者スコープ)。同一 include_str! 資産のまま実行時分岐。
+    // http_bind の `/livechat.html`(pathname にボードなし)では ON_COMPAT=false で従来どおり。
+    const ON_COMPAT = /^\/[0-9a-fA-F]{64}\/$/.test(location.pathname);
+
+    // =====================================================================
     // 状態・共通ヘルパ(トークン取得・api()・エスケープは 006 を温存)
     // =====================================================================
     let token = null;
@@ -265,6 +275,7 @@
     let boardView = null;           // 板ページの現在板 { board, isLocal }(板管理の PUT/BAN 対象)
 
     async function loadToken() {
+      if (ON_COMPAT) return;   // 互換オリジンはトークン保護 API 面を持たない(FR-023a)。
       const res = await fetch('/api/v1/token');
       if (!res.ok) throw new Error('token');
       token = (await res.json()).token;
@@ -363,9 +374,38 @@
     }
 
     async function fetchThreads() {
-      const res = await fetch('/api/v1/livechat/threads');
+      // 互換オリジンは boards.json(ホスト板 + 参加中板・最小フィールド)。http_bind は既存の
+      // 板一覧 API。いずれも [{ board_id, title, res_count, is_local, ... }] を返す。
+      const res = await fetch(ON_COMPAT ? '/boards.json' : '/api/v1/livechat/threads');
       if (!res.ok) return null;
       return res.json();
+    }
+
+    // 板詳細の取得(FR-023b): 互換オリジンは board.json(視聴者向け最小 CompatBoardView)を
+    // http_bind の板詳細と同形へ正規化して返す。`ok` で成否を、`settings`/`res`/`pending`/
+    // `compat_bbs_port`/`thread` で描画に必要な最小を揃える。
+    async function loadBoardDetail(board) {
+      if (ON_COMPAT) {
+        const res = await fetch('/' + encodeURIComponent(board) + '/board.json');
+        if (!res.ok) return { ok: false };
+        const b = await res.json();
+        return {
+          ok: true,
+          settings: {
+            title: b.title, noname_name: b.noname_name, res_limit: b.res_limit,
+            local_rules_html: b.local_rules_html,
+          },
+          res: b.res || [],
+          pending: [],                       // 互換面はセッションレス(送信中概念なし)。
+          compat_bbs_port: b.compat_bbs_port,
+          thread: b.thread || null,
+        };
+      }
+      const res = await fetch('/api/v1/livechat/threads/' + board);
+      if (!res.ok) return { ok: false };
+      const d = await res.json();
+      d.ok = true;
+      return d;
     }
 
     async function renderHome() {
@@ -383,7 +423,9 @@
           ? '<span class="badge-local">[自板]</span>'
           : '<span class="badge-remote">[他ノード]</span>';
         // 自板はそのまま板ページへ。他ノード板は join(常駐セッション起動)してから板ページへ。
-        const link = t.is_local
+        // 互換オリジン(視聴者スコープ)では join を行わず、いずれも板ページへの直リンクにする
+        // (boards.json は既に自ノードが参加中の板を列挙しているため — FR-023b/c)。
+        const link = (t.is_local || ON_COMPAT)
           ? `<a href="#/board/${encodeURIComponent(t.board_id)}">${escHtml(t.title)}</a>`
           : `<a href="#" class="join-link" data-b="${escHtml(t.board_id)}">${escHtml(t.title)}</a>`;
         li.innerHTML = `${badge} ${link} ` +
@@ -429,7 +471,7 @@
       const threads = await fetchThreads() ?? [];
       const summary = threads.find(t => t.board_id === board) || null;
 
-      const res = await fetch('/api/v1/livechat/threads/' + board);
+      const d = await loadBoardDetail(board);
       const titleEl = document.getElementById('board-title');
       const badgeEl = document.getElementById('board-badge');
       const idEl = document.getElementById('board-idlabel');
@@ -446,7 +488,7 @@
       badgeEl.innerHTML = isLocal
         ? '<span class="badge-local">自板</span>' : '<span class="badge-remote">他ノード板</span>';
 
-      if (!res.ok) {
+      if (!d.ok) {
         titleEl.textContent = summary ? summary.title : board;
         rulesWrap.hidden = true;
         urlWrap.hidden = true;
@@ -457,7 +499,6 @@
         document.getElementById('board-retry').addEventListener('click', () => renderBoard(board));
         return;
       }
-      const d = await res.json();
       statusEl.textContent = '';
       titleEl.textContent = d.settings.title || (summary ? summary.title : board);
 
@@ -479,15 +520,17 @@
       }
 
       // スレ一覧: この板の現行スレ(1 行)。{連番}: {タイトル} ({確定レス数})。
-      const key = summary ? String(summary.generation) : '1';
+      // 世代は板詳細(互換 board.json は thread.generation)を優先し、無ければ summary から。
+      const key = String((d.thread && d.thread.generation) || (summary && summary.generation) || 1);
       const li = document.createElement('li');
       li.innerHTML = `<a href="#/thread/${encodeURIComponent(board)}/${encodeURIComponent(key)}">` +
         `${escHtml(d.settings.title || (summary ? summary.title : board))}</a> ` +
         `<span class="rescount">(${d.res.length})</span>`;
       listEl.appendChild(li);
 
-      // 新規スレ作成欄(自板のみ — 掲載チャンネルへ open_thread する)。
-      if (summary && summary.is_local && summary.channel) {
+      // 新規スレ作成欄(自板のみ — 掲載チャンネルへ open_thread する)。互換オリジン(視聴者
+      // スコープ)では開設導線を出さない(FR-023b)。
+      if (!ON_COMPAT && summary && summary.is_local && summary.channel) {
         newWrap.hidden = false;
         // >>1 本文欄に固定 >>1 テンプレをプリフィル(FR-014a。未設定なら空 = 開設時は
         // サーバのシステム既定テンプレが >>1 になる — 空 >>1 は生じない)。
@@ -517,8 +560,9 @@
         newWrap.hidden = true;
       }
 
-      // 板管理セクション(FR-006a/FR-006b — 自板のみ。スレの有無に依存しない)。
-      if (isLocal) {
+      // 板管理セクション(FR-006a/FR-006b — 自板のみ。スレの有無に依存しない)。互換オリジン
+      // (視聴者スコープ)では板設定編集・BAN 一覧を出さない(ホストの http_bind UI 専用 — FR-023b)。
+      if (isLocal && !ON_COMPAT) {
         manageWrap.hidden = false;
         // 板設定フォームへ現在値を反映(編集はスレ非依存でここから行う)。
         document.getElementById('s-title').value = d.settings.title || '';
@@ -615,17 +659,16 @@
       const threads = await fetchThreads() ?? [];
       current.summary = threads.find(t => t.board_id === board) || current.summary;
 
-      const res = await fetch('/api/v1/livechat/threads/' + board);
+      const d = await loadBoardDetail(board);
       const listEl = document.getElementById('res-list');
       const titleEl = document.getElementById('thread-title');
       const badgeEl = document.getElementById('thread-badge');
-      if (!res.ok) {
+      if (!d.ok) {
         titleEl.textContent = current.summary ? current.summary.title : board;
         badgeEl.innerHTML = '';
         listEl.innerHTML = '<div class="muted">まだ取得できていません。「更新」を押してください。</div>';
         return;
       }
-      const d = await res.json();
       titleEl.textContent = d.settings.title || (current.summary ? current.summary.title : board);
       badgeEl.innerHTML = (current.summary && current.summary.is_local)
         ? '<span class="badge-local">自板</span>' : '<span class="badge-remote">他ノード板</span>';
@@ -759,11 +802,16 @@
       const body = document.getElementById('w-body').value;
       const st = document.getElementById('write-status');
       if (!body) { st.textContent = '本文を入力してください'; return; }
-      const r = await api('POST', `/livechat/threads/${current.board}/write`, {
-        name: document.getElementById('w-name').value || null,
-        mail: document.getElementById('w-mail').value || null,
-        body,
-      });
+      const name = document.getElementById('w-name').value || null;
+      const mail = document.getElementById('w-mail').value || null;
+      // 互換オリジンはトークンレスの write.json(実体は bbs.cgi と同一検証・採番 — FR-023a)。
+      // http_bind は既存の保護 API(トークン付き)。いずれも受理は 202。
+      const r = ON_COMPAT
+        ? await fetch('/' + encodeURIComponent(current.board) + '/write.json', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, mail, body }),
+          })
+        : await api('POST', `/livechat/threads/${current.board}/write`, { name, mail, body });
       if (r.status === 202) {
         st.textContent = '送信しました(送信中 → 確定を待ちます)';
         document.getElementById('w-body').value = '';
@@ -826,15 +874,29 @@
       if (m) location.hash = '#/board/' + m[1];
     }
 
+    // 互換オリジン(視聴者スコープ)ではホスト管理導線を DOM から隠す(FR-023b)。チャンネル
+    // 選択・スレ開設(home)・スレ操作・モデレーション(thread)は互換面に対応する API を持たない。
+    function applyCompatViewerScope() {
+      if (!ON_COMPAT) return;
+      for (const id of ['home-open-wrap', 'thread-ops-wrap', 'thread-mod-wrap']) {
+        const el = document.getElementById(id);
+        if (el) el.hidden = true;
+      }
+    }
+
     window.addEventListener('hashchange', route);
+    applyCompatViewerScope();
     bootstrapHashFromPath();
     (async () => {
       try { await loadToken(); } catch (_) {}
-      // 供給元未配線・機能無効の検知(一覧が取得できないケースを軽く提示)。
-      try {
-        const probe = await fetch('/api/v1/livechat/threads');
-        if (!probe.ok) document.getElementById('disabled-banner').hidden = false;
-      } catch (_) { document.getElementById('disabled-banner').hidden = false; }
+      // 供給元未配線・機能無効の検知(一覧が取得できないケースを軽く提示)。互換オリジンは
+      // /api/v1 を持たないため probe を行わない(boards.json 経路で判定する)。
+      if (!ON_COMPAT) {
+        try {
+          const probe = await fetch('/api/v1/livechat/threads');
+          if (!probe.ok) document.getElementById('disabled-banner').hidden = false;
+        } catch (_) { document.getElementById('disabled-banner').hidden = false; }
+      }
       await route();
     })();
   </script>

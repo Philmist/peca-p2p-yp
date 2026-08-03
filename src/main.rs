@@ -561,6 +561,7 @@ async fn run() -> Result<(), i32> {
                             peca_p2p_yp::web::compat::RATE_LIMIT_PER_SEC,
                         )),
                         enforce_lan_source: compat_lan,
+                        compat_bbs_port: Some(compat_addr.port()),
                     };
                     // LAN 公開に成功した起動時、面ごとに SecurityEvent を 1 件記録する
                     // (ADR-0015 決定 6 — bind 成功後・非 loopback のときのみ)。

@@ -210,6 +210,7 @@ fn lan_compat_state() -> CompatState {
             Box::new(|| 1_000),
         )),
         enforce_lan_source: true,
+        compat_bbs_port: Some(7183),
     }
 }
 
