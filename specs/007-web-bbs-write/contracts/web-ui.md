@@ -135,15 +135,69 @@
 | リクエスト(互換ポート) | 応答 | 文字コード | 用途 |
 |--------------------------|------|-----------|------|
 | `GET /{board}/`(末尾スラッシュのみ・ファイル名なし) | 旧来 BBS UI の板ページ(HTML)。`{board}` を初期表示板として開く | UTF-8 | Web ブラウザ |
+| `GET /boards.json` | 板一覧(§7.1) | UTF-8 JSON | ブラウザ SPA |
+| `GET /{board}/board.json` | 板詳細(§7.2 — 視聴者向け最小) | UTF-8 JSON | ブラウザ SPA |
+| `POST /{board}/write.json` | レス書き込み(§7.3 — トークンレス) | UTF-8 JSON | ブラウザ SPA |
 | `GET /{board}/subject.txt` | スレ一覧(既存) | Shift_JIS | 専ブラ |
 | `GET /{board}/dat/{key}.dat` | レス取得(既存) | Shift_JIS | 専ブラ |
 | `POST /{board}/bbs.cgi`(相当) | 書き込み(既存) | Shift_JIS | 専ブラ |
 
 - ブラウザ向け HTML は Web UI(`http_bind`)と**同一の `include_str!` 資産**を用い、板ページ・
-  スレページが互換ポート上で自己完結する(板詳細/書き込み等の JSON API も同一オリジンで到達)
+  スレページが互換ポート上で自己完結する。データ経路は**互換名前空間の JSON**(§7.1〜§7.3)で
+  提供し、**トークン保護 API 面(`/api/v1`)は互換リスナーへ一切生やさない**(FR-023a — 互換
+  リスナーの「`/api/v1` を物理的に持たない」不変条件の維持。research.md R13)
 - 専ブラ向けパス(`subject.txt` / `dat` / `bbs.cgi`)の応答・SJIS・検証は**一切変更しない**
 - 板ルート URL への HTTP リダイレクト(302 等)で他面の Web UI に飛ばしてはならない
-  (公開面ごとの独立オプトインの維持・同一 URL での自己完結 — FR-023、research.md R11)
+  (公開面ごとの独立オプトインの維持・同一 URL での自己完結 — FR-023、research.md R13)
+- 互換名前空間 JSON の 3 面はすべて既存の Host 検証 + 送信元 LAN 限定 + per-IP レート制限
+  ミドルウェアを共有する(保護は非緩和 — lan-exposure.md §4/§5 と同一水準)
+
+### 7.1 `GET /boards.json`(板一覧 — FR-023c)
+
+ホストする板 + 参加中(視聴)板を最小フィールドで列挙する。`tip` / `channel` / 内部状態は
+出さない。参加中板の露出は `compat_bbs_lan_consent` の意図の範囲として受容(ADR-0015 追補)。
+
+```jsonc
+[
+  { "board_id": "…64hex…", "title": "実況板", "res_count": 42, "is_local": true }
+]
+```
+
+### 7.2 `GET /{board}/board.json`(板詳細 — 視聴者向け最小 `CompatBoardView`・FR-023a)
+
+`http_bind` の板詳細(§5.1 `ThreadDetail`)から**視聴者に必要な最小のみ**を返す。板主設定
+(`first_post_template` / `first_post_pow_bits`)と送信中投稿(`pending`)は**含めない**
+(MUST NOT)。原文 `local_rules` は出さず安全 HTML 化済みの `local_rules_html` のみ。
+
+```jsonc
+{
+  "title": "実況板",
+  "noname_name": "名無しさん",
+  "res_limit": 1000,
+  "local_rules_html": "<h1>…</h1>",   // サーバ側で安全 HTML 化済み(§4)
+  "res": [ { "res_no": 1, "name": "…", "mail": "", "body": "…", "created_at": 0 } ],
+  "thread": { "generation": 1, "res_count": 42 },
+  "compat_bbs_port": 7183
+}
+```
+
+- 未知 board・未ホスト/未接続は定型 404(内部状態を開示しない)
+- 内容は「公開済み SJIS 読取(subject.txt/dat/SETTING.TXT/head.txt)の JSON 再エンコード」に
+  留め、新規のデータ種別・板鍵・秘密・トークン面を増やさない(FR-023a)
+
+### 7.3 `POST /{board}/write.json`(レス書き込み — トークンレス・FR-023a)
+
+トークンレス・board スコープ。リクエスト `{ "name": string?, "mail": string?, "body": string }`
+(`key` は取らない — ホストが現行スレへ採番)。書き込みの実体は専ブラ `bbs.cgi` と**同一の
+`submit`**(自板は採番、未知板は常駐セッション経由)で、板鍵署名・名前欄 `#` 除去・PoW・レート・
+サイズ上限・非開示(FR-022)を満たす。
+
+- `202`(受理 — BAN/PoW 不足/レート超過は非開示で受理扱い)/ `400`(本文空・サイズ超過等の形式違反)
+- Host 検証・送信元 LAN 限定・レート制限は他の互換面と同一に適用(非緩和)
+- **視聴者スコープ(FR-023b)**: ブラウザ SPA は互換オリジンでは開設/板設定/モデレーション/
+  BAN 一覧/チャンネル選択を提供しない(それらはホストの `http_bind` UI 専用)。SPA は配信
+  オリジン(`/{board}/` パス配信)を検出して読取=board.json・一覧=boards.json・書込=write.json に
+  分岐する(同一資産のまま)
 
 ## 8. 受け入れ対応
 
@@ -159,3 +213,6 @@
 | FR-006a/b(板設定は板ページ・モデレーションはスレページ・BAN 一覧は板ページ) | §2.5、§3.7 |
 | FR-014a(新規スレ >>1 のプリフィル・上書き) | §2.4、§5.3 |
 | FR-023(互換ポートのブラウザ向け板ページ) | §7 |
+| FR-023a(互換名前空間 JSON・`/api/v1` 非露出) | §7.1/§7.2/§7.3 |
+| FR-023b(互換=視聴者スコープ・ホスト管理除外) | §7.3 注記 |
+| FR-023c(boards.json はホスト板+参加中板を列挙) | §7.1 |

@@ -52,6 +52,33 @@ contracts/fixed-first-post.md §3.5。
 **別扱い(実装バグ・仕様漏れではない)**: 板一覧のコピーボタンがブラウザで動作しない件は
 クリップボード操作の実装不具合として GitHub Issue 起票(spec/plan には含めない)。
 
+### Clarifications 2026-08-03 追補(FR-023 自己完結 / T050 の設計判断)
+
+FR-023(互換ポートのブラウザ向け板ページ)の実装中に判明した設計課題を確定した(spec
+Session 2026-08-03 追補・FR-023a/b/c)。板ページ HTML は配信できるが、**互換リスナーは
+トークン保護 `/api/v1` を物理的に持たない不変条件**(`src/web/compat/` — トークン保護 API
+露出の故障モードを構造的に排除)のため、SPA のデータ経路が互換ポート上で到達できず「自己
+完結」が成立しない、という課題への設計解。いずれも表現層 + 互換ルータのパス追加で、006 の
+P2P・検証・鍵体系は不変。設計根拠は research.md R13、契約は contracts/web-ui.md §7、公開面の
+受容露出は ADR-0015 追補。
+
+1. **FR-023a(互換名前空間 JSON)**: `/api/v1` を互換面に生やさず、互換名前空間の JSON で
+   自己完結させる。`GET /{board}/board.json`(視聴者向け最小ペイロード `CompatBoardView` —
+   pending・板主設定=固定 >>1 テンプレ/PoW ビットを含めない)、`GET /boards.json`(板一覧)、
+   `POST /{board}/write.json`(トークンレス・board スコープ)。書込の実体は既存 bbs.cgi の
+   `submit`(自板採番 → 未知板は常駐セッション経由)と**同一**で FR-022 を満たす。新 JSON
+   読取は「公開済み SJIS 読取(subject/dat/SETTING/head)の JSON 再エンコード」に留める。
+2. **FR-023b(視聴者スコープ)**: 互換オリジンでは閲覧・レス書込・板横断ブラウズのみ。ホスト
+   管理(開設・板設定・モデレーション・BAN 一覧・チャンネル選択)は非表示(http_bind 専用)。
+   Web UI は単一資産のまま、配信オリジン(`/{board}/` パス配信=互換)を実行時検出して分岐。
+3. **FR-023c(boards.json の列挙範囲)**: ホスト板 + 参加中(視聴)板の両方を列挙。参加板の
+   LAN トークンレス露出は実況公開(`compat_bbs_lan_consent`)意図の範囲で受容(ADR-0015 追補)。
+   列挙は最小フィールド(board_id・title・res_count・is_local)、tip/channel/内部状態は出さない。
+
+**保護面の位置づけ**: 互換の新 3 エンドポイントは既存の host_guard + source_guard(LAN 限定)+
+rate_limit ミドルウェアを共有する。`/api/v1` を生やさないため「トークン保護 API 非露出」の
+不変条件は字義でも精神でも維持される(Principle II)。
+
 ## Technical Context
 
 **Language/Version**: Rust(edition 2024、stable toolchain)
@@ -124,6 +151,26 @@ contracts/fixed-first-post.md の検証同一性(通常書き込みと同じ kin
 
 新たな違反・複雑性の追加なし(Complexity Tracking 追記不要)。
 
+**Post-Design 再評価**(Clarifications 2026-08-03 追補 FR-023a/b/c 反映後): PASS を維持。
+
+- **I / II(最重要)**: 互換面に追加する 3 エンドポイントは**トークン保護 `/api/v1` を生やさず**、
+  互換名前空間(`/{board}/board.json`・`/boards.json`・`/{board}/write.json`)に閉じる。
+  これにより「互換リスナーはトークン保護 API を物理的に持たない」不変条件が維持され、経路
+  フィルタ由来の保護 API 露出という故障モードを増やさない。読取は公開済み SJIS 読取の JSON
+  再エンコードに留め(board.json は pending・板主設定を除外)、書込は既存 bbs.cgi の submit と
+  同一検証(FR-022)。3 面とも既存 host_guard + source_guard(LAN 限定・`to_canonical()` 正規化)
+  + rate_limit を共有し保護は非緩和。**受容する残存リスク**: `boards.json` が自ノードの参加中
+  (視聴)板を LAN のトークンレス面へ列挙する点(FR-023c)— 実況公開意図の範囲として ADR-0015
+  追補に受容判断を明記する(Principle I の明示的リスク受容)。
+- **III**: 追加は互換ルータへのパス追加 + 既存 `bbs_cgi::submit`/スナップショット合成の再利用 +
+  UI の実行時分岐で、新規モジュール・新規並行処理なし。
+- **IV**: FR-023a(board.json/boards.json 形状・write.json 受理)は contract テスト、視聴者
+  スコープ(FR-023b)・列挙範囲(FR-023c)は contract/実機(quickstart V-4)で検証する。
+- **V(対象外)**: 新規の並行アルゴリズム・状態機械なし。判断は不変。
+
+新たな違反なし。受容リスク(boards.json の視聴板露出)は ADR-0015 追補で記録する
+(Complexity Tracking ではなくリスク受容の記録)。
+
 ## Project Structure
 
 ### Documentation (this feature)
@@ -161,9 +208,14 @@ src/
 └── web/
     ├── mod.rs           # [変更] allowed_hosts 生成の LAN 対応、板詳細 API への
     │                    #   compat_bbs_port 追加
-    ├── livechat.rs      # [変更] スレ開設 API に任意 first_post_override(FR-014a)
+    ├── livechat.rs      # [変更] スレ開設 API に任意 first_post_override(FR-014a)、
+    │                    #   BAN 一覧取得 list_bans(FR-006b)。CompatBoardView 生成の共有ロジック
     └── compat/mod.rs    # [変更] CompatState.allowed_hosts の LAN 対応・送信元検証、
-                         #   板ルート URL `.../{board}/` のブラウザ向け HTML 配信(FR-023・R11)
+                         #   板ルート URL `.../{board}/` のブラウザ向け HTML 配信(FR-023)、
+                         #   互換名前空間 JSON: board.json / boards.json / write.json(FR-023a/b/c・R13)
+ui/
+└── livechat.html        # [変更] 配信オリジン検出(ON_COMPAT)で読取/一覧/書込経路とホスト管理
+                         #   導線の表示を分岐(FR-023b)。互換面は board.json/boards.json/write.json 使用
 
 ui/
 └── livechat.html        # [全面刷新] 旧来スキン(板ページ + スレページ、ハッシュ

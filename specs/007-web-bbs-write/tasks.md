@@ -52,7 +52,7 @@ US3 = 固定 >>1)。すべて P1 だが各ストーリーは独立に実装・�
 ### Tests for User Story 1(先に書き、失敗を確認)⚠️
 
 - [X] T004 [P] [US1] contract テスト追加: 板詳細 API(`GET /api/v1/livechat/threads/{board}`)レスポンスに `compat_bbs_port`(互換 API 有効時はポート番号・無効時は null)が含まれることを tests/contract/local_api.rs に追加し、失敗を確認する(contracts/web-ui.md §5.1)
-- [ ] T039 [P] [US1] FR-005(安全描画)の自動テスト追加(/speckit-analyze C1 対応): tests/features/safe_rendering.feature に Gherkin を追加し対応ステップを cucumber ハーネスに実装する — (a) ローカルルール Markdown への `<script>`/生 HTML 注入が板設定 API の `local_rules_html` で無害化される(既存の src/web/livechat.rs:759-873 単体テストを統合面から補完)、(b) レス本文・名前・固定 >>1 テンプレに HTML/スクリプトを含めても API 応答はプレーンテキストのまま往復し、サーバ側で HTML 化されない。クライアント側エスケープ(T008/T009 の描画)は実機確認 T012 で検証済みのため、その検証範囲の判断と根拠を ADR-0015(T035)に記録する(憲法 Principle IV: セキュリティ要件の Gherkin + 自動テスト)
+- [X] T039 [P] [US1] FR-005(安全描画)の自動テスト追加(/speckit-analyze C1 対応): tests/features/safe_rendering.feature に Gherkin を追加し対応ステップを cucumber ハーネスに実装する — (a) ローカルルール Markdown への `<script>`/生 HTML 注入が板設定 API の `local_rules_html` で無害化される(既存の src/web/livechat.rs:759-873 単体テストを統合面から補完)、(b) レス本文・名前・固定 >>1 テンプレに HTML/スクリプトを含めても API 応答はプレーンテキストのまま往復し、サーバ側で HTML 化されない。クライアント側エスケープ(T008/T009 の描画)は実機確認 T012 で検証済みのため、その検証範囲の判断と根拠を ADR-0015(T035)に記録する(憲法 Principle IV: セキュリティ要件の Gherkin + 自動テスト)
 
 ### Implementation for User Story 1
 
@@ -215,12 +215,50 @@ contracts/web-ui.md §1/§2.4/§2.5/§3.7/§5.3/§7 と contracts/fixed-first-po
 **⚠️ テスト先行(憲法 Principle IV — MUST)**: T041/T043 は対応実装(T042/T044/T045)より先に
 書き、失敗を確認してから実装する。
 
-- [ ] T041 [P] FR-023 の contract/integration テストを追加し失敗を確認する per FR-023 (missing) — 互換ポート(`src/web/compat/`)への `GET /{board}/`(末尾スラッシュのみ)が旧来 BBS UI の板ページ HTML(`text/html; charset=UTF-8`)を返し、`GET /{board}/subject.txt` は従来どおり Shift_JIS を返す(専ブラ向けパス非干渉)ことを tests/contract/compat_bbs.rs(または新規)に追加(contracts/web-ui.md §7)
-- [ ] T042 FR-023 を実装する per FR-023 (missing) — `src/web/compat/mod.rs` の `routes()` に `/{board}/` ルートを追加し、既存 Web UI(`ui/livechat.html`)の `include_str!` 資産を UTF-8 の HTML として配信する(`{board}` を初期表示板として開く)。専ブラ向け `subject.txt`/`dat`/`bbs.cgi` の応答・SJIS・検証は変更しない。他面へのリダイレクトはしない。T041 をパスさせる(research.md R11、contracts/web-ui.md §7)
-- [ ] T043 [P] FR-014a の contract/cucumber テストを追加し失敗を確認する per FR-014a (missing) — スレ開設 API の任意 `first_post_override` について (a) 指定時にそのスレの >>1 が override 本文で確定、(b) override は板設定 `first_post_template` を変更せず次スレ・別スレに波及しない、(c) 上限超過(>2048 文字/>32 行)は 400 — を tests/contract/local_api.rs と tests/features/fixed_first_post.feature(contracts/fixed-first-post.md §4 の追加 2 シナリオ)へ追加(fixed-first-post.md §3.5)
-- [ ] T044 FR-014a の開設 API・registry 配線を実装する per FR-014a (missing) — `src/web/livechat.rs` のスレ開設ハンドラに任意 `first_post_override`(string、検証は固定テンプレと同一)を受け付け、`src/livechat/registry.rs` の `open_thread` の >>1 生成へ「override があればそれ、なければ板設定テンプレ、空なら既定テンプレ」の優先順で渡す。override は当該スレ限りで永続テンプレを変更しない(MUST NOT)。T043 をパスさせる(contracts/web-ui.md §5.3、fixed-first-post.md §3.5)
-- [ ] T045 [US1] FR-014a の UI を実装する per FR-014a (missing) — `ui/livechat.html` の新規スレ作成欄(現状 `164-171`・タイトルのみ)に >>1 本文入力欄を追加し、板詳細 API の `settings.first_post_template`(未設定時は既定テンプレ相当)を既定値としてプリフィル、開設 POST に `first_post_override` を付与する。未編集時は空 >>1 を生じさせない(contracts/web-ui.md §2.4)
-- [ ] T046 [US1] FR-006a の板設定導線を板ページへ移設する per FR-006a (partial) — `ui/livechat.html` の板設定編集(現状スレページ `222-231`)を板ページ(view-board)の板管理セクション(`<details>`)へ移し、スレ非依存で編集可能にする(スレ 0 件でも可)。あわせて設定フォームと PUT(現状 `724-730` は `first_post_template` 未送信)に**固定 >>1 テンプレ**編集欄を追加する。スレページからは板設定編集を外す(モデレーション実行はスレページに残す)(contracts/web-ui.md §2.5/§3.7)
-- [ ] T047 FR-006b の BAN 一覧取得経路を追加する per FR-006b (missing) — `src/web/livechat.rs`(および `LivechatDirectory`/adapter)に現行 BAN(板鍵 BAN・接続 BAN)の**一覧取得**経路を追加する(現状は ban/unban 実行系のみ・`680-728`)。応答は Principle II の定型化を維持(内部情報を漏らさない)。契約に無い新規 API 形は最小限とし、対応する contract/unit テストを先に追加して失敗を確認する
-- [ ] T048 [US1] FR-006b の BAN 一覧 UI を追加する per FR-006b (missing) — `ui/livechat.html` の板ページ板管理セクションに、T047 の一覧取得を用いた BAN 済みエントリの一覧参照と解除(既存 unban/unconnban)導線を追加する。個別レスへの BAN **実行**はスレページ側に残す(contracts/web-ui.md §2.5)
+- [X] T041 [P] FR-023 の contract/integration テストを追加し失敗を確認する per FR-023 (missing) — 互換ポート(`src/web/compat/`)への `GET /{board}/`(末尾スラッシュのみ)が旧来 BBS UI の板ページ HTML(`text/html; charset=UTF-8`)を返し、`GET /{board}/subject.txt` は従来どおり Shift_JIS を返す(専ブラ向けパス非干渉)ことを tests/contract/compat_bbs.rs(または新規)に追加(contracts/web-ui.md §7)
+- [X] T042 FR-023 を実装する per FR-023 (missing) — `src/web/compat/mod.rs` の `routes()` に `/{board}/` ルートを追加し、既存 Web UI(`ui/livechat.html`)の `include_str!` 資産を UTF-8 の HTML として配信する(`{board}` を初期表示板として開く)。専ブラ向け `subject.txt`/`dat`/`bbs.cgi` の応答・SJIS・検証は変更しない。他面へのリダイレクトはしない。T041 をパスさせる(research.md R11、contracts/web-ui.md §7)
+- [X] T043 [P] FR-014a の contract/cucumber テストを追加し失敗を確認する per FR-014a (missing) — スレ開設 API の任意 `first_post_override` について (a) 指定時にそのスレの >>1 が override 本文で確定、(b) override は板設定 `first_post_template` を変更せず次スレ・別スレに波及しない、(c) 上限超過(>2048 文字/>32 行)は 400 — を tests/contract/local_api.rs と tests/features/fixed_first_post.feature(contracts/fixed-first-post.md §4 の追加 2 シナリオ)へ追加(fixed-first-post.md §3.5)
+- [X] T044 FR-014a の開設 API・registry 配線を実装する per FR-014a (missing) — `src/web/livechat.rs` のスレ開設ハンドラに任意 `first_post_override`(string、検証は固定テンプレと同一)を受け付け、`src/livechat/registry.rs` の `open_thread` の >>1 生成へ「override があればそれ、なければ板設定テンプレ、空なら既定テンプレ」の優先順で渡す。override は当該スレ限りで永続テンプレを変更しない(MUST NOT)。T043 をパスさせる(contracts/web-ui.md §5.3、fixed-first-post.md §3.5)
+- [X] T045 [US1] FR-014a の UI を実装する per FR-014a (missing) — `ui/livechat.html` の新規スレ作成欄(現状 `164-171`・タイトルのみ)に >>1 本文入力欄を追加し、板詳細 API の `settings.first_post_template`(未設定時は既定テンプレ相当)を既定値としてプリフィル、開設 POST に `first_post_override` を付与する。未編集時は空 >>1 を生じさせない(contracts/web-ui.md §2.4)
+- [X] T046 [US1] FR-006a の板設定導線を板ページへ移設する per FR-006a (partial) — `ui/livechat.html` の板設定編集(現状スレページ `222-231`)を板ページ(view-board)の板管理セクション(`<details>`)へ移し、スレ非依存で編集可能にする(スレ 0 件でも可)。あわせて設定フォームと PUT(現状 `724-730` は `first_post_template` 未送信)に**固定 >>1 テンプレ**編集欄を追加する。スレページからは板設定編集を外す(モデレーション実行はスレページに残す)(contracts/web-ui.md §2.5/§3.7)
+- [X] T047 FR-006b の BAN 一覧取得経路を追加する per FR-006b (missing) — `src/web/livechat.rs`(および `LivechatDirectory`/adapter)に現行 BAN(板鍵 BAN・接続 BAN)の**一覧取得**経路を追加する(現状は ban/unban 実行系のみ・`680-728`)。応答は Principle II の定型化を維持(内部情報を漏らさない)。契約に無い新規 API 形は最小限とし、対応する contract/unit テストを先に追加して失敗を確認する
+- [X] T048 [US1] FR-006b の BAN 一覧 UI を追加する per FR-006b (missing) — `ui/livechat.html` の板ページ板管理セクションに、T047 の一覧取得を用いた BAN 済みエントリの一覧参照と解除(既存 unban/unconnban)導線を追加する。個別レスへの BAN **実行**はスレページ側に残す(contracts/web-ui.md §2.5)
 - [ ] T049 [US1] FR-002a のナビゲーションリンクを実機で確認・是正する per FR-002a (partial) — `ui/livechat.html` は板一覧→自板(`366-367`)・スレ一覧→スレ(`460`)のアンカーを既に持つが、実機検証で遷移リンク欠落が報告された。再ビルド後に板一覧→自板・スレ一覧→スレの遷移が実機で機能することを確認し、条件描画等で欠落する経路があれば是正する(contracts/web-ui.md §1、quickstart V-1 手順 7)
+
+## Phase 8: Convergence(T041〜T048 実装中に判明した設計課題)
+
+- [ ] T050 FR-023 の「互換ポート上での SPA 自己完結」を成立させる per FR-023 (design-gap) —
+  T042 で `compat_bbs_bind` に `GET /{board}/`(HTML 配信)とクライアント側パス→板ルーティング
+  (`ui/livechat.html` `bootstrapHashFromPath`)を追加し、板ページ HTML は配信されるが、SPA の
+  データ経路(`/api/v1/token`・`/api/v1/livechat/threads/{board}` 等)は**互換リスナーが構造的に
+  持たない**(`src/web/compat/mod.rs` モジュール doc — 「本リスナーは `/api/v1` のルートを物理的に
+  持たない」= トークン保護 API 露出の故障モードを排除する設計不変条件)。このため互換ポートで板 URL を
+  ブラウザで開くと HTML は出るが板詳細/書き込みが読めず、contracts/web-ui.md §7・research R11 の
+  「互換ポート上で自己完結」を満たさない(quickstart V-4 手順 6 が失敗する見込み)。解決は互換リスナーへの
+  API 面追加を伴い**セキュリティモデルの決定(ADR-0015 追補)**が必要なため、実装前に設計判断を要する。
+  候補: (a) 互換リスナーへ**閲覧専用**の livechat JSON 読み取り面のみを慎重に限定公開し書き込みは
+  bbs.cgi 経由に寄せる、(b) ブラウザ板ページ用に別系統の読み取り経路を設ける、(c) FR-023 の
+  「自己完結」要件自体を再クラリファイする。**この課題の Issue 起票は feature 区切りで実施予定**
+  (ユーザー方針)。
+
+## Phase 9: Convergence(FR-023a/b/c — 互換名前空間 JSON による自己完結)
+
+> 注: T050 の設計判断は候補 **(b)+(c)** で確定(spec FR-023a/b/c・research R13・ADR-0015 決定 7)。
+> 以下 T051〜T056 がその実装分解であり、T050 の残作業を具体化・代替する(T050 は履歴として不変のまま残す)。
+
+**Purpose**: T050 の設計判断(spec FR-023a/b/c・research R13・ADR-0015 決定 7)を実装する。
+互換リスナーの「`/api/v1` を物理的に持たない」不変条件を維持したまま、互換名前空間 JSON で
+板ページ SPA を自己完結させる。表現層 + 互換ルータのパス追加のみで、006 の検証・鍵体系は不変。
+契約は contracts/web-ui.md §7.1/§7.2/§7.3、データ形は data-model.md「互換名前空間 JSON
+エンドポイント / CompatBoardView」。
+
+**⚠️ テスト先行(憲法 Principle IV — MUST)**: T051〜T053 は対応実装(T054)より先に書き、
+失敗を確認してから実装する。**T054 は `/api/v1` を互換ルータへ追加してはならない(MUST NOT —
+不変条件維持。Principle II)**。
+
+- [ ] T051 [P] FR-023a の contract テスト(board.json)を追加し失敗を確認する per FR-023a (missing) — 互換ポート `GET /{board}/board.json` が視聴者向け最小 `CompatBoardView`(title/noname_name/res_limit/local_rules_html/確定 res 列/thread{generation,res_count}/compat_bbs_port)を UTF-8 JSON で返し、`first_post_template`・`first_post_pow_bits`・`pending`・原文 `local_rules` を**含まない**こと、未知/未ホスト板は 404 であることを tests/contract/compat_bbs.rs に追加(contracts/web-ui.md §7.2)
+- [ ] T052 [P] FR-023c の contract テスト(boards.json)を追加し失敗を確認する per FR-023c (missing) — 互換ポート `GET /boards.json` がホスト板 + 参加中板を最小フィールド `{board_id,title,res_count,is_local}` で列挙し、tip/channel/内部状態を含まないことを tests/contract/compat_bbs.rs に追加(contracts/web-ui.md §7.1)
+- [ ] T053 [P] FR-023a の contract テスト(write.json)を追加し失敗を確認する per FR-023a (missing) — 互換ポート `POST /{board}/write.json`(トークンレス・`{name,mail,body}`・key 省略)が受理で 202、本文空/サイズ超過等の形式違反で 400 を返し、書き込みが既存 bbs.cgi と同一の採番経路で確定する(自板採番・未知板は常駐セッション)ことを tests/contract/compat_bbs.rs に追加(contracts/web-ui.md §7.3、FR-022)
+- [ ] T054 FR-023a/c を実装する per FR-023a (missing) — `src/web/compat/mod.rs` に `CompatBoardView` と 3 ルート(`GET /{board}/board.json`・`GET /boards.json`・`POST /{board}/write.json`)を追加する。board.json は `resolve_snapshot` から最小ビューを合成(pending・板主設定を除外)、boards.json は registry(ホスト板)+ manager(参加中板)を列挙、write.json は既存 `bbs_cgi::submit`(自板採番 → 未知板は `manager.write` フォールバック)を再利用し 202/400 を返す。3 面とも既存 host_guard + source_guard + rate_limit を共有。**`/api/v1` を互換ルータへ追加しない(MUST NOT)**。T051〜T053 をパスさせる(research R13、contracts/web-ui.md §7)
+- [ ] T055 [US2] FR-023b の SPA オリジン分岐を実装する per FR-023b (missing) — `ui/livechat.html` に配信オリジン検出(`ON_COMPAT` = pathname が `/{hex64}/`)を追加し、互換オリジンでは読取=`board.json`・一覧=`boards.json`・書込=`write.json` に経路を振り替え、ホスト管理導線(スレ開設・板設定編集・モデレーション実行・BAN 一覧・チャンネル選択・`/api/v1/token` 取得・disabled-banner probe)を非表示/無効化する。同一 `include_str!` 資産のまま実行時分岐(contracts/web-ui.md §7.3 注記、FR-023b)
+- [ ] T056 FR-023 の自己完結を実機確認する per FR-023 / quickstart V-4-6 (partial) — quickstart V-4 手順 6 に従い、別端末ブラウザで `http://{LAN}:7183/{board}/` を開き、スレ一覧・レス列が読み込まれる(board.json/boards.json)・レス書き込みが全端末で同一レス番号に確定する(write.json)・ホスト管理導線が非表示・開発者ツールで `/api/v1/...` 要求が発生しないことを確認して記録する(SC-002/SC-009)
