@@ -238,6 +238,19 @@ pub struct ThreadDetail {
     pub compat_bbs_port: Option<u16>,
 }
 
+/// 現行 BAN の一覧(007 FR-006b — 板管理セクションの BAN 一覧参照用)。
+///
+/// 板鍵 BAN・接続 BAN の**台帳の閲覧**専用ビュー(スレ非依存 — 板ページから到達)。個別の
+/// BAN/解除の**実行**は既存の ban/unban/connban/unconnban エンドポイント(スレページ起点)を用いる。
+/// 応答は当該板の BAN 対象(板鍵 hex / `ip:port`)の列挙のみで、内部状態は含めない(Principle II)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BanListView {
+    /// BAN 済み板鍵(pubkey hex)の一覧。
+    pub board_keys: Vec<String>,
+    /// ConnBan 済み接続元(`ip:port`)の一覧。
+    pub connections: Vec<String>,
+}
+
 /// 操作 API(変更系)の失敗理由(定型 — 内部情報を漏らさない Principle II)。
 ///
 /// HTTP へは [`Self::into_response`] で写像する。存在しない対象と未サポートは区別せず
@@ -325,6 +338,12 @@ pub struct OpenThreadRequest {
     /// 初期板設定(省略時は既定値)。
     #[serde(default)]
     pub settings: Option<BoardSettingsInput>,
+    /// 開設時の固定 >>1 上書き本文(007 FR-014a — 任意。contracts/web-ui.md §5.3)。
+    /// 指定時はそのスレの res_no=1 本文として板設定テンプレの代わりに用いる(そのスレ限り。
+    /// 板設定の永続テンプレは変更しない)。検証は固定テンプレと同一(≤2048 文字・≤32 行)、
+    /// 上限超過は 400。省略/空なら従来どおりテンプレ(未設定時はシステム既定)を用いる。
+    #[serde(default)]
+    pub first_post_override: Option<String>,
 }
 
 /// スレ開設の結果(開設できた自板の board_id と世代)。
@@ -402,6 +421,11 @@ pub trait LivechatDirectory: Send + Sync {
     /// 接続元 ConnBan 解除(T067)。既定は未サポート。
     fn unban_connection(&self, _board_id: &str, _addr: &str) -> Result<(), LivechatOpError> {
         Err(LivechatOpError::Unsupported)
+    }
+    /// 現行 BAN 一覧の取得(007 T047 — FR-006b)。自ノードがホストする板の板鍵 BAN・接続 BAN の
+    /// 台帳を返す。未知 board・他ノード板・未配線は `None`(404 に丸める — 内部状態を開示しない)。
+    fn list_bans(&self, _board_id: &str) -> Option<BanListView> {
+        None
     }
     /// 板鍵ローテーション(T067 — FR-017)。**視聴者自身**の当該板向け書き込み鍵を再生成し、
     /// 新しい公開鍵(hex)を返す(旧鍵は破棄。初回 PoW は次回書き込み時にクライアントが計算)。
@@ -508,6 +532,8 @@ pub(crate) fn routes() -> Router<AppState> {
             "/livechat/threads/{board_id}/unconnban",
             post(unban_connection),
         )
+        // BAN 一覧参照(007 T047 — FR-006b。板管理セクションから到達)。
+        .route("/livechat/threads/{board_id}/bans", get(list_bans))
         // 視聴者自身の板鍵ローテーション(T067 — FR-017)。
         .route(
             "/livechat/boards/{board_id}/rotate-key",
@@ -733,6 +759,20 @@ async fn unban_connection(
     match directory.unban_connection(&board_id, &body.target) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /api/v1/livechat/threads/{board_id}/bans` — 現行 BAN 一覧(T047 — FR-006b)。
+///
+/// 自ノードがホストする板の板鍵 BAN・接続 BAN の台帳を返す(スレ非依存 — 板管理から到達)。
+/// 未知 board・他ノード板・未配線は `not_found`(内部状態を開示しない — Principle II)。
+async fn list_bans(State(state): State<AppState>, Path(board_id): Path<String>) -> Response {
+    let Some(directory) = state.livechat_directory.as_ref() else {
+        return not_wired();
+    };
+    match directory.list_bans(&board_id) {
+        Some(view) => Json(view).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "not_found"),
     }
 }
 
@@ -1207,6 +1247,7 @@ mod tests {
             channel_id: channel_id.to_string(),
             title: None,
             settings: None,
+            first_post_override: None,
         }
     }
 

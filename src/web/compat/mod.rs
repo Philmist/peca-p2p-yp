@@ -18,6 +18,15 @@
 //! リモート板の書き込み(bbs.cgi)は常駐セッション経由で RES を送る(FR-028 — 通常経路と同一)。
 //! 参加者セッションは前世代を保持しないため、リモート板の dat は現行世代のみ(旧世代 key は 404)。
 //!
+//! ## ブラウザ向け板ページ(007 FR-023 — [`board_page`])
+//!
+//! 専ブラ向けパスに加えて `GET /{board}/`(末尾スラッシュのみ)で旧来 BBS UI(Web UI と
+//! 同一の `include_str!` 資産・UTF-8 HTML)を配信する。専ブラ向け `subject.txt`/`dat`/`bbs.cgi`
+//! の応答・SJIS・検証は不変で、他面(`http_bind`)への HTTP リダイレクトは行わない(MUST NOT —
+//! 公開面ごとの独立オプトイン維持・同一 URL での自己完結。contracts/web-ui.md §7・research R11)。
+//! なお本リスナーは依然 `/api/v1` を持たないため、板ページ SPA のデータ経路の互換ポート到達性は
+//! 設計課題として別途整理する(tasks T050)。
+//!
 //! ## 保護層(FR-026)
 //!
 //! 1. **Host 検証**: `127.0.0.1[:port]` / `localhost[:port]` 以外は定型 403
@@ -139,6 +148,10 @@ fn session_view_to_snapshot(board: &str, view: &SessionView) -> Option<BoardSnap
 /// 互換 API 専用リスナーのルーター(T052)。`/api/v1`・静的アセットは物理的に持たない。
 pub fn routes(state: CompatState) -> Router {
     Router::new()
+        // ブラウザ向け板ページ(007 FR-023 — contracts/web-ui.md §7)。専ブラ向けパスと
+        // 同一ポート・同一パス上でパスにより振り分ける(末尾スラッシュのみ = ブラウザ)。
+        // 他面(http_bind)へはリダイレクトしない。
+        .route("/{board}/", get(board_page))
         .route("/{board}/subject.txt", get(subject_txt))
         .route("/{board}/SETTING.TXT", get(setting_txt))
         .route("/{board}/head.txt", get(head_txt))
@@ -255,6 +268,28 @@ fn text_response(text: &str) -> Response {
 fn html_response(html: &str) -> Response {
     let body = sjis::encode(html);
     ([(header::CONTENT_TYPE, CONTENT_TYPE_HTML)], body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// FR-023: ブラウザ向け板ページ(007 — contracts/web-ui.md §7 / research R11)
+// ---------------------------------------------------------------------------
+
+/// 旧来 BBS UI(Web UI と同一の `include_str!` 資産)。互換ポートでブラウザ向け板ページを
+/// 配信するために `http_bind`(`src/web/mod.rs`)と**同一のバイト列**を埋め込む。
+const LIVECHAT_HTML: &str = include_str!("../../../ui/livechat.html");
+
+/// `GET /{board}/`(末尾スラッシュのみ)— ブラウザ向け板ページ(FR-023)。
+///
+/// 専ブラ向けパス(`subject.txt`/`dat`/`bbs.cgi`)と**同一ポート・同一パス上でパスにより
+/// 振り分けて**旧来 BBS UI(HTML・UTF-8)を配信する。他面(`http_bind`)への HTTP リダイレクトは
+/// 行わない(MUST NOT — 公開面ごとの独立オプトイン維持・同一 URL での自己完結。research R11)。
+/// SPA は `location.pathname`(`/{board}/`)から初期表示板を解決する(ハッシュ空時)。
+async fn board_page(Path(_board): Path<String>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        LIVECHAT_HTML,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

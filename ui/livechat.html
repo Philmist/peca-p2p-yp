@@ -165,9 +165,36 @@
             <label for="nt-title">タイトル</label>
             <input id="nt-title" type="text" size="36" placeholder="実況スレ">
           </div>
+          <div class="row"><label for="nt-firstpost">&gt;&gt;1 本文</label></div>
+          <div class="row">
+            <textarea id="nt-firstpost" rows="4" placeholder="スレ頭(&gt;&gt;1)の本文。固定テンプレをプリフィル。今回だけ上書きできます"></textarea>
+          </div>
           <div class="row">
             <button id="nt-btn">作成</button>
             <span id="nt-status" class="muted"></span>
+          </div>
+        </details>
+
+        <!-- 板管理(FR-006a/FR-006b — スレ非依存。板設定編集 + BAN 一覧管理) -->
+        <details id="board-manage-wrap" hidden>
+          <summary>板管理(配信者)</summary>
+          <div class="manage-sec">
+            <h4 style="margin:0.4rem 0 0.2rem;">板設定</h4>
+            <div class="row"><label for="s-title">タイトル</label><input id="s-title" type="text" size="40"></div>
+            <div class="row"><label for="s-noname">名無し名</label><input id="s-noname" type="text" size="24"></div>
+            <div class="row"><label for="s-reslimit">レス上限</label><input id="s-reslimit" type="number" min="100" max="4000"></div>
+            <div class="row"><label for="s-pow">初回PoW</label><input id="s-pow" type="number" min="0" max="32"></div>
+            <div class="row"><label for="s-rules">ルール</label></div>
+            <div class="row"><textarea id="s-rules" rows="4" placeholder="ローカルルール(Markdown)"></textarea></div>
+            <div class="row"><label for="s-firstpost">固定 &gt;&gt;1 テンプレ</label></div>
+            <div class="row"><textarea id="s-firstpost" rows="4" placeholder="スレ頭(&gt;&gt;1)の定型文。次スレから反映"></textarea></div>
+            <div class="row"><button id="settings-btn">設定を保存</button> <span id="settings-status" class="muted"></span></div>
+          </div>
+          <div class="manage-sec">
+            <h4 style="margin:0.6rem 0 0.2rem;">BAN 一覧</h4>
+            <div id="banlist-status" class="muted"></div>
+            <ul id="banlist" class="banlist"></ul>
+            <div class="muted">個別レスへの NG/BAN の実行はスレページから行います。</div>
           </div>
         </details>
       </div>
@@ -209,6 +236,8 @@
         </div>
       </details>
 
+      <!-- 個別レスのモデレーション実行はスレページ起点(FR-006b)。板設定・BAN 一覧管理は
+           板ページの板管理セクション(FR-006a)へ移設した。 -->
       <details>
         <summary>モデレーション(配信者)</summary>
         <div class="row"><label for="ban-key">板鍵 BAN</label>
@@ -217,17 +246,7 @@
         <div class="row"><label for="connban-addr">接続 BAN</label>
           <input id="connban-addr" type="text" size="24" placeholder="ip:port">
           <button id="connban-btn">ConnBan</button><button id="unconnban-btn">解除</button></div>
-      </details>
-
-      <details>
-        <summary>板設定を変更(配信者)</summary>
-        <div class="row"><label for="s-title">タイトル</label><input id="s-title" type="text" size="40"></div>
-        <div class="row"><label for="s-noname">名無し名</label><input id="s-noname" type="text" size="24"></div>
-        <div class="row"><label for="s-reslimit">レス上限</label><input id="s-reslimit" type="number" min="100" max="4000"></div>
-        <div class="row"><label for="s-pow">初回PoW</label><input id="s-pow" type="number" min="0" max="32"></div>
-        <div class="row"><label for="s-rules">ルール</label></div>
-        <div class="row"><textarea id="s-rules" rows="4" placeholder="ローカルルール(Markdown)"></textarea></div>
-        <div class="row"><button id="settings-btn">設定を保存</button> <span id="settings-status" class="muted"></span></div>
+        <div class="muted">BAN 済みの一覧参照・解除は板ページの「板管理」から行えます。</div>
       </details>
     </section>
   </div>
@@ -243,6 +262,7 @@
     let token = null;
     let pollTimer = null;           // スレページの 8 秒ポーリング(FR-006)
     let current = null;             // { board, key, showAll, res, resByNo, maxResNo, summary }
+    let boardView = null;           // 板ページの現在板 { board, isLocal }(板管理の PUT/BAN 対象)
 
     async function loadToken() {
       const res = await fetch('/api/v1/token');
@@ -418,9 +438,12 @@
       const listEl = document.getElementById('thread-list');
       const statusEl = document.getElementById('board-status');
       const newWrap = document.getElementById('newthread-wrap');
+      const manageWrap = document.getElementById('board-manage-wrap');
       listEl.innerHTML = '';
       idEl.textContent = shortId(board);
-      badgeEl.innerHTML = (summary && summary.is_local)
+      const isLocal = !!(summary && summary.is_local);
+      boardView = { board, isLocal };
+      badgeEl.innerHTML = isLocal
         ? '<span class="badge-local">自板</span>' : '<span class="badge-remote">他ノード板</span>';
 
       if (!res.ok) {
@@ -428,6 +451,7 @@
         rulesWrap.hidden = true;
         urlWrap.hidden = true;
         newWrap.hidden = true;
+        manageWrap.hidden = true;
         statusEl.innerHTML = 'まだ取得できていません。' +
           '<button id="board-retry">再取得</button>';
         document.getElementById('board-retry').addEventListener('click', () => renderBoard(board));
@@ -465,6 +489,9 @@
       // 新規スレ作成欄(自板のみ — 掲載チャンネルへ open_thread する)。
       if (summary && summary.is_local && summary.channel) {
         newWrap.hidden = false;
+        // >>1 本文欄に固定 >>1 テンプレをプリフィル(FR-014a。未設定なら空 = 開設時は
+        // サーバのシステム既定テンプレが >>1 になる — 空 >>1 は生じない)。
+        document.getElementById('nt-firstpost').value = d.settings.first_post_template || '';
         const btn = document.getElementById('nt-btn');
         btn.onclick = async () => {
           const title = document.getElementById('nt-title').value;
@@ -472,7 +499,12 @@
           // channel は "30311:<pubkey>:<guid>" 形式。open_thread は d タグ(guid)を要求する。
           const parts = summary.channel.split(':');
           const channel_id = parts[parts.length - 1];
-          const r = await api('POST', '/livechat/threads', { channel_id, title: title || null });
+          // >>1 上書き(FR-014a): 入力があればそのスレ限りで上書き。空なら null で
+          // 送りサーバ側テンプレ(未設定時は既定)に委ねる。上書きは板設定を変更しない。
+          const fp = document.getElementById('nt-firstpost').value;
+          const r = await api('POST', '/livechat/threads', {
+            channel_id, title: title || null, first_post_override: fp.trim() ? fp : null,
+          });
           if (r.status === 201) {
             const j = await r.json();
             st.textContent = '作成しました';
@@ -484,6 +516,73 @@
       } else {
         newWrap.hidden = true;
       }
+
+      // 板管理セクション(FR-006a/FR-006b — 自板のみ。スレの有無に依存しない)。
+      if (isLocal) {
+        manageWrap.hidden = false;
+        // 板設定フォームへ現在値を反映(編集はスレ非依存でここから行う)。
+        document.getElementById('s-title').value = d.settings.title || '';
+        document.getElementById('s-noname').value = d.settings.noname_name || '';
+        document.getElementById('s-reslimit').value = d.settings.res_limit || 1000;
+        document.getElementById('s-pow').value = d.settings.first_post_pow_bits ?? 20;
+        document.getElementById('s-rules').value = d.settings.local_rules || '';
+        document.getElementById('s-firstpost').value = d.settings.first_post_template || '';
+        await loadBanList(board);
+      } else {
+        manageWrap.hidden = true;
+      }
+    }
+
+    // --- 板管理: 板設定保存(FR-006a — スレ非依存。固定 >>1 テンプレを含む)---
+    document.getElementById('settings-btn').addEventListener('click', async () => {
+      if (!boardView) return;
+      const st = document.getElementById('settings-status');
+      const r = await api('PUT', `/livechat/threads/${boardView.board}/settings`, {
+        title: document.getElementById('s-title').value,
+        noname_name: document.getElementById('s-noname').value,
+        res_limit: parseInt(document.getElementById('s-reslimit').value, 10),
+        local_rules: document.getElementById('s-rules').value,
+        first_post_pow_bits: parseInt(document.getElementById('s-pow').value, 10),
+        first_post_template: document.getElementById('s-firstpost').value,
+      });
+      if (r.status === 204) { st.textContent = '保存しました'; renderBoard(boardView.board); }
+      else st.textContent = 'エラー: ' + r.status;
+    });
+
+    // --- 板管理: BAN 一覧の参照・解除(FR-006b — 台帳はスレ非依存)---
+    async function loadBanList(board) {
+      const statusEl = document.getElementById('banlist-status');
+      const listEl = document.getElementById('banlist');
+      listEl.innerHTML = '';
+      const r = await fetch('/api/v1/livechat/threads/' + board + '/bans');
+      if (!r.ok) { statusEl.textContent = 'BAN 一覧を取得できません'; return; }
+      const d = await r.json();
+      const keys = d.board_keys ?? [];
+      const conns = d.connections ?? [];
+      if (keys.length === 0 && conns.length === 0) {
+        statusEl.textContent = 'BAN 済みのエントリはありません。';
+        return;
+      }
+      statusEl.textContent = '';
+      for (const k of keys) listEl.appendChild(banRow('板鍵', k, 'unban', board));
+      for (const c of conns) listEl.appendChild(banRow('接続', c, 'unconnban', board));
+    }
+
+    // BAN 一覧の 1 行(種別ラベル + 対象 + 解除ボタン)。解除は既存 unban/unconnban を用いる。
+    function banRow(label, target, path, board) {
+      const li = document.createElement('li');
+      const span = document.createElement('span');
+      span.textContent = `[${label}] ${target}`;
+      const btn = document.createElement('button');
+      btn.textContent = '解除';
+      btn.addEventListener('click', async () => {
+        const r = await api('POST', `/livechat/threads/${board}/${path}`, { target });
+        if (r.status === 204) { await loadBanList(board); } else alert('解除に失敗: ' + r.status);
+      });
+      li.appendChild(span);
+      li.appendChild(document.createTextNode(' '));
+      li.appendChild(btn);
+      return li;
     }
 
     function boardUrl(board, port) {
@@ -540,12 +639,8 @@
         current.resByNo[r.res_no] = r;
         if (r.res_no > current.maxResNo) current.maxResNo = r.res_no;
       }
-      // 設定フォームへ現在値を反映。
-      document.getElementById('s-title').value = d.settings.title || '';
-      document.getElementById('s-noname').value = d.settings.noname_name || '';
-      document.getElementById('s-reslimit').value = d.settings.res_limit || 1000;
-      document.getElementById('s-pow').value = d.settings.first_post_pow_bits ?? 20;
-      document.getElementById('s-rules').value = d.settings.local_rules || '';
+      // 板設定編集は板ページの板管理セクション(FR-006a)へ移設したため、スレページでは
+      // 設定フォームへの反映を行わない。
 
       renderResList();
     }
@@ -717,25 +812,22 @@
     document.getElementById('unconnban-btn').addEventListener('click', () =>
       moderate('unconnban', { target: document.getElementById('connban-addr').value }, 'ConnBan 解除しました'));
 
-    // --- 板設定変更 ---
-    document.getElementById('settings-btn').addEventListener('click', async () => {
-      if (!current) return;
-      const st = document.getElementById('settings-status');
-      const r = await api('PUT', `/livechat/threads/${current.board}/settings`, {
-        title: document.getElementById('s-title').value,
-        noname_name: document.getElementById('s-noname').value,
-        res_limit: parseInt(document.getElementById('s-reslimit').value, 10),
-        local_rules: document.getElementById('s-rules').value,
-        first_post_pow_bits: parseInt(document.getElementById('s-pow').value, 10),
-      });
-      if (r.status === 204) { st.textContent = '保存しました'; refreshThread(); }
-      else st.textContent = 'エラー: ' + r.status;
-    });
+    // 板設定編集・BAN 一覧管理は板ページの板管理セクション(FR-006a/FR-006b)へ移設した。
 
     // =====================================================================
     // 起動
     // =====================================================================
+    // 互換ポートのブラウザ向け板ページ(FR-023): `/{board}/` で配信された場合、ハッシュが
+    // 空なら pathname から板を解決して板ページへ初期遷移する(他面へリダイレクトしない・
+    // 同一 URL で自己完結)。http_bind の `/livechat.html`(pathname にボードなし)では作動しない。
+    function bootstrapHashFromPath() {
+      if (location.hash) return;
+      const m = location.pathname.match(/^\/([0-9a-fA-F]{64})\/$/);
+      if (m) location.hash = '#/board/' + m[1];
+    }
+
     window.addEventListener('hashchange', route);
+    bootstrapHashFromPath();
     (async () => {
       try { await loadToken(); } catch (_) {}
       // 供給元未配線・機能無効の検知(一覧が取得できないケースを軽く提示)。

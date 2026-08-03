@@ -152,6 +152,74 @@ async fn loopback_host_variants_are_accepted() {
 }
 
 // ---------------------------------------------------------------------------
+// FR-023: 互換ポートのブラウザ向け板ページ(contracts/web-ui.md §7)
+// ---------------------------------------------------------------------------
+
+/// `GET /{board}/`(末尾スラッシュのみ)は旧来 BBS UI の板ページ HTML を UTF-8 で返す。
+/// 専ブラ向けパス(subject.txt 等)へのリダイレクトではなく、同一ポート・同一パスで HTML を配信する。
+#[tokio::test]
+async fn board_root_slash_serves_html_board_page_utf8() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(&state, &persona, BoardSettings::default());
+    let app = routes(state);
+    let resp = app
+        .oneshot(get_req(&format!("/{board_id}/"), Some(GOOD_HOST)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        content_type, "text/html; charset=utf-8",
+        "ブラウザ向けは UTF-8 HTML"
+    );
+    // 他面(http_bind)へのリダイレクトではない(2xx・Location なし)。
+    assert!(
+        resp.headers().get(header::LOCATION).is_none(),
+        "他面へリダイレクトしない"
+    );
+    let html = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        html.contains("id=\"view-board\""),
+        "旧来 BBS UI の板ページ HTML を配信する"
+    );
+}
+
+/// `/{board}/` の追加は専ブラ向け `subject.txt`(Shift_JIS)を一切変えない(非干渉)。
+#[tokio::test]
+async fn board_root_does_not_interfere_with_subject_txt_sjis() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(&state, &persona, BoardSettings::default());
+    let app = routes(state);
+    let resp = app
+        .oneshot(get_req(
+            &format!("/{board_id}/subject.txt"),
+            Some(GOOD_HOST),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        content_type, "text/plain; charset=Shift_JIS",
+        "専ブラ向けは従来どおり SJIS"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // subject.txt(スレ一覧)
 // ---------------------------------------------------------------------------
 

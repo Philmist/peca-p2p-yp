@@ -1164,7 +1164,7 @@ mod fixed_first_post {
         )
         .unwrap();
         let board_key = Keys::generate();
-        reg.arm_first_post(&board_id, board_key.clone(), 1_700_000_001)
+        reg.arm_first_post(&board_id, board_key.clone(), None, 1_700_000_001)
             .unwrap();
         (board_id, channel, board_key)
     }
@@ -1189,6 +1189,53 @@ mod fixed_first_post {
             first.board_key,
             board_key.public_key().to_hex(),
             ">>1 はホスト板鍵で署名される"
+        );
+    }
+
+    /// 開設時 >>1 上書き(FR-014a)はそのスレの res_no=1 のみに効き、板設定の永続テンプレを
+    /// 変更しない。次スレ移行は上書きを持ち越さず投稿時点のテンプレを用いる(§3.5)。
+    #[test]
+    fn open_override_applies_to_this_thread_only_and_next_uses_template() {
+        let reg = LivechatRegistry::new(128);
+        let persona = Keys::generate();
+        let board_id = persona.public_key().to_hex();
+        let channel = format!("30311:{board_id}:{GUID}");
+        reg.open_thread(
+            persona,
+            channel.clone(),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            BoardSettings {
+                first_post_template: "既定案内".into(),
+                ..Default::default()
+            },
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let board_key = Keys::generate();
+        // 開設時上書きを付けて arm する。
+        reg.arm_first_post(
+            &board_id,
+            board_key.clone(),
+            Some("今回だけの案内".into()),
+            1_700_000_001,
+        )
+        .unwrap();
+
+        // (a) このスレの res_no=1 は上書き本文。
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.active.res[0].body, "今回だけの案内");
+        // (b) 板設定の永続テンプレは変更されない(MUST NOT)。
+        assert_eq!(snap.settings.first_post_template, "既定案内");
+
+        // (c) 次スレ移行では上書きを持ち越さず、その時点の板設定テンプレを用いる。
+        reg.start_next_generation(&board_id, 1_700_000_100, "実況スレ".to_string())
+            .unwrap();
+        let snap2 = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(
+            snap2.active.res[0].body, "既定案内",
+            "次スレの >>1 は板設定テンプレ(上書きは 1 回限り)"
         );
     }
 
@@ -1333,7 +1380,7 @@ mod fixed_first_post {
             "198.51.100.1:7147",
         )
         .unwrap();
-        reg.arm_first_post(&board_id, Keys::generate(), 1_700_000_001)
+        reg.arm_first_post(&board_id, Keys::generate(), None, 1_700_000_001)
             .unwrap();
         let snap = reg.board_snapshot(&board_id).unwrap();
         assert_eq!(

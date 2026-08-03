@@ -1531,3 +1531,195 @@ async fn put_first_post_template_over_limit_is_400() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "上限超過は 400");
 }
+
+// ---------------------------------------------------------------------------
+// スレ開設 API の first_post_override(T043 — FR-014a /
+// contracts/web-ui.md §5.3 / fixed-first-post.md §3.5)
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::web::livechat::{OpenThreadRequest, OpenThreadResult};
+
+/// 開設時上書きの検証を行う最小フェイク供給元(T043 — 実アダプタと同一の写像で
+/// override を sanitize → validate し、上限超過は Invalid(400)。捕捉した override を記録する)。
+struct OpenOverrideDirectory {
+    captured: Mutex<Option<Option<String>>>,
+}
+
+impl LivechatDirectory for OpenOverrideDirectory {
+    fn threads(&self) -> Vec<ThreadSummary> {
+        Vec::new()
+    }
+    fn thread(&self, _board_id: &str) -> Option<ThreadDetail> {
+        None
+    }
+    fn next_thread(&self, _board_id: &str) -> Option<u32> {
+        None
+    }
+    fn close_thread(&self, _board_id: &str) -> bool {
+        false
+    }
+    fn open_thread(&self, req: OpenThreadRequest) -> Result<OpenThreadResult, LivechatOpError> {
+        // 実アダプタ(src/main.rs)と同一: override があれば sanitize → validate、上限超過は 400。
+        let override_body = match req.first_post_override {
+            Some(o) => {
+                let s = peca_p2p_yp::livechat::thread::sanitize_first_post_body(&o);
+                peca_p2p_yp::livechat::thread::validate_first_post_body(&s)
+                    .map_err(|_| LivechatOpError::Invalid)?;
+                Some(s)
+            }
+            None => None,
+        };
+        *self.captured.lock().unwrap() = Some(override_body);
+        Ok(OpenThreadResult {
+            board_id: "ab".repeat(32),
+            generation: 1,
+        })
+    }
+}
+
+fn open_override_state() -> (AppState, Arc<OpenOverrideDirectory>) {
+    let (security, _p, _d) = temp_security_log();
+    let dir = Arc::new(OpenOverrideDirectory {
+        captured: Mutex::new(None),
+    });
+    let state = test_state(security).with_livechat_directory(dir.clone());
+    (state, dir)
+}
+
+/// JSON ボディ付き POST(トークン付き)。
+fn post_json(uri: &str, body: String) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::HOST, GOOD_HOST)
+        .header("X-Api-Token", TOKEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
+
+/// 上限内の first_post_override を付けた開設は受理される(201)。override が供給元へ渡る。
+#[tokio::test]
+async fn open_with_valid_first_post_override_is_accepted() {
+    let (state, dir) = open_override_state();
+    let body = serde_json::json!({
+        "channel_id": "cd".repeat(16),
+        "first_post_override": "今回だけの案内\nよろしく"
+    })
+    .to_string();
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(post_json("/api/v1/livechat/threads", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "上限内 override は 201");
+    assert_eq!(
+        *dir.captured.lock().unwrap(),
+        Some(Some("今回だけの案内\nよろしく".to_string())),
+        "override が供給元へ渡る"
+    );
+}
+
+/// 2048 文字を超える first_post_override は 400(検証は固定テンプレと同一)。
+#[tokio::test]
+async fn open_with_over_limit_first_post_override_is_400() {
+    let (state, _dir) = open_override_state();
+    let too_long: String = "あ".repeat(2049);
+    let body = serde_json::json!({
+        "channel_id": "cd".repeat(16),
+        "first_post_override": too_long
+    })
+    .to_string();
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(post_json("/api/v1/livechat/threads", body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "上限超過 override は 400"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BAN 一覧参照 API(T047 — FR-006b / contracts/web-ui.md §2.5)
+// ---------------------------------------------------------------------------
+
+use peca_p2p_yp::web::livechat::BanListView;
+
+/// BAN 台帳を返す最小フェイク供給元(自板のみ Some、他は None = 404)。
+struct BanDirectory {
+    board_id: String,
+}
+
+impl LivechatDirectory for BanDirectory {
+    fn threads(&self) -> Vec<ThreadSummary> {
+        Vec::new()
+    }
+    fn thread(&self, _board_id: &str) -> Option<ThreadDetail> {
+        None
+    }
+    fn next_thread(&self, _board_id: &str) -> Option<u32> {
+        None
+    }
+    fn close_thread(&self, _board_id: &str) -> bool {
+        false
+    }
+    fn list_bans(&self, board_id: &str) -> Option<BanListView> {
+        (board_id == self.board_id).then(|| BanListView {
+            board_keys: vec!["ab".repeat(32)],
+            connections: vec!["192.168.1.9:7147".to_string()],
+        })
+    }
+}
+
+fn ban_state(board_id: &str) -> AppState {
+    let (security, _p, _d) = temp_security_log();
+    test_state(security).with_livechat_directory(Arc::new(BanDirectory {
+        board_id: board_id.to_string(),
+    }))
+}
+
+/// 自板の BAN 一覧は板鍵 BAN・接続 BAN を列挙して返す(200)。
+#[tokio::test]
+async fn list_bans_returns_board_keys_and_connections() {
+    let board_id = "cd".repeat(32);
+    let state = ban_state(&board_id);
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            &format!("/api/v1/livechat/threads/{board_id}/bans"),
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["board_keys"][0], "ab".repeat(32));
+    assert_eq!(json["connections"][0], "192.168.1.9:7147");
+}
+
+/// 未知 board(他ノード板・未ホスト)の BAN 一覧は 404(内部状態を開示しない)。
+#[tokio::test]
+async fn list_bans_unknown_board_is_404() {
+    let state = ban_state(&"cd".repeat(32));
+    let app = web::build_router(state);
+    let resp = app
+        .oneshot(build_request(
+            Method::GET,
+            &format!("/api/v1/livechat/threads/{}/bans", "ff".repeat(32)),
+            Some(GOOD_HOST),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

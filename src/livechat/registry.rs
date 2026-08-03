@@ -258,16 +258,28 @@ impl LivechatRegistry {
     /// (板設定 `first_post_template`。空ならシステム既定テンプレ)。PoW・レート・BAN の
     /// 検査は課さない(ホスト内部採番 — FR-016)。既に res があるスレでは呼ばない前提
     /// (開設直後のみ)。未知 board は [`RegistryError::UnknownBoard`]。
+    /// `first_post_override`(007 FR-014a)は開設リクエストの任意上書き本文。`Some(非空)` の
+    /// とき当該スレの res_no=1 本文として板設定テンプレの**代わりに**用いる(そのスレ限り。
+    /// 板設定の永続テンプレは変更しない — 次スレ移行は §3.1 のとおり投稿時点のテンプレを使う)。
+    /// `None`・空文字は従来どおりテンプレ(空ならシステム既定)へフォールバックする。上書き本文の
+    /// 検証・正規化(≤2048 文字・≤32 行・制御文字除去)は呼び出し側が済ませておくこと。
     pub fn arm_first_post(
         &self,
         board_id: &str,
         board_key: Keys,
+        first_post_override: Option<String>,
         created_at: u64,
     ) -> Result<u16, RegistryError> {
         let mut hosts = lock(&self.hosts);
         let entry = hosts.get_mut(board_id).ok_or(RegistryError::UnknownBoard)?;
         entry.host_board_key = Some(board_key.clone());
-        Self::confirm_first_post_locked(board_id, entry, &board_key, created_at)
+        Self::confirm_first_post_locked(
+            board_id,
+            entry,
+            &board_key,
+            first_post_override.as_deref(),
+            created_at,
+        )
     }
 
     /// 固定 >>1 を現行スレの res_no=1 として確定・配布する内部ヘルパー(T031/T032)。
@@ -280,15 +292,24 @@ impl LivechatRegistry {
         board_id: &str,
         entry: &mut HostEntry,
         board_key: &Keys,
+        first_post_override: Option<&str>,
         created_at: u64,
     ) -> Result<u16, RegistryError> {
         let generation = entry.host.thread.generation;
         let channel = entry.host.thread.channel.clone();
-        let template = entry.host.settings.first_post_template.clone();
-        let body = if template.trim().is_empty() {
-            default_first_post_body(&entry.host.settings.title, &channel)
-        } else {
-            template
+        // 本文の優先順(007 FR-014a — fixed-first-post.md §3.2/§3.5): 開設時上書き(非空)>
+        // 板設定テンプレ(非空)> システム既定テンプレ。上書きはそのスレ限りで、板設定の
+        // 永続テンプレ(entry.host.settings.first_post_template)は書き換えない。
+        let body = match first_post_override {
+            Some(o) if !o.trim().is_empty() => o.to_string(),
+            _ => {
+                let template = entry.host.settings.first_post_template.clone();
+                if template.trim().is_empty() {
+                    default_first_post_body(&entry.host.settings.title, &channel)
+                } else {
+                    template
+                }
+            }
         };
         let res_event = sign_res(board_key, board_id, &channel, generation, &body, created_at)
             .map_err(RegistryError::Build)?;
@@ -465,6 +486,14 @@ impl LivechatRegistry {
         lock(&self.hosts)
             .get(board_id)
             .map(|e| e.banned_keys.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// ConnBan 済み接続元一覧(007 FR-006b — 板管理の BAN 一覧参照用)。未知 board は空。
+    pub fn banned_connections(&self, board_id: &str) -> Vec<String> {
+        lock(&self.hosts)
+            .get(board_id)
+            .map(|e| e.conn_banned.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -1034,7 +1063,9 @@ impl LivechatRegistry {
         //    テンプレを自動投稿する(変更は次スレから反映・遡及なし)。未登録(テスト等)は
         //    投稿しない(006 の採番セマンティクスを保つ)。時刻源は新スレ key(created_at)。
         if let Some(board_key) = entry.host_board_key.clone() {
-            Self::confirm_first_post_locked(board_id, entry, &board_key, new_key)?;
+            // 次スレ移行では開設時上書き(first_post_override)を持ち越さない(override は
+            // スレ開設 1 回限り — FR-014a)。その時点の板設定テンプレを用いる。
+            Self::confirm_first_post_locked(board_id, entry, &board_key, None, new_key)?;
         }
         Ok(new_generation)
     }

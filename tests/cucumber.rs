@@ -34,6 +34,8 @@ mod livechat;
 mod outbound_only;
 #[path = "steps/persona_selection.rs"]
 mod persona_selection;
+#[path = "steps/safe_rendering.rs"]
+mod safe_rendering;
 #[path = "steps/security.rs"]
 mod security;
 #[path = "steps/us1.rs"]
@@ -66,6 +68,8 @@ pub struct AppWorld {
     lan_exposure: Option<lan_exposure::LanExposureWorld>,
     /// 固定 >>1(007)シナリオの状態。各シナリオの Given で初期化する(T028)。
     fixed_first_post: Option<fixed_first_post::FixedFirstPostWorld>,
+    /// 安全描画(007 FR-005)シナリオの状態。各シナリオの Given で初期化する(T039)。
+    safe_rendering: Option<safe_rendering::SafeRenderingWorld>,
 }
 
 /// ステップの async 未来型は debug ビルドで巨大になり、Windows 既定の main スレッド

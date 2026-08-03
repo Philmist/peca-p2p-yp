@@ -59,8 +59,38 @@ fn open_and_arm(lw: &mut FixedFirstPostWorld) {
     )
     .unwrap();
     let board_key = Keys::generate();
-    reg.arm_first_post(&board_id, board_key.clone(), 1_700_000_001)
+    reg.arm_first_post(&board_id, board_key.clone(), None, 1_700_000_001)
         .unwrap();
+    lw.reg = Some(reg);
+    lw.board_id = Some(board_id);
+    lw.channel = Some(channel);
+    lw.board_key = Some(board_key);
+}
+
+/// 現在の `settings` で板を開設し、開設時上書き(FR-014a)を付けて >>1 を arm する。
+fn open_and_arm_with_override(lw: &mut FixedFirstPostWorld, override_body: &str) {
+    let reg = LivechatRegistry::new(128);
+    let persona = Keys::generate();
+    let board_id = persona.public_key().to_hex();
+    let channel = format!("30311:{board_id}:{GUID}");
+    reg.open_thread(
+        persona,
+        channel.clone(),
+        1,
+        1_700_000_000,
+        "実況スレ",
+        lw.settings.clone(),
+        "198.51.100.1:7147",
+    )
+    .unwrap();
+    let board_key = Keys::generate();
+    reg.arm_first_post(
+        &board_id,
+        board_key.clone(),
+        Some(override_body.to_string()),
+        1_700_000_001,
+    )
+    .unwrap();
     lw.reg = Some(reg);
     lw.board_id = Some(board_id);
     lw.channel = Some(channel);
@@ -148,6 +178,22 @@ async fn when_change_and_next(world: &mut AppWorld, new_template: String) {
 async fn when_validate(world: &mut AppWorld) {
     let lw = w(world);
     lw.validate_ok = Some(lw.settings.validate().is_ok());
+}
+
+#[when(regex = r#"^板主が first_post_override "(.*)" を付けてスレを開設する$"#)]
+async fn when_open_with_override(world: &mut AppWorld, override_body: String) {
+    let lw = w(world);
+    open_and_arm_with_override(lw, &override_body);
+}
+
+#[when("板主が 2048 文字を超える first_post_override を付けてスレを開設する")]
+async fn when_open_with_over_limit_override(world: &mut AppWorld) {
+    use peca_p2p_yp::livechat::thread::{sanitize_first_post_body, validate_first_post_body};
+    let lw = w(world);
+    // 実アダプタと同一: sanitize → validate。上限超過は拒否(開設は行わない)。
+    let over = "あ".repeat(FIRST_POST_TEMPLATE_MAX_CHARS + 1);
+    let s = sanitize_first_post_body(&over);
+    lw.validate_ok = Some(validate_first_post_body(&s).is_ok());
 }
 
 #[when("参加者が上限まで書き込む")]
@@ -254,5 +300,45 @@ async fn then_migrated_by_limit(world: &mut AppWorld) {
     assert_eq!(
         snap.active.generation, 2,
         ">>1 込みで上限到達 → 次スレへ移行"
+    );
+}
+
+// --- FR-014a: 開設時 >>1 上書き ---------------------------------------------
+
+#[then(regex = r#"^そのスレの res_no=1 は "(.*)" になる$"#)]
+async fn then_res_no_1_is(world: &mut AppWorld, expected: String) {
+    let lw = w(world);
+    assert_eq!(snap_active_res0_body(lw), expected, "上書き本文で確定する");
+}
+
+#[then(regex = r#"^板設定の first_post_template は "(.*)" のまま変わらない$"#)]
+async fn then_template_unchanged(world: &mut AppWorld, expected: String) {
+    let lw = w(world);
+    let reg = lw.reg.as_ref().unwrap();
+    let snap = reg.board_snapshot(lw.board_id.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        snap.settings.first_post_template, expected,
+        "上書きは板設定の永続テンプレを変更しない(MUST NOT)"
+    );
+}
+
+#[then(regex = r#"^次に上書きなしで開設したスレの >>1 は "(.*)" になる$"#)]
+async fn then_next_open_uses_template(world: &mut AppWorld, expected: String) {
+    let lw = w(world);
+    let reg = lw.reg.as_ref().unwrap();
+    let board_id = lw.board_id.clone().unwrap();
+    // 次スレ移行は上書きを持ち越さず、その時点の板設定テンプレを用いる(override は 1 回限り)。
+    reg.start_next_generation(&board_id, 1_700_001_000, "実況スレ")
+        .unwrap();
+    let snap = reg.board_snapshot(&board_id).unwrap();
+    assert_eq!(snap.active.res[0].body, expected, "次スレの >>1 はテンプレ");
+}
+
+#[then("上書きは検証エラーで拒否される")]
+async fn then_override_rejected(world: &mut AppWorld) {
+    assert_eq!(
+        w(world).validate_ok,
+        Some(false),
+        "上限超過 override は検証エラーで拒否される"
     );
 }

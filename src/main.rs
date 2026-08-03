@@ -39,8 +39,9 @@ use peca_p2p_yp::web::announced::{
     AnnouncedProvider, AnnouncedSummary, ClockSkewStatus, NodeStatusProvider, clock_skew_status,
 };
 use peca_p2p_yp::web::livechat::{
-    BoardSettingsInput, BoardSettingsView, LivechatDirectory, LivechatOpError, OpenThreadRequest,
-    OpenThreadResult, PendingResView, ResView, ThreadDetail, ThreadSummary, WriteInput,
+    BanListView, BoardSettingsInput, BoardSettingsView, LivechatDirectory, LivechatOpError,
+    OpenThreadRequest, OpenThreadResult, PendingResView, ResView, ThreadDetail, ThreadSummary,
+    WriteInput,
 };
 use peca_p2p_yp::web::{AppState, IndexLanStatus, build_index_router, build_router};
 
@@ -957,6 +958,18 @@ impl LivechatDirectory for LivechatAdapter {
             );
             LivechatOpError::Unavailable
         })?;
+        // 4.75 開設時の固定 >>1 上書き(007 FR-014a — 任意)。指定時は板設定テンプレと
+        //      同一の検証・正規化(≤2048 文字・≤32 行・制御文字除去)を通し、上限超過は 400。
+        //      そのスレの res_no=1 限りに効き、板設定の永続テンプレは変更しない。
+        let first_post_override = match req.first_post_override {
+            Some(o) => {
+                let s = peca_p2p_yp::livechat::thread::sanitize_first_post_body(&o);
+                peca_p2p_yp::livechat::thread::validate_first_post_body(&s)
+                    .map_err(|_| LivechatOpError::Invalid)?;
+                Some(s)
+            }
+            None => None,
+        };
         // 5. 開設(gen=1・key=現在秒)。channel は `30311:<persona>:<guid>`。
         let channel = format!("30311:{persona_pubkey}:{}", req.channel_id);
         let title = settings.title.clone();
@@ -964,10 +977,11 @@ impl LivechatDirectory for LivechatAdapter {
         self.registry
             .open_thread(persona, channel, 1, now, title, settings, tip)
             .map_err(|_| LivechatOpError::Invalid)?;
-        // 5.5 固定 >>1 の自動投稿を有効化し res_no=1 を確定する(007 T031/T033)。以後の
-        //     次スレ移行(自動・明示)でも同じ板鍵で >>1 が自動投稿される(registry が保持)。
+        // 5.5 固定 >>1 の自動投稿を有効化し res_no=1 を確定する(007 T031/T033)。開設時
+        //     上書きがあればそのスレの >>1 に用いる(FR-014a)。以後の次スレ移行(自動・明示)
+        //     では上書きを持ち越さず、その時点の板設定テンプレで自動投稿される(registry が保持)。
         self.registry
-            .arm_first_post(&persona_pubkey, board_key, now)
+            .arm_first_post(&persona_pubkey, board_key, first_post_override, now)
             .map_err(|_| LivechatOpError::Invalid)?;
         Ok(OpenThreadResult {
             board_id: persona_pubkey,
@@ -1016,6 +1030,16 @@ impl LivechatDirectory for LivechatAdapter {
 
     fn unban_connection(&self, board_id: &str, addr: &str) -> Result<(), LivechatOpError> {
         map_registry_bool(self.registry.unban_connection(board_id, addr))
+    }
+
+    fn list_bans(&self, board_id: &str) -> Option<BanListView> {
+        // 自ノードがホストする板のみ BAN 台帳を返す(他ノード板のモデレーションは権限外)。
+        // 未ホスト板は None(404 に丸める — 内部状態を開示しない。FR-006b / Principle II)。
+        self.registry.board_snapshot(board_id)?;
+        Some(BanListView {
+            board_keys: self.registry.banned_board_keys(board_id),
+            connections: self.registry.banned_connections(board_id),
+        })
     }
 
     fn rotate_board_key(&self, board_id: &str) -> Result<String, LivechatOpError> {

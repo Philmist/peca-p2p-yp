@@ -204,6 +204,25 @@ impl BoardSettings {
     }
 }
 
+/// 固定 >>1 の開設時上書き本文(`first_post_override`)を検証する(007 FR-014a —
+/// contracts/fixed-first-post.md §3.5)。板設定 `first_post_template` と**同一の値域**
+/// (≤ 2048 文字・≤ 32 行)。上限超過は既存のテンプレ検証エラーへ写像する(400 系)。
+pub fn validate_first_post_body(body: &str) -> Result<(), BoardSettingsError> {
+    if body.chars().count() > FIRST_POST_TEMPLATE_MAX_CHARS {
+        return Err(BoardSettingsError::FirstPostTemplateTooLong);
+    }
+    if body.lines().count() > FIRST_POST_TEMPLATE_MAX_LINES {
+        return Err(BoardSettingsError::FirstPostTemplateTooManyLines);
+    }
+    Ok(())
+}
+
+/// 固定 >>1 の開設時上書き本文を正規化する(改行(\n/\t)保持で他の制御文字を除去 —
+/// テンプレ [`BoardSettings::sanitized`] と同一規則)。
+pub fn sanitize_first_post_body(body: &str) -> String {
+    strip_control_chars_keep_markdown(body)
+}
+
 // ---------------------------------------------------------------------------
 // スレ状態(ThreadState)— data-model §スレ 状態遷移
 // ---------------------------------------------------------------------------
