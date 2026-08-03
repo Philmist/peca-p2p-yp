@@ -201,3 +201,26 @@ Task: T017 tests/features/lan_exposure.feature — Gherkin
 - 各タスク完了ごとに `cargo fmt -- --check` を通してからコミットする(プロジェクト CLAUDE.md)
 - src/main.rs は 3 ストーリーで競合するため、並列進行時はタスク単位で直列化する
 - 実機確認(T012/T024/T034)はユーザーの操作・確認が必要になりうる(特に 2 台構成の V-3/V-4)
+
+---
+
+## Phase 7: Convergence
+
+**Purpose**: Clarifications 2026-08-03(quickstart 実機検証で判明した UI/公開経路の要件漏れ)で
+追加された FR-002a / FR-006a / FR-006b / FR-014a / FR-023 のうち、現行コードで未達・部分実装の
+残作業を追補する。すべて表現層(Web UI / 互換ポートのルーティング)+ 開設 API の任意フィールド
+追加で、006 の P2P・順序確定・検証・鍵体系は不変。設計根拠は research.md R11/R12、契約は
+contracts/web-ui.md §1/§2.4/§2.5/§3.7/§5.3/§7 と contracts/fixed-first-post.md §3.5/§4。
+
+**⚠️ テスト先行(憲法 Principle IV — MUST)**: T041/T043 は対応実装(T042/T044/T045)より先に
+書き、失敗を確認してから実装する。
+
+- [ ] T041 [P] FR-023 の contract/integration テストを追加し失敗を確認する per FR-023 (missing) — 互換ポート(`src/web/compat/`)への `GET /{board}/`(末尾スラッシュのみ)が旧来 BBS UI の板ページ HTML(`text/html; charset=UTF-8`)を返し、`GET /{board}/subject.txt` は従来どおり Shift_JIS を返す(専ブラ向けパス非干渉)ことを tests/contract/compat_bbs.rs(または新規)に追加(contracts/web-ui.md §7)
+- [ ] T042 FR-023 を実装する per FR-023 (missing) — `src/web/compat/mod.rs` の `routes()` に `/{board}/` ルートを追加し、既存 Web UI(`ui/livechat.html`)の `include_str!` 資産を UTF-8 の HTML として配信する(`{board}` を初期表示板として開く)。専ブラ向け `subject.txt`/`dat`/`bbs.cgi` の応答・SJIS・検証は変更しない。他面へのリダイレクトはしない。T041 をパスさせる(research.md R11、contracts/web-ui.md §7)
+- [ ] T043 [P] FR-014a の contract/cucumber テストを追加し失敗を確認する per FR-014a (missing) — スレ開設 API の任意 `first_post_override` について (a) 指定時にそのスレの >>1 が override 本文で確定、(b) override は板設定 `first_post_template` を変更せず次スレ・別スレに波及しない、(c) 上限超過(>2048 文字/>32 行)は 400 — を tests/contract/local_api.rs と tests/features/fixed_first_post.feature(contracts/fixed-first-post.md §4 の追加 2 シナリオ)へ追加(fixed-first-post.md §3.5)
+- [ ] T044 FR-014a の開設 API・registry 配線を実装する per FR-014a (missing) — `src/web/livechat.rs` のスレ開設ハンドラに任意 `first_post_override`(string、検証は固定テンプレと同一)を受け付け、`src/livechat/registry.rs` の `open_thread` の >>1 生成へ「override があればそれ、なければ板設定テンプレ、空なら既定テンプレ」の優先順で渡す。override は当該スレ限りで永続テンプレを変更しない(MUST NOT)。T043 をパスさせる(contracts/web-ui.md §5.3、fixed-first-post.md §3.5)
+- [ ] T045 [US1] FR-014a の UI を実装する per FR-014a (missing) — `ui/livechat.html` の新規スレ作成欄(現状 `164-171`・タイトルのみ)に >>1 本文入力欄を追加し、板詳細 API の `settings.first_post_template`(未設定時は既定テンプレ相当)を既定値としてプリフィル、開設 POST に `first_post_override` を付与する。未編集時は空 >>1 を生じさせない(contracts/web-ui.md §2.4)
+- [ ] T046 [US1] FR-006a の板設定導線を板ページへ移設する per FR-006a (partial) — `ui/livechat.html` の板設定編集(現状スレページ `222-231`)を板ページ(view-board)の板管理セクション(`<details>`)へ移し、スレ非依存で編集可能にする(スレ 0 件でも可)。あわせて設定フォームと PUT(現状 `724-730` は `first_post_template` 未送信)に**固定 >>1 テンプレ**編集欄を追加する。スレページからは板設定編集を外す(モデレーション実行はスレページに残す)(contracts/web-ui.md §2.5/§3.7)
+- [ ] T047 FR-006b の BAN 一覧取得経路を追加する per FR-006b (missing) — `src/web/livechat.rs`(および `LivechatDirectory`/adapter)に現行 BAN(板鍵 BAN・接続 BAN)の**一覧取得**経路を追加する(現状は ban/unban 実行系のみ・`680-728`)。応答は Principle II の定型化を維持(内部情報を漏らさない)。契約に無い新規 API 形は最小限とし、対応する contract/unit テストを先に追加して失敗を確認する
+- [ ] T048 [US1] FR-006b の BAN 一覧 UI を追加する per FR-006b (missing) — `ui/livechat.html` の板ページ板管理セクションに、T047 の一覧取得を用いた BAN 済みエントリの一覧参照と解除(既存 unban/unconnban)導線を追加する。個別レスへの BAN **実行**はスレページ側に残す(contracts/web-ui.md §2.5)
+- [ ] T049 [US1] FR-002a のナビゲーションリンクを実機で確認・是正する per FR-002a (partial) — `ui/livechat.html` は板一覧→自板(`366-367`)・スレ一覧→スレ(`460`)のアンカーを既に持つが、実機検証で遷移リンク欠落が報告された。再ビルド後に板一覧→自板・スレ一覧→スレの遷移が実機で機能することを確認し、条件描画等で欠落する経路があれば是正する(contracts/web-ui.md §1、quickstart V-1 手順 7)
