@@ -426,9 +426,9 @@
         // 互換オリジン(視聴者スコープ)では join を行わず、いずれも板ページへの直リンクにする
         // (boards.json は既に自ノードが参加中の板を列挙しているため — FR-023b/c)。
         const link = (t.is_local || ON_COMPAT)
-          ? `<a href="#/board/${encodeURIComponent(t.board_id)}">${escHtml(t.title)}</a>`
-          : `<a href="#" class="join-link" data-b="${escHtml(t.board_id)}">${escHtml(t.title)}</a>`;
-        li.innerHTML = `${badge} ${link} ` +
+          ? `<a href="#/board/${encodeURIComponent(t.board_id)}">${badge} ${escHtml(t.title)}</a>`
+          : `<a href="#" class="join-link" data-b="${escHtml(t.board_id)}">${badge} ${escHtml(t.title)}</a>`;
+        li.innerHTML = `${link} ` +
           `<span class="muted">(${t.res_count} レス / ${escHtml(t.tip)})</span>`;
         list.appendChild(li);
       }
@@ -524,7 +524,7 @@
       const key = String((d.thread && d.thread.generation) || (summary && summary.generation) || 1);
       const li = document.createElement('li');
       li.innerHTML = `<a href="#/thread/${encodeURIComponent(board)}/${encodeURIComponent(key)}">` +
-        `${escHtml(d.settings.title || (summary ? summary.title : board))}</a> ` +
+        `${escHtml(d.settings.title || (summary ? (summary.title ? summary.title : "スレ") : board))}</a> ` +
         `<span class="rescount">(${d.res.length})</span>`;
       listEl.appendChild(li);
 
