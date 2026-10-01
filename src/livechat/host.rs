@@ -374,6 +374,46 @@ pub fn build_announce_for(
 }
 
 // ---------------------------------------------------------------------------
+// tip の導出(announce に載せるホスト接続先)
+// ---------------------------------------------------------------------------
+
+/// tip を導出できない理由([`derive_tip`])。配線側がログの `cause` に写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipError {
+    /// 自ノードの P2P が待受していない(`listen_port = 0`)。
+    NotListening,
+    /// チャンネルの tracker(配信元アドレス)が未確定(firewalled 等)。
+    TrackerUnknown,
+    /// tracker を `ip:port` として解釈できない。
+    TrackerUnparsable,
+    /// tracker の IP が loopback / unspecified で、他ノードから到達できない。
+    TrackerNotReachable,
+}
+
+/// tip(視聴者の接続先)を導出する — チャンネル tracker の IP + 自ノード P2P `listen_port`。
+///
+/// tracker の IP は配信クライアントが YP へ申告したもので、loopback 専用 YP の構成では
+/// クライアントが YP の返す `rip`(= `127.0.0.1`)を自分のアドレスとして採用することがある。
+/// loopback / unspecified の tip は**視聴者側では視聴者自身を指す**ため、announce に載せると
+/// 他ノードは板の存在だけ見えて中身を取得できない。開設の時点で拒否する。判定は v4-mapped
+/// (`::ffff:127.0.0.1`)を取りこぼさないよう正規化(`to_canonical`)してから行う。
+/// LAN 内アドレス(private)は LAN 内視聴の正当な用途があるため拒否しない。
+pub fn derive_tip(tracker: Option<&str>, listen_port: u16) -> Result<String, TipError> {
+    if listen_port == 0 {
+        return Err(TipError::NotListening);
+    }
+    let tracker = tracker.ok_or(TipError::TrackerUnknown)?;
+    let mut addr: std::net::SocketAddr =
+        tracker.parse().map_err(|_| TipError::TrackerUnparsable)?;
+    let ip = addr.ip().to_canonical();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err(TipError::TrackerNotReachable);
+    }
+    addr.set_port(listen_port);
+    Ok(addr.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // ワイヤアダプタ(判定結果 → Message)
 // ---------------------------------------------------------------------------
 
@@ -691,5 +731,53 @@ mod tests {
             WireMessage::ThreadReject { reason } => assert_eq!(reason, "full"),
             other => panic!("REJECT であるべき: {other:?}"),
         }
+    }
+
+    #[test]
+    fn derive_tip_replaces_port_with_p2p_listen_port() {
+        assert_eq!(
+            derive_tip(Some("198.51.100.1:7144"), 7148).as_deref(),
+            Ok("198.51.100.1:7148")
+        );
+        assert_eq!(
+            derive_tip(Some("[2001:db8::1]:7144"), 7148).as_deref(),
+            Ok("[2001:db8::1]:7148")
+        );
+        // LAN 内アドレスは LAN 内視聴の正当な用途があるため許す。
+        assert_eq!(
+            derive_tip(Some("192.168.1.10:7144"), 7148).as_deref(),
+            Ok("192.168.1.10:7148")
+        );
+    }
+
+    #[test]
+    fn derive_tip_rejects_addresses_unreachable_from_other_nodes() {
+        // 擬似 PeerCast クライアントが YP の rip(127.0.0.1)を自アドレスとして申告した事例。
+        for tracker in [
+            "127.0.0.1:7144",
+            "[::1]:7144",
+            "[::ffff:127.0.0.1]:7144",
+            "0.0.0.0:7144",
+            "[::]:7144",
+        ] {
+            assert_eq!(
+                derive_tip(Some(tracker), 7148),
+                Err(TipError::TrackerNotReachable),
+                "{tracker} は他ノードから到達できない"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_tip_reports_missing_inputs() {
+        assert_eq!(
+            derive_tip(Some("198.51.100.1:7144"), 0),
+            Err(TipError::NotListening)
+        );
+        assert_eq!(derive_tip(None, 7148), Err(TipError::TrackerUnknown));
+        assert_eq!(
+            derive_tip(Some("not-an-addr"), 7148),
+            Err(TipError::TrackerUnparsable)
+        );
     }
 }

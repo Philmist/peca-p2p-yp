@@ -554,6 +554,11 @@ impl Session {
         &mut self,
         message: Message,
     ) -> Result<Vec<SessionAction>, Disconnect> {
+        // keepalive(PING/PONG)は gossip と共通(thread-delivery.md §トランスポート)。
+        // gossip 専用ではないため 1 用途原則の対象外として委譲する。
+        if matches!(message, Message::Ping { .. } | Message::Pong { .. }) {
+            return Ok(vec![SessionAction::Deliver(message)]);
+        }
         if !is_thread_message(&message) {
             return self.fail_invalid_frame();
         }
@@ -568,6 +573,11 @@ impl Session {
             _ => {}
         }
         Ok(vec![SessionAction::Deliver(message)])
+    }
+
+    /// 本接続がスレ用途(最初のメッセージが THREAD_JOIN)に確定しているか。
+    pub fn is_thread(&self) -> bool {
+        self.kind == SessionKind::Thread
     }
 
     fn fail_invalid_frame(&mut self) -> Result<Vec<SessionAction>, Disconnect> {
@@ -838,6 +848,33 @@ mod tests {
         let err = s.on_frame(16, Message::GetPeers).unwrap_err();
         assert_eq!(err.category, Some(SecurityCategory::P2pInvalidFrame));
         assert_eq!(s.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn keepalive_in_thread_session_is_delivered_not_disconnected() {
+        // keepalive(PING/PONG)は gossip と共通。スレセッションでも不正フレームにしない
+        // (thread-delivery.md §トランスポート)。
+        let mut s = Session::new_inbound(cfg(1), "p:26".into(), None);
+        s.on_frame(64, hello(1, 3)).unwrap();
+        s.on_frame(
+            32,
+            Message::ThreadJoin {
+                thread: "board:1".into(),
+                challenge: "deadbeef".into(),
+                since_seq: 0,
+            },
+        )
+        .unwrap();
+        assert!(s.is_thread());
+        for msg in [Message::Ping { nonce: 1 }, Message::Pong { nonce: 2 }] {
+            let actions = s.on_frame(16, msg.clone()).unwrap();
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, SessionAction::Deliver(m) if *m == msg))
+            );
+        }
+        assert_eq!(s.state(), SessionState::Established);
     }
 
     #[test]

@@ -778,36 +778,36 @@ impl LivechatAdapter {
 
     /// tip を導出する(ユーザー確定方針 — チャンネル tracker の IP + 自ノード P2P listen_port)。
     ///
-    /// tracker 無し(firewalled で配信元アドレス不明)・P2P 待受無し(`listen_port=0`)は `None`
-    /// (視聴者が到達できるホストアドレスを提示できないため開設不可)。IPv4/IPv6 いずれも
-    /// [`SocketAddr`] パースで正しく port 差し替えする。
+    /// 判定本体は [`peca_p2p_yp::livechat::host::derive_tip`]。導出できない場合(P2P 待受無し・
+    /// tracker 未確定/不正・loopback 等の到達不能アドレス)は理由を warn して `None`
+    /// (視聴者が到達できるホストアドレスを提示できないため開設不可)。
     fn derive_tip(&self, tracker: Option<&str>) -> Option<String> {
-        if self.listen_port == 0 {
-            tracing::warn!(
-                target: "livechat",
-                cause = "p2p_not_listening",
-                "スレ開設不可: 自ノードの P2P が待受していません(listen_port=0)"
-            );
-            return None;
+        use peca_p2p_yp::livechat::host::{TipError, derive_tip};
+        match derive_tip(tracker, self.listen_port) {
+            Ok(tip) => Some(tip),
+            Err(e) => {
+                let (cause, message) = match e {
+                    TipError::NotListening => (
+                        "p2p_not_listening",
+                        "スレ開設不可: 自ノードの P2P が待受していません(listen_port=0)",
+                    ),
+                    TipError::TrackerUnknown => (
+                        "tracker_unknown",
+                        "スレ開設不可: チャンネルの tracker(配信元アドレス)が未確定です(firewalled 等)",
+                    ),
+                    TipError::TrackerUnparsable => (
+                        "tracker_unparsable",
+                        "スレ開設不可: チャンネルの tracker を接続先アドレスとして解釈できません",
+                    ),
+                    TipError::TrackerNotReachable => (
+                        "tracker_not_reachable",
+                        "スレ開設不可: チャンネルの tracker が loopback 等で他ノードから到達できません(配信クライアントのグローバルアドレス設定を確認してください)",
+                    ),
+                };
+                tracing::warn!(target: "livechat", cause, tracker = tracker.unwrap_or("<none>"), "{message}");
+                None
+            }
         }
-        let Some(tracker) = tracker else {
-            tracing::warn!(
-                target: "livechat",
-                cause = "tracker_unknown",
-                "スレ開設不可: チャンネルの tracker(配信元アドレス)が未確定です(firewalled 等)"
-            );
-            return None;
-        };
-        let Ok(mut addr) = tracker.parse::<SocketAddr>() else {
-            tracing::warn!(
-                target: "livechat",
-                cause = "tracker_unparsable",
-                "スレ開設不可: チャンネルの tracker を接続先アドレスとして解釈できません"
-            );
-            return None;
-        };
-        addr.set_port(self.listen_port);
-        Some(addr.to_string())
     }
 }
 

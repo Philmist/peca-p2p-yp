@@ -166,6 +166,12 @@ ADR-0005 の「設計制約の発見」と同じく、モデル作成の過程�
   チャンネルの tracker の IP + 自ノードの P2P `listen_port`」で合成する(利用者確定方針)。
   tracker 無し(firewalled)・P2P 待受無し(`listen_port=0`)は開設不可(視聴者へ到達
   アドレスを提示できないため — src/main.rs `LivechatAdapter::derive_tip`)。
+  **tracker の IP が loopback / unspecified の場合も開設不可**(2026-10-01 追記 —
+  src/livechat/host.rs `derive_tip`)。loopback 専用 YP は OLEH の `rip` に接続元
+  (`127.0.0.1`)を返すため、それを自アドレスとして採用する配信クライアントでは tracker が
+  `127.0.0.1` になる(擬似クライアントで実機確認。PeerCastStation は独自にグローバル
+  アドレスを得るため該当しない)。loopback の tip は視聴者側で視聴者自身を指し、板の存在だけ
+  見えて中身を取得できない状態になるため、announce に載せる前に拒否する。
 
 ## 6. SJIS 仮説の状態(T060 / T062 実機確認済み)
 

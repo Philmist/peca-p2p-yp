@@ -1390,3 +1390,133 @@ mod fixed_first_post {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// スレ接続の 1 用途原則と keepalive(実ランタイム — 生 TCP で観測)
+// ---------------------------------------------------------------------------
+
+mod thread_connection {
+    use super::*;
+
+    use peca_p2p_yp::p2p::frame::{Hello, Message, read_frame, write_frame};
+    use peca_p2p_yp::p2p::session::{FEATURE_LIVECHAT1, PROTOCOL_VERSION};
+    use tokio::net::TcpStream;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+    /// 32 バイト hex の固定チャレンジ(ホストは署名するだけで内容を問わない)。
+    const CHALLENGE: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// ホストへ生 TCP で接続し HELLO → HELLO_ACK まで進める(THREAD_JOIN は呼び出し側)。
+    async fn connect_hello(host: &LivechatHostNode) -> (OwnedReadHalf, OwnedWriteHalf) {
+        let stream = TcpStream::connect(host.listen_addr()).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        let hello = Message::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            listen_port: 0,
+            features: vec![FEATURE_LIVECHAT1.into()],
+            nonce: 0x7E57_0001,
+            ts: unix_now() as i64,
+        });
+        write_frame(&mut w, &hello).await.unwrap();
+        let ack = read_frame(&mut r).await.unwrap().unwrap();
+        assert!(
+            matches!(ack.message, Message::HelloAck(_)),
+            "HELLO_ACK が返るべき"
+        );
+        (r, w)
+    }
+
+    async fn send_join(host: &LivechatHostNode, w: &mut OwnedWriteHalf) {
+        let join = Message::ThreadJoin {
+            thread: format!("{}:1", host.board_id()),
+            challenge: CHALLENGE.into(),
+            since_seq: 0,
+        };
+        write_frame(w, &join).await.unwrap();
+    }
+
+    /// 次のフレームを `timeout` だけ待つ(届かなければ `None`、切断は `Some(None)`)。
+    async fn next_frame(r: &mut OwnedReadHalf, timeout: Duration) -> Option<Option<Message>> {
+        match tokio::time::timeout(timeout, read_frame(r)).await {
+            Err(_) => None,
+            Ok(Ok(Some(f))) => Some(Some(f.message)),
+            Ok(_) => Some(None),
+        }
+    }
+
+    /// HELLO_ACK 後・THREAD_JOIN 前に gossip の EVENT が伝搬しても、スレ接続には流れ込まない
+    /// (1 TCP = 1 用途 — 参加者は WELCOME/REJECT 以外が先に届くと JOIN 失敗扱いになる)。
+    #[tokio::test]
+    async fn thread_connection_does_not_receive_gossip_events() {
+        let host = LivechatHostNode::spawn(0xC001).await;
+        host.open_thread("実況スレ", livechat_settings_without_pow());
+        let (mut r, mut w) = connect_hello(&host).await;
+
+        // 用途未確定(JOIN 前)の接続へ向けて gossip 伝搬を起こす。
+        host.publish_announce(unix_now());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        send_join(&host, &mut w).await;
+
+        let first = next_frame(&mut r, Duration::from_secs(5))
+            .await
+            .expect("WELCOME が届くべき")
+            .expect("切断されないべき");
+        assert!(
+            matches!(first, Message::ThreadWelcome { .. }),
+            "JOIN への最初の応答は WELCOME であるべき: {}",
+            first.type_name()
+        );
+
+        // joined 後の gossip 伝搬もスレ接続へは流れない。
+        host.publish_announce(unix_now() + 1);
+        while let Some(Some(msg)) = next_frame(&mut r, Duration::from_millis(500)).await {
+            assert!(
+                !matches!(msg, Message::Event { .. }),
+                "スレ接続に gossip の EVENT が流れてはならない"
+            );
+        }
+    }
+
+    /// スレ接続でも keepalive(PING/PONG)は共通(thread-delivery.md §トランスポート)。
+    /// ホストは PING に PONG を返し、参加者の PONG で切断しない。
+    #[tokio::test]
+    async fn thread_connection_keepalive_ping_pong_is_accepted() {
+        let host = LivechatHostNode::spawn(0xC002).await;
+        host.open_thread("実況スレ", livechat_settings_without_pow());
+        let (mut r, mut w) = connect_hello(&host).await;
+        send_join(&host, &mut w).await;
+        let first = next_frame(&mut r, Duration::from_secs(5))
+            .await
+            .expect("WELCOME が届くべき")
+            .expect("切断されないべき");
+        assert!(matches!(first, Message::ThreadWelcome { .. }));
+
+        // 参加者 → ホスト: PONG(ホストの PING への応答)は不正フレームではない。
+        write_frame(&mut w, &Message::Pong { nonce: 1 })
+            .await
+            .unwrap();
+        // 参加者 → ホスト: PING には PONG が返る(接続は維持される)。
+        write_frame(&mut w, &Message::Ping { nonce: 42 })
+            .await
+            .unwrap();
+        loop {
+            match next_frame(&mut r, Duration::from_secs(5)).await {
+                Some(Some(Message::Pong { nonce })) => {
+                    assert_eq!(nonce, 42);
+                    break;
+                }
+                // 同期の RES/ORDER 等は読み飛ばす。
+                Some(Some(_)) => continue,
+                Some(None) => panic!("PING/PONG でスレ接続が切断されてはならない"),
+                None => panic!("PING への PONG が返るべき"),
+            }
+        }
+    }
+
+    fn livechat_settings_without_pow() -> peca_p2p_yp::livechat::thread::BoardSettings {
+        peca_p2p_yp::livechat::thread::BoardSettings {
+            first_post_pow_bits: 0,
+            ..Default::default()
+        }
+    }
+}

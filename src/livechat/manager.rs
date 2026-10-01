@@ -50,11 +50,8 @@ struct SessionEntry {
     cmd_tx: mpsc::UnboundedSender<WriteCommand>,
     /// セッションタスク。破棄時に abort する。
     handle: JoinHandle<()>,
-    /// 起動時の接続先(announce の `tip`)。診断ログで再オープン要求の tip と比較する。
+    /// 起動時の接続先(announce の `tip`)。再オープン要求の tip と異なれば張り替える。
     host_addr: String,
-    /// この板へ最後に書き込んだ板鍵の公開鍵(初回 PoW 判定用 — 初見・ローテーション後は
-    /// `first_post_pow_bits` を課す。既知は 0)。
-    last_written_pubkey: Option<String>,
 }
 
 impl Drop for SessionEntry {
@@ -102,7 +99,10 @@ impl ParticipantManager {
 
     /// 「スレを開く」明示操作。当該板の常駐セッションを起動する(冪等)。
     ///
-    /// 既に生きた(未終端)セッションがあれば何もしない。終端済みエントリは張り替える。
+    /// 既に生きた(未終端)セッションが**同じ tip** で動いていれば何もしない。終端済みエントリと、
+    /// tip が変わった(板の開設し直し・ホストのアドレス変化)生存中エントリは張り替える —
+    /// 生存中のセッションは起動時の tip へ再接続を続けるため、張り替えないと古い tip に
+    /// 接続し続けて表示が空のままになる。
     /// `config.security` は本マネージャの `security` で上書きする(呼び出し側は未設定でよい)。
     pub fn open(&self, mut config: ParticipantConfig) {
         let board_id = config.board_id.clone();
@@ -112,17 +112,23 @@ impl ParticipantManager {
             .get(&board_id)
             .filter(|e| !lock(&e.shared).terminated)
         {
-            // 既存セッションは起動時の tip で接続を続ける。announce の tip が変わっていても
-            // 張り替えないため、食い違いを診断ログに残す(古い tip への再接続ループの検出用)。
+            if existing.host_addr == config.host_addr {
+                tracing::debug!(
+                    target: "livechat",
+                    board_id = %board_id,
+                    host = %existing.host_addr,
+                    "生存中の参加者セッションを継続(同一 tip の再オープン要求)"
+                );
+                return;
+            }
+            // tip 変更: 既存エントリは下の insert で置き換わり、Drop でタスクが畳まれる。
             tracing::debug!(
                 target: "livechat",
                 board_id = %board_id,
                 session_host = %existing.host_addr,
                 announced_host = %config.host_addr,
-                tip_changed = existing.host_addr != config.host_addr,
-                "生存中の参加者セッションを継続(再オープン要求は無視)"
+                "announce の tip が変わったため参加者セッションを張り替え"
             );
-            return;
         }
         tracing::debug!(
             target: "livechat",
@@ -150,7 +156,6 @@ impl ParticipantManager {
                 cmd_tx,
                 handle,
                 host_addr,
-                last_written_pubkey: None,
             },
         );
     }
@@ -186,8 +191,10 @@ impl ParticipantManager {
         lock(&self.sessions).remove(board_id).is_some()
     }
 
-    /// 当該板へ書き込む(T066 — FR-008)。板鍵を解決し初回 PoW を決めてセッションへ委譲する。
+    /// 当該板へ書き込む(T066 — FR-008)。板鍵を解決してセッションへ委譲する。
     ///
+    /// 初回 PoW のビット数はセッションタスクが送信時に決める(joined 後の板設定とホストの確定列で
+    /// 判定する — `participant::write_pow_bits`)。接続前に受けた書き込みは joined まで保留される。
     /// 送信中(pending)への反映はセッションタスクが行うため、呼び出し側は [`Self::view`] を
     /// 再取得して送信中投稿を観測する(FR-008 の「送信中」区別表示)。未オープン板は
     /// [`ManagerError::NotOpen`]、板鍵解決失敗は [`ManagerError::KeyUnavailable`]。
@@ -203,34 +210,19 @@ impl ParticipantManager {
             .board_keys
             .signing_keys(board_id)
             .map_err(|_| ManagerError::KeyUnavailable)?;
-        let pubkey = keys.public_key().to_hex();
 
-        let mut sessions = lock(&self.sessions);
-        let entry = sessions.get_mut(board_id).ok_or(ManagerError::NotOpen)?;
+        let sessions = lock(&self.sessions);
+        let entry = sessions.get(board_id).ok_or(ManagerError::NotOpen)?;
         if lock(&entry.shared).terminated {
             return Err(ManagerError::NotOpen);
         }
-        // 初回 PoW: この板鍵で初めて書く(初見・ローテーション後)なら first_post_pow_bits、
-        // 既知なら 0(research R6)。板設定未受信時は 0(ホストが不足を拒否 → 設定到達後に再送)。
-        let is_first = entry.last_written_pubkey.as_deref() != Some(pubkey.as_str());
-        let pow_bits = if is_first {
-            lock(&entry.shared)
-                .settings
-                .as_ref()
-                .map(|s| s.first_post_pow_bits)
-                .unwrap_or(0)
-        } else {
-            0
-        };
         let cmd = WriteCommand {
             board_keys: keys,
             name,
             mail,
             body,
-            pow_bits,
         };
         entry.cmd_tx.send(cmd).map_err(|_| ManagerError::NotOpen)?;
-        entry.last_written_pubkey = Some(pubkey);
         Ok(())
     }
 }
@@ -338,6 +330,45 @@ mod tests {
         m.open(config(&board_id));
         assert!(m.is_open(&board_id));
         // 後始末(タスク abort)。
+        assert!(m.leave(&board_id));
+    }
+
+    #[tokio::test]
+    async fn reopen_with_changed_tip_replaces_alive_session() {
+        // 生存中のセッションは起動時の tip で再接続を続けるため、announce の tip が変わった
+        // (板の開設し直し・ホストのアドレス変化)ら張り替えないと古い tip に接続し続ける。
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let board_keys = Arc::new(BoardKeyManager::new(store, Keystore::ephemeral()));
+        let m = ParticipantManager::with_tuning(board_keys, None, u32::MAX, 1.0);
+        let board_id = "ab".repeat(32);
+        let config = |tip: &str| ParticipantConfig {
+            host_addr: tip.to_string(),
+            board_id: board_id.clone(),
+            channel: format!("30311:{board_id}:{}", "cd".repeat(16)),
+            generation: 1,
+            key: 1_700_000_000,
+            title: "実況スレ".into(),
+            res_limit: 1000,
+            security: None,
+        };
+        let shared_of = |m: &ParticipantManager| {
+            let sessions = lock(&m.sessions);
+            let e = sessions.get(&board_id).unwrap();
+            (Arc::clone(&e.shared), e.host_addr.clone())
+        };
+
+        m.open(config("127.0.0.1:7148"));
+        let (first, _) = shared_of(&m);
+        // 同じ tip の再オープンは no-op(同一セッションを維持)。
+        m.open(config("127.0.0.1:7148"));
+        let (same, _) = shared_of(&m);
+        assert!(Arc::ptr_eq(&first, &same), "同一 tip では張り替えない");
+        // tip が変わったら新しい tip でセッションを張り替える。
+        m.open(config("[2001:db8::1]:7148"));
+        let (replaced, host) = shared_of(&m);
+        assert!(!Arc::ptr_eq(&first, &replaced), "tip 変更で張り替える");
+        assert_eq!(host, "[2001:db8::1]:7148");
+        assert!(m.is_open(&board_id));
         assert!(m.leave(&board_id));
     }
 }

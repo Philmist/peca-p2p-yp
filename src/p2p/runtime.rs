@@ -556,6 +556,9 @@ impl P2pRuntime {
         // established 直後に送る。inbound は最初の gossip メッセージ受信で Gossip 用途が
         // 確定してから一度だけ送る(スレ用途 = THREAD_JOIN のときは送らない)。
         let mut gossip_openers_sent = false;
+        // inbound の gossip ハブ登録を用途確定まで遅らせる間、established 時の時計ずれ標本を
+        // 保持する(`Some` = 未登録。gossip 用途の確定時に取り出して登録する)。
+        let mut deferred_hub_skew: Option<i64> = None;
         // 送信キュー: 他接続からの再伝搬・PONG・SYNC 応答の平滑送信を本接続へ流す。
         let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Message>();
         let mut conn_id: Option<u64> = None;
@@ -647,7 +650,16 @@ impl P2pRuntime {
                                             .peer()
                                             .map(|p| p.ts - unix_now())
                                             .unwrap_or(0);
-                                        self.hub.register_peer(id, addr, direction, outbox_tx.clone(), clock_skew);
+                                        // gossip ハブへの登録(= EVENT 再伝搬の宛先化)は gossip
+                                        // 用途の接続に限る。outbound は gossip 目的で張るため即登録。
+                                        // inbound は用途未確定(THREAD_JOIN ならスレ用途)なので、
+                                        // 最初の gossip メッセージ受信まで遅らせる(1 TCP = 1 用途 —
+                                        // スレ接続へ EVENT を流すと参加者の WELCOME 待ちを壊す)。
+                                        if direction == Direction::Outbound {
+                                            self.hub.register_peer(id, addr, direction, outbox_tx.clone(), clock_skew);
+                                        } else {
+                                            deferred_hub_skew = Some(clock_skew);
+                                        }
                                         self.on_established(direction, addr, resolved_ip);
                                         // inbound 相手の候補化(申告 listen_port を接続元 host と
                                         // 組み合わせ source=pex・verified=0 で登録 — contracts §接続管理)。
@@ -672,12 +684,19 @@ impl P2pRuntime {
                                     SessionAction::Deliver(msg) => {
                                         // スレメッセージ(006-livechat-thread)は registry 経由で
                                         // 処理する。gossip メッセージは従来の handle_deliver へ。
-                                        let cont = if is_thread_message(&msg) {
+                                        // 用途はセッションが最初のメッセージで確定済み。スレ用途なら
+                                        // keepalive(PING/PONG)もスレ側で処理する(gossip 制御を
+                                        // スレ接続へ混ぜない)。
+                                        let cont = if session.is_thread() {
                                             self.handle_thread_deliver(msg, addr, &outbox_tx, &mut thread_board, &mut thread_rate)
                                         } else {
                                             // inbound で最初の gossip メッセージを受けた =
-                                            // Gossip 用途が確定した。ここで一度だけ SYNC_REQ/
-                                            // GET_PEERS を送る(双方向 SYNC を inbound 側でも維持)。
+                                            // Gossip 用途が確定した。ここでハブへ登録し(EVENT
+                                            // 再伝搬の宛先化)、一度だけ SYNC_REQ/GET_PEERS を送る
+                                            // (双方向 SYNC を inbound 側でも維持)。
+                                            if let (Some(skew), Some(id)) = (deferred_hub_skew.take(), conn_id) {
+                                                self.hub.register_peer(id, addr, direction, outbox_tx.clone(), skew);
+                                            }
                                             self.send_gossip_openers(
                                                 &outbox_tx,
                                                 &mut sync_counter,
@@ -1013,6 +1032,13 @@ impl P2pRuntime {
                     }
                 }
             }
+            // keepalive(gossip と共通 — thread-delivery.md §トランスポート)。PING には PONG を
+            // 返す。PONG(本ホストの PING への応答)は受信自体が生存の証拠で、処理は不要。
+            Message::Ping { nonce } => {
+                let _ = outbox_tx.send(Message::Pong { nonce });
+                true
+            }
+            Message::Pong { .. } => true,
             // その他のスレメッセージ(ホスト→参 の種別が参→ホ 方向に来た等)は無視する
             // (前方互換 — 未知/方向違いは切断しない。厳格な方向検査は US2 で扱う)。
             _ => true,
@@ -1065,22 +1091,6 @@ impl P2pRuntime {
             }
         }
     }
-}
-
-/// メッセージが THREAD_* 系(スレ配送専用)か(session.rs の同名判定と対 — 配線分岐用)。
-fn is_thread_message(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::ThreadJoin { .. }
-            | Message::ThreadWelcome { .. }
-            | Message::ThreadReject { .. }
-            | Message::Res { .. }
-            | Message::Order { .. }
-            | Message::Settings { .. }
-            | Message::ResendReq { .. }
-            | Message::ThreadClose { .. }
-            | Message::NextThread { .. }
-    )
 }
 
 /// 現在の unix 時刻(秒)。SYNC の `since` 計算用。

@@ -738,8 +738,6 @@ pub struct WriteCommand {
     pub mail: Option<String>,
     /// 本文。
     pub body: String,
-    /// 初回書き込み PoW ビット(初見板鍵は `first_post_pow_bits`、既知は 0 — research R6)。
-    pub pow_bits: u8,
 }
 
 /// フレーム適用の結果(継続 / 終端)。
@@ -812,9 +810,28 @@ where
             session.apply_close();
             return FrameOutcome::Closed;
         }
+        // keepalive(gossip と共通 — thread-delivery.md §トランスポート)。ホストは無受信
+        // 120 秒で切断するため、書き込まない視聴者も PONG で生存を示す。
+        Message::Ping { nonce } => {
+            let _ = write_frame(writer, &Message::Pong { nonce }).await;
+        }
         _ => {}
     }
     FrameOutcome::Continue
+}
+
+/// 書き込みに課す PoW ビット数を決める(research R6 — 初見板鍵は `first_post_pow_bits`)。
+///
+/// 「初見」の判定はホストの実状態に合わせる: **この接続でホストが確定した確定列に自分の板鍵の
+/// レスがあれば既知**(ホストは採番時に板鍵を既知化する)、無ければ初見として PoW を課す。
+/// ローカルの「書いたことがある」記録で判定すると、WELCOME 前の書き込み(設定未受信で PoW 0)や
+/// ホスト再起動(既知集合の消失)の後、PoW 不足で黙って破棄され続ける。板設定未受信は 0。
+fn write_pow_bits(confirmed: &[Res], settings: Option<&BoardSettings>, board_key: &str) -> u8 {
+    let Some(settings) = settings else {
+        return 0;
+    };
+    let known = confirmed.iter().any(|r| r.board_key == board_key);
+    crate::livechat::session::first_post_pow_bits(settings, !known)
 }
 
 /// 明示操作(スレを開く)を起点に常駐し、継続受信 + 書き込み + 凍結/復帰/クローズを駆動する
@@ -877,11 +894,18 @@ pub async fn run_session(
         publish_view(&shared, &session, SessionLiveState::Active);
 
         // 受信を別タスクへ分離(キャンセル安全)。フレームを mpsc で主ループへ渡す。
+        // ホストは 60 秒ごとに PING を送るため、無受信が keepalive しきい値(120 秒)を超えたら
+        // 通知なき切断(ホスト停止・経路断)とみなす(FR-014 — PING 無応答で凍結)。
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Option<Message>>();
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
+            let idle = Duration::from_secs_f64(crate::p2p::session::KEEPALIVE_TIMEOUT_SECS);
             loop {
-                match read_frame(&mut reader).await {
+                let Ok(read) = tokio::time::timeout(idle, read_frame(&mut reader)).await else {
+                    let _ = frame_tx.send(None);
+                    break;
+                };
+                match read {
                     Ok(Some(f)) => {
                         if frame_tx.send(Some(f.message)).is_err() {
                             break;
@@ -907,6 +931,15 @@ pub async fn run_session(
                 biased;
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else { break LoopEnd::ManagerGone; };
+                    // 初回 PoW は joined 後(板設定受信済み)にホストの確定列から決める。
+                    let pow_bits = {
+                        let settings = shared.lock().unwrap_or_else(|e| e.into_inner()).settings.clone();
+                        write_pow_bits(
+                            session.confirmed(),
+                            settings.as_ref(),
+                            &cmd.board_keys.public_key().to_hex(),
+                        )
+                    };
                     // 形式違反(本文長・行数等)は送らずスキップ(前方互換で切断しない)。
                     // 書き込み失敗(切断途上)は凍結扱いで再接続へ。
                     if let Ok(msg) = session.compose_write(
@@ -916,7 +949,7 @@ pub async fn run_session(
                         cmd.mail,
                         &cmd.body,
                         unix_now() as u64,
-                        cmd.pow_bits,
+                        pow_bits,
                     ) && write_frame(&mut writer, &msg).await.is_err()
                     {
                         break LoopEnd::Disconnected;
@@ -1062,4 +1095,78 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> ParticipantConfig {
+        ParticipantConfig {
+            host_addr: "203.0.113.1:7147".into(),
+            board_id: "b".repeat(64),
+            channel: format!("30311:{}:guid", "b".repeat(64)),
+            generation: 1,
+            key: 1_700_000_000,
+            title: "t".into(),
+            res_limit: 1000,
+            security: None,
+        }
+    }
+
+    fn confirmed_res(board_key: &str, res_no: u16) -> Res {
+        Res {
+            event_id: format!("{res_no:064x}"),
+            board_key: board_key.into(),
+            name: None,
+            mail: None,
+            body: "本文".into(),
+            created_at: 1_700_000_000,
+            res_no: Some(res_no),
+            pending: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_from_host_is_answered_with_pong() {
+        // ホストは 60 秒ごとに PING を送り、120 秒無受信で切断する。参加者が PONG を返さないと
+        // 書き込まない視聴者は 2 分ごとに切断される(thread-delivery.md §トランスポート)。
+        let config = config();
+        let mut session = ParticipantSession::new(config.make_thread(), generate_challenge());
+        let shared = std::sync::Mutex::new(SessionView::initial(1, 1_700_000_000));
+        let mut pending = std::collections::HashMap::new();
+        let (mut ours, mut theirs) = tokio::io::duplex(1024);
+        let outcome = apply_session_frame(
+            &config,
+            &mut session,
+            &shared,
+            &mut pending,
+            &mut ours,
+            Message::Ping { nonce: 7 },
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        let frame = read_frame(&mut theirs).await.unwrap().unwrap();
+        assert_eq!(frame.message, Message::Pong { nonce: 7 });
+    }
+
+    #[test]
+    fn write_pow_requires_first_post_bits_until_host_confirms_own_key() {
+        // 板設定未受信は 0(ホストが不足を拒否しうるが、計算すべきビット数が分からない)。
+        let me = "a".repeat(64);
+        assert_eq!(write_pow_bits(&[], None, &me), 0);
+
+        let settings = BoardSettings {
+            first_post_pow_bits: 12,
+            ..Default::default()
+        };
+        // この接続で自分の板鍵のレスが確定していなければ初見扱い(ホスト再起動で既知集合が
+        // 失われていても PoW 付きで送るため、黙って破棄され続けない)。
+        assert_eq!(write_pow_bits(&[], Some(&settings), &me), 12);
+        let others = [confirmed_res(&"c".repeat(64), 1)];
+        assert_eq!(write_pow_bits(&others, Some(&settings), &me), 12);
+        // ホストが自分の板鍵のレスを確定した = ホストにとって既知 → PoW 不要。
+        let mine = [confirmed_res(&"c".repeat(64), 1), confirmed_res(&me, 2)];
+        assert_eq!(write_pow_bits(&mine, Some(&settings), &me), 0);
+    }
 }
