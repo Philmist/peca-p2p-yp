@@ -50,6 +50,8 @@ struct SessionEntry {
     cmd_tx: mpsc::UnboundedSender<WriteCommand>,
     /// セッションタスク。破棄時に abort する。
     handle: JoinHandle<()>,
+    /// 起動時の接続先(announce の `tip`)。診断ログで再オープン要求の tip と比較する。
+    host_addr: String,
     /// この板へ最後に書き込んだ板鍵の公開鍵(初回 PoW 判定用 — 初見・ローテーション後は
     /// `first_post_pow_bits` を課す。既知は 0)。
     last_written_pubkey: Option<String>,
@@ -106,12 +108,30 @@ impl ParticipantManager {
         let board_id = config.board_id.clone();
         let mut sessions = lock(&self.sessions);
         // 生存中(未終端)のセッションがあれば二重起動しない(SC-005 — 接続は 1 本)。
-        if sessions
+        if let Some(existing) = sessions
             .get(&board_id)
-            .is_some_and(|e| !lock(&e.shared).terminated)
+            .filter(|e| !lock(&e.shared).terminated)
         {
+            // 既存セッションは起動時の tip で接続を続ける。announce の tip が変わっていても
+            // 張り替えないため、食い違いを診断ログに残す(古い tip への再接続ループの検出用)。
+            tracing::debug!(
+                target: "livechat",
+                board_id = %board_id,
+                session_host = %existing.host_addr,
+                announced_host = %config.host_addr,
+                tip_changed = existing.host_addr != config.host_addr,
+                "生存中の参加者セッションを継続(再オープン要求は無視)"
+            );
             return;
         }
+        tracing::debug!(
+            target: "livechat",
+            board_id = %board_id,
+            host = %config.host_addr,
+            generation = config.generation,
+            "参加者セッションを起動"
+        );
+        let host_addr = config.host_addr.clone();
         config.security = self.security.clone();
         let shared = Arc::new(Mutex::new(SessionView::initial(
             config.generation,
@@ -129,6 +149,7 @@ impl ParticipantManager {
                 shared,
                 cmd_tx,
                 handle,
+                host_addr,
                 last_written_pubkey: None,
             },
         );

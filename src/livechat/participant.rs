@@ -197,6 +197,20 @@ where
     }
 }
 
+/// 接続試行の段階ごとの診断ログ(DEBUG — 板・接続先・段階を必ず添える)。
+///
+/// 参加者側の接続失敗は UI に Connecting/Frozen としか現れないため、どの段階(connect /
+/// handshake / join)で止まったかをここで追えるようにする。
+fn join_debug(config: &ParticipantConfig, stage: &'static str, message: &'static str) {
+    tracing::debug!(
+        target: "livechat",
+        board_id = %config.board_id,
+        host = %config.host_addr,
+        stage,
+        "{message}"
+    );
+}
+
 /// ハンドシェイク(HELLO → THREAD_JOIN → WELCOME 検証)を行い joined 済みセッションを返す
 /// ([`drive`] と [`connect_write_collect`] の共通部)。
 ///
@@ -222,11 +236,38 @@ where
         ts: unix_now(),
     });
     if write_frame(writer, &hello).await.is_err() {
+        join_debug(config, "handshake", "HELLO の送信に失敗");
         return Err(JoinResult::Transport);
     }
     match read_frame(reader).await {
         Ok(Some(frame)) if matches!(frame.message, Message::HelloAck(_)) => {}
-        _ => return Err(JoinResult::Transport),
+        Ok(Some(frame)) => {
+            // ホストが CLOSE で拒否(接続 BAN・着信上限・バージョン非互換・自己接続)した場合も含む。
+            tracing::debug!(
+                target: "livechat",
+                board_id = %config.board_id,
+                host = %config.host_addr,
+                stage = "handshake",
+                received = frame.message.type_name(),
+                "HELLO_ACK 以外を受信したため接続を中止"
+            );
+            return Err(JoinResult::Transport);
+        }
+        Ok(None) => {
+            join_debug(config, "handshake", "HELLO_ACK 前にホストが切断");
+            return Err(JoinResult::Transport);
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "livechat",
+                board_id = %config.board_id,
+                host = %config.host_addr,
+                stage = "handshake",
+                error = %e,
+                "HELLO_ACK の受信に失敗"
+            );
+            return Err(JoinResult::Transport);
+        }
     }
 
     // 2. THREAD_JOIN(challenge を生成してセッションへ保持)。
@@ -238,13 +279,28 @@ where
         since_seq,
     };
     if write_frame(writer, &join).await.is_err() {
+        join_debug(config, "join", "THREAD_JOIN の送信に失敗");
         return Err(JoinResult::Transport);
     }
 
     // 3. WELCOME / REJECT を待つ。
     let first = match read_frame(reader).await {
         Ok(Some(f)) => f.message,
-        _ => return Err(JoinResult::Transport),
+        Ok(None) => {
+            join_debug(config, "join", "WELCOME/REJECT 前にホストが切断");
+            return Err(JoinResult::Transport);
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "livechat",
+                board_id = %config.board_id,
+                host = %config.host_addr,
+                stage = "join",
+                error = %e,
+                "WELCOME/REJECT の受信に失敗"
+            );
+            return Err(JoinResult::Transport);
+        }
     };
     match first {
         Message::ThreadWelcome {
@@ -253,18 +309,41 @@ where
             ..
         } => match session.on_welcome(&sig) {
             // 板設定(WELCOME 同梱)も持ち帰る(T064 — 他ノード板の設定表示に使う)。
-            WelcomeOutcome::Accepted => Ok((session, board_settings)),
+            WelcomeOutcome::Accepted => {
+                join_debug(config, "join", "WELCOME 検証成功(joined)");
+                Ok((session, board_settings))
+            }
             WelcomeOutcome::ChallengeFailed { category } => {
+                join_debug(config, "join", "WELCOME の署名検証に失敗");
                 self_log(config, category);
                 Err(JoinResult::ChallengeFailed)
             }
         },
         Message::ThreadReject { reason } => {
             let handling = session.on_reject(&reason);
+            tracing::debug!(
+                target: "livechat",
+                board_id = %config.board_id,
+                host = %config.host_addr,
+                stage = "join",
+                reason = %reason,
+                handling = ?handling,
+                "THREAD_REJECT を受信"
+            );
             Err(JoinResult::Rejected { reason, handling })
         }
         // WELCOME/REJECT 以外が最初に来るのはプロトコル違反。
-        _ => Err(JoinResult::Transport),
+        other => {
+            tracing::debug!(
+                target: "livechat",
+                board_id = %config.board_id,
+                host = %config.host_addr,
+                stage = "join",
+                received = other.type_name(),
+                "WELCOME/REJECT 以外を受信したため接続を中止"
+            );
+            Err(JoinResult::Transport)
+        }
     }
 }
 
@@ -500,9 +579,17 @@ async fn connect_and_handshake(
     ),
     JoinResult,
 > {
-    let stream = TcpStream::connect(&config.host_addr)
-        .await
-        .map_err(|_| JoinResult::Transport)?;
+    let stream = TcpStream::connect(&config.host_addr).await.map_err(|e| {
+        tracing::debug!(
+            target: "livechat",
+            board_id = %config.board_id,
+            host = %config.host_addr,
+            stage = "connect",
+            error = %e,
+            "ホストへの TCP 接続に失敗"
+        );
+        JoinResult::Transport
+    })?;
     let (mut reader, mut writer) = stream.into_split();
     let (session, board_settings) =
         handshake_join(config, since_seq, &mut reader, &mut writer).await?;
@@ -765,10 +852,18 @@ pub async fn run_session(
                     handling: RejectHandling::GiveUp,
                     ..
                 })
-                | Err(JoinResult::Closed) => break,
+                | Err(JoinResult::Closed) => {
+                    join_debug(
+                        &config,
+                        "session",
+                        "スレが存在しない・クローズ済みのためセッションを終了",
+                    );
+                    break;
+                }
                 Err(_) => {
                     // Transport/ChallengeFailed 系はバックオフ再試行(Connecting のまま)。
                     set_view_state(&shared, SessionLiveState::Connecting);
+                    backoff_debug(&config, attempt, sleep_scale);
                     backoff(attempt, sleep_scale).await;
                     attempt += 1;
                     continue;
@@ -853,6 +948,11 @@ pub async fn run_session(
         match end {
             LoopEnd::Closed => {
                 // 明示クローズ: データ削除済み・終端(FR-014/FR-015)。
+                join_debug(
+                    &config,
+                    "session",
+                    "THREAD_CLOSE を受信したためセッションを終了",
+                );
                 let mut view = shared.lock().unwrap_or_else(|e| e.into_inner());
                 view.confirmed.clear();
                 view.pending.clear();
@@ -863,8 +963,14 @@ pub async fn run_session(
             LoopEnd::ManagerGone => return,
             LoopEnd::Disconnected => {
                 // 通知なき切断 → Frozen(閲覧継続)。バックオフして再接続する(FR-014)。
+                join_debug(
+                    &config,
+                    "session",
+                    "ホストとの接続が切れたため凍結(再接続へ)",
+                );
                 session.on_disconnect();
                 publish_view(&shared, &session, SessionLiveState::Frozen);
+                backoff_debug(&config, attempt, sleep_scale);
                 backoff(attempt, sleep_scale).await;
                 attempt += 1;
             }
@@ -876,6 +982,20 @@ pub async fn run_session(
     if view.state != SessionLiveState::Closed {
         view.state = SessionLiveState::Frozen;
     }
+}
+
+/// 再接続待機の診断ログ(DEBUG — 何回目の試行を何秒後に行うか)。
+fn backoff_debug(config: &ParticipantConfig, attempt: u32, sleep_scale: f64) {
+    let delay = crate::livechat::session::backoff_delay_secs(attempt) as f64 * sleep_scale;
+    tracing::debug!(
+        target: "livechat",
+        board_id = %config.board_id,
+        host = %config.host_addr,
+        stage = "session",
+        attempt,
+        delay_secs = delay,
+        "バックオフ後に再接続を試行"
+    );
 }
 
 /// バックオフ待機(試行回数に応じた遅延。テストは `sleep_scale` で短縮できる)。

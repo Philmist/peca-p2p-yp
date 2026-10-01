@@ -131,6 +131,33 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// ワイヤ上の `type` 名(診断ログ用 — 本文を含めずに種別だけを出す)。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Message::Hello(_) => "HELLO",
+            Message::HelloAck(_) => "HELLO_ACK",
+            Message::Event { .. } => "EVENT",
+            Message::SyncReq { .. } => "SYNC_REQ",
+            Message::SyncDone { .. } => "SYNC_DONE",
+            Message::GetPeers => "GET_PEERS",
+            Message::Peers { .. } => "PEERS",
+            Message::Ping { .. } => "PING",
+            Message::Pong { .. } => "PONG",
+            Message::Close { .. } => "CLOSE",
+            Message::ThreadJoin { .. } => "THREAD_JOIN",
+            Message::ThreadWelcome { .. } => "THREAD_WELCOME",
+            Message::ThreadReject { .. } => "THREAD_REJECT",
+            Message::Res { .. } => "RES",
+            Message::Order { .. } => "ORDER",
+            Message::Settings { .. } => "SETTINGS",
+            Message::ResendReq { .. } => "RESEND_REQ",
+            Message::ThreadClose { .. } => "THREAD_CLOSE",
+            Message::NextThread { .. } => "NEXT_THREAD",
+        }
+    }
+}
+
 /// THREAD_REJECT の定型 reason コード(内部情報を含めない — MUST NOT。FR-006)。
 ///
 /// 受信側は前方互換のため未知コードを許容する(文字列として保持)。送信時は本定数を使う。
