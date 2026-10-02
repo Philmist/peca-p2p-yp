@@ -223,11 +223,11 @@ contracts/web-ui.md §1/§2.4/§2.5/§3.7/§5.3/§7 と contracts/fixed-first-po
 - [X] T046 [US1] FR-006a の板設定導線を板ページへ移設する per FR-006a (partial) — `ui/livechat.html` の板設定編集(現状スレページ `222-231`)を板ページ(view-board)の板管理セクション(`<details>`)へ移し、スレ非依存で編集可能にする(スレ 0 件でも可)。あわせて設定フォームと PUT(現状 `724-730` は `first_post_template` 未送信)に**固定 >>1 テンプレ**編集欄を追加する。スレページからは板設定編集を外す(モデレーション実行はスレページに残す)(contracts/web-ui.md §2.5/§3.7)
 - [X] T047 FR-006b の BAN 一覧取得経路を追加する per FR-006b (missing) — `src/web/livechat.rs`(および `LivechatDirectory`/adapter)に現行 BAN(板鍵 BAN・接続 BAN)の**一覧取得**経路を追加する(現状は ban/unban 実行系のみ・`680-728`)。応答は Principle II の定型化を維持(内部情報を漏らさない)。契約に無い新規 API 形は最小限とし、対応する contract/unit テストを先に追加して失敗を確認する
 - [X] T048 [US1] FR-006b の BAN 一覧 UI を追加する per FR-006b (missing) — `ui/livechat.html` の板ページ板管理セクションに、T047 の一覧取得を用いた BAN 済みエントリの一覧参照と解除(既存 unban/unconnban)導線を追加する。個別レスへの BAN **実行**はスレページ側に残す(contracts/web-ui.md §2.5)
-- [ ] T049 [US1] FR-002a のナビゲーションリンクを実機で確認・是正する per FR-002a (partial) — `ui/livechat.html` は板一覧→自板(`366-367`)・スレ一覧→スレ(`460`)のアンカーを既に持つが、実機検証で遷移リンク欠落が報告された。再ビルド後に板一覧→自板・スレ一覧→スレの遷移が実機で機能することを確認し、条件描画等で欠落する経路があれば是正する(contracts/web-ui.md §1、quickstart V-1 手順 7)
+- [X] T049 [US1] FR-002a のナビゲーションリンクを実機で確認・是正する per FR-002a (partial) — `ui/livechat.html` は板一覧→自板(`366-367`)・スレ一覧→スレ(`460`)のアンカーを既に持つが、実機検証で遷移リンク欠落が報告された。再ビルド後に板一覧→自板・スレ一覧→スレの遷移が実機で機能することを確認し、条件描画等で欠落する経路があれば是正する(contracts/web-ui.md §1、quickstart V-1 手順 7)
 
 ## Phase 8: Convergence(T041〜T048 実装中に判明した設計課題)
 
-- [ ] T050 FR-023 の「互換ポート上での SPA 自己完結」を成立させる per FR-023 (design-gap) —
+- [X] T050 FR-023 の「互換ポート上での SPA 自己完結」を成立させる per FR-023 (design-gap) —
   T042 で `compat_bbs_bind` に `GET /{board}/`(HTML 配信)とクライアント側パス→板ルーティング
   (`ui/livechat.html` `bootstrapHashFromPath`)を追加し、板ページ HTML は配信されるが、SPA の
   データ経路(`/api/v1/token`・`/api/v1/livechat/threads/{board}` 等)は**互換リスナーが構造的に
@@ -261,4 +261,11 @@ contracts/web-ui.md §1/§2.4/§2.5/§3.7/§5.3/§7 と contracts/fixed-first-po
 - [X] T053 [P] FR-023a の contract テスト(write.json)を追加し失敗を確認する per FR-023a (missing) — 互換ポート `POST /{board}/write.json`(トークンレス・`{name,mail,body}`・key 省略)が受理で 202、本文空/サイズ超過等の形式違反で 400 を返し、書き込みが既存 bbs.cgi と同一の採番経路で確定する(自板採番・未知板は常駐セッション)ことを tests/contract/compat_bbs.rs に追加(contracts/web-ui.md §7.3、FR-022)
 - [X] T054 FR-023a/c を実装する per FR-023a (missing) — `src/web/compat/mod.rs` に `CompatBoardView` と 3 ルート(`GET /{board}/board.json`・`GET /boards.json`・`POST /{board}/write.json`)を追加する。board.json は `resolve_snapshot` から最小ビューを合成(pending・板主設定を除外)、boards.json は registry(ホスト板)+ manager(参加中板)を列挙、write.json は既存 `bbs_cgi::submit`(自板採番 → 未知板は `manager.write` フォールバック)を再利用し 202/400 を返す。3 面とも既存 host_guard + source_guard + rate_limit を共有。**`/api/v1` を互換ルータへ追加しない(MUST NOT)**。T051〜T053 をパスさせる(research R13、contracts/web-ui.md §7)
 - [X] T055 [US2] FR-023b の SPA オリジン分岐を実装する per FR-023b (missing) — `ui/livechat.html` に配信オリジン検出(`ON_COMPAT` = pathname が `/{hex64}/`)を追加し、互換オリジンでは読取=`board.json`・一覧=`boards.json`・書込=`write.json` に経路を振り替え、ホスト管理導線(スレ開設・板設定編集・モデレーション実行・BAN 一覧・チャンネル選択・`/api/v1/token` 取得・disabled-banner probe)を非表示/無効化する。同一 `include_str!` 資産のまま実行時分岐(contracts/web-ui.md §7.3 注記、FR-023b)
-- [ ] T056 FR-023 の自己完結を実機確認する per FR-023 / quickstart V-4-6 (partial) — quickstart V-4 手順 6 に従い、別端末ブラウザで `http://{LAN}:7183/{board}/` を開き、スレ一覧・レス列が読み込まれる(board.json/boards.json)・レス書き込みが全端末で同一レス番号に確定する(write.json)・ホスト管理導線が非表示・開発者ツールで `/api/v1/...` 要求が発生しないことを確認して記録する(SC-002/SC-009)
+- [X] T056 FR-023 の自己完結を実機確認する per FR-023 / quickstart V-4-6 (partial) — quickstart V-4 手順 6 に従い、別端末ブラウザで `http://{LAN}:7183/{board}/` を開き、スレ一覧・レス列が読み込まれる(board.json/boards.json)・レス書き込みが全端末で同一レス番号に確定する(write.json)・ホスト管理導線が非表示・開発者ツールで `/api/v1/...` 要求が発生しないことを確認して記録する(SC-002/SC-009)
+
+## Phase 10: Convergence
+
+- [X] T057 [US1] スレページのレスヘッダに `ID:{id}` を表示する per FR-002 / US1-AS2 (partial) — `ui/livechat.html` の `resNode` は `{res_no} ：{名前}：{日付}` のみで ID を出さない(contracts/web-ui.md §3.2 の `{res_no} :{名前}:{日付} ID:{id}` 不一致)。互換 dat が既に公開している短縮 ID(`src/web/compat/dat.rs` `short_id` = 板鍵先頭 8 文字・表示専用)と同一導出の `id` を `src/web/livechat.rs` `ResView` と `src/web/compat/mod.rs` `CompatResView`(board.json — 公開済み dat の JSON 再エンコードの範囲内)に追加し、UI で `ID:{id}` を描画する。完全鍵は出さない。対応する contract テスト(local_api.rs / compat_bbs.rs)を先に追加して失敗を確認する
+- [X] T058 [US2] 互換オリジンの板一覧ビューから `/api/v1` 要求とホスト面導線を除去する per FR-023a / FR-023b (contradicts) — `ui/livechat.html` `renderHome` が `ON_COMPAT` でも `loadChannels()` を呼び `fetch('/api/v1/announced')` を発行する(「← 板一覧へ」遷移で発生 — T056 の「`/api/v1` 要求が発生しない」基準に反する)。`ON_COMPAT` 時は `loadChannels` を呼ばない。あわせて互換ポートに存在しない `/index.html` への topnav リンク(互換面では 404)を非表示にし、boards.json に無い `tip` を一覧行に描画しない(現状 `(n レス / )` と空欄表示)
+- [X] T059 [US3] 新規スレ作成欄の >>1 プリフィルを固定テンプレ未設定時もシステム既定テンプレで行う per FR-014a (partial) — `ui/livechat.html` `renderBoard` は `first_post_template` が空のとき空欄をプリフィルする(contracts/web-ui.md §2.4「未設定時はシステム既定テンプレを既定値としてプリフィル表示」不一致)。`src/livechat/registry.rs` `default_first_post_body` の結果を http_bind 板詳細(自板のみ・互換 board.json には出さない)へ公開するなどして既定値を提示する。未編集送信時に override を付けずサーバ既定が使われる現挙動は維持し、contract テストを先に追加して失敗を確認する
+- [X] T060 `src/web/compat/mod.rs` のモジュール doc を実装に同期する per plan: ドキュメント同期(T036) (partial) — 冒頭の「専用 loopback リスナー」、FR-023 節の「データ経路の互換ポート到達性は設計課題として別途整理する(tasks T050)」、保護層 1 の「`127.0.0.1[:port]` / `localhost[:port]` 以外は定型 403」が、LAN 公開(T021)と互換名前空間 JSON(T054)実装後の現状と食い違う。board.json/boards.json/write.json と送信元 LAN 限定を反映して更新する

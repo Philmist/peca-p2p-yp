@@ -157,6 +157,14 @@ pub struct BoardSnapshot {
     pub settings: BoardSettings,
 }
 
+impl BoardSnapshot {
+    /// 上書きなしでスレを開設したとき >>1 になる本文(007 FR-014a — 新規スレ作成欄の
+    /// プリフィル値)。板設定テンプレ(非空)、未設定ならシステム既定テンプレ。
+    pub fn first_post_default(&self) -> String {
+        effective_first_post_body(&self.settings, &self.active.channel)
+    }
+}
+
 /// 板鍵単位の書き込みレート窓(FR-021 — `thread_write_rate`)。
 ///
 /// 固定 30 秒窓(data-model §Settings で窓長は 30 秒固定)。窓を跨ぐと計数をリセットする。
@@ -302,14 +310,7 @@ impl LivechatRegistry {
         // 永続テンプレ(entry.host.settings.first_post_template)は書き換えない。
         let body = match first_post_override {
             Some(o) if !o.trim().is_empty() => o.to_string(),
-            _ => {
-                let template = entry.host.settings.first_post_template.clone();
-                if template.trim().is_empty() {
-                    default_first_post_body(&entry.host.settings.title, &channel)
-                } else {
-                    template
-                }
-            }
+            _ => effective_first_post_body(&entry.host.settings, &channel),
         };
         let res_event = sign_res(board_key, board_id, &channel, generation, &body, created_at)
             .map_err(RegistryError::Build)?;
@@ -1200,10 +1201,16 @@ fn order_event_to_message(event: &Event) -> WireMessage {
     }
 }
 
-/// スレ主鍵で確定レス用の kind 1311 イベントを署名する補助(seed・テスト用)。
-///
-/// 板鍵で署名するのが本来だが(FR-016)、seed 用途では任意の署名鍵を受け取れるよう
-/// 分離する。`board_id`(スレ主 pubkey)と `channel` は封筒の必須フィールド。
+/// 上書きなしの >>1 本文: 板設定テンプレ(非空)> システム既定テンプレ
+/// (fixed-first-post.md §3.2)。開設・次スレ移行・UI プリフィルで同一の規則を使う。
+fn effective_first_post_body(settings: &BoardSettings, channel: &str) -> String {
+    if settings.first_post_template.trim().is_empty() {
+        default_first_post_body(&settings.title, channel)
+    } else {
+        settings.first_post_template.clone()
+    }
+}
+
 /// システム既定の固定 >>1 本文(007 — `first_post_template` が空の板で使う)。
 ///
 /// 空の >>1 を生じさせないため、板タイトルと対象チャンネルの案内を含む最小テンプレを返す
@@ -1218,6 +1225,10 @@ pub fn default_first_post_body(title: &str, channel: &str) -> String {
     format!("{title} 実況スレ\n対象チャンネル: {channel}")
 }
 
+/// スレ主鍵で確定レス用の kind 1311 イベントを署名する補助(seed・テスト用)。
+///
+/// 板鍵で署名するのが本来だが(FR-016)、seed 用途では任意の署名鍵を受け取れるよう
+/// 分離する。`board_id`(スレ主 pubkey)と `channel` は封筒の必須フィールド。
 pub fn sign_res(
     board_key: &Keys,
     board_id: &str,
@@ -1272,6 +1283,45 @@ mod tests {
         )
         .unwrap();
         reg
+    }
+
+    #[test]
+    fn snapshot_first_post_default_falls_back_to_system_default() {
+        // 007 T059(FR-014a): テンプレ未設定の板では、プリフィル値はシステム既定テンプレ
+        // (開設時に実際に >>1 になる本文と同一)。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = registry_with_thread(&p, 128);
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(
+            snap.first_post_default(),
+            default_first_post_body(&snap.settings.title, &channel_of(&board_id))
+        );
+    }
+
+    #[test]
+    fn snapshot_first_post_default_uses_board_template() {
+        // 007 T059(FR-014a): テンプレ設定済みの板では、プリフィル値は固定 >>1 テンプレ。
+        let p = persona();
+        let board_id = p.public_key().to_hex();
+        let reg = LivechatRegistry::new(128);
+        let settings = BoardSettings {
+            first_post_template: "固定テンプレ本文".into(),
+            first_post_pow_bits: 0,
+            ..Default::default()
+        };
+        reg.open_thread(
+            p.clone(),
+            channel_of(&board_id),
+            1,
+            1_700_000_000,
+            "実況スレ",
+            settings,
+            "198.51.100.1:7147",
+        )
+        .unwrap();
+        let snap = reg.board_snapshot(&board_id).unwrap();
+        assert_eq!(snap.first_post_default(), "固定テンプレ本文");
     }
 
     #[test]

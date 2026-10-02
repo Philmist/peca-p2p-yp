@@ -866,6 +866,8 @@ impl LivechatDirectory for LivechatAdapter {
                 res,
                 pending: Vec::new(),
                 compat_bbs_port: self.compat_bbs_port,
+                // 新規スレ作成欄のプリフィル(007 FR-014a — 開設時の >>1 と同一規則)。
+                first_post_default: Some(snap.first_post_default()),
             });
         }
         // 他ノード板は開いている常駐セッション(T064)が確定レス・板設定・送信中を供給する。
@@ -887,6 +889,8 @@ impl LivechatDirectory for LivechatAdapter {
             res,
             pending,
             compat_bbs_port: self.compat_bbs_port,
+            // 他ノード板は開設できないためプリフィル値を持たない。
+            first_post_default: None,
         })
     }
 

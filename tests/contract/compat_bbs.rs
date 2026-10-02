@@ -1159,6 +1159,35 @@ async fn board_json_returns_minimal_compat_view() {
     );
 }
 
+/// T057(FR-002 — `{res_no} :{名前}:{日付} ID:{id}`): board.json の各レスは dat と同一導出の
+/// 短縮 ID(板鍵先頭 8 文字)を `id` に載せる。完全鍵・板主設定の既定 >>1 は載せない。
+#[tokio::test]
+async fn board_json_res_carries_short_id_same_as_dat() {
+    let state = test_state();
+    let persona = Keys::generate();
+    let board_id = open_board(&state, &persona, BoardSettings::default());
+    let board_key = Keys::generate();
+    seed(&state, &board_id, &board_key, "本文", 1_700_000_001);
+    let app = routes(state);
+    let resp = app
+        .oneshot(get_req(&format!("/{board_id}/board.json"), Some(GOOD_HOST)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let key_hex = board_key.public_key().to_hex();
+    let res = v["res"].as_array().unwrap();
+    assert_eq!(res[0]["id"], key_hex[..8], "dat の ID:xxxxxxxx と同一導出");
+    assert!(
+        !v.to_string().contains(&key_hex),
+        "完全な板鍵を含めない: {v}"
+    );
+    assert!(
+        v.get("first_post_default").is_none(),
+        "板主向けの既定 >>1 は互換面に出さない"
+    );
+}
+
 /// T051: 未知/未ホスト板の board.json は定型 404(内部状態を開示しない)。
 #[tokio::test]
 async fn board_json_unknown_board_is_404() {

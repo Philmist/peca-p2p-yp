@@ -170,6 +170,9 @@ pub struct ResView {
     pub body: String,
     /// 参考情報(正となる順序は `res_no` — spec Edge Case)。
     pub created_at: i64,
+    /// 表示用の短縮 ID(板鍵先頭 8 文字 — 互換 dat の `ID:xxxxxxxx` と同一導出。007 FR-002)。
+    /// 完全鍵照合(NG/BAN)には使わない。
+    pub id: String,
 }
 
 impl ResView {
@@ -189,6 +192,7 @@ impl ResView {
             mail: res.mail.clone().unwrap_or_default(),
             body: res.body.clone(),
             created_at: res.created_at,
+            id: crate::web::compat::dat::short_id(&res.board_key).to_string(),
         })
     }
 }
@@ -236,6 +240,10 @@ pub struct ThreadDetail {
     /// UI が専ブラ向け板 URL(`http://{hostname}:{port}/{board}/`)を動的生成するための値。
     /// 互換 API 無効(`compat_bbs_bind` 空)のときは `None`(JSON では null)= UI は非表示。
     pub compat_bbs_port: Option<u16>,
+    /// 上書きなしで開設したとき >>1 になる本文(板設定テンプレ、未設定ならシステム既定)。
+    /// 新規スレ作成欄のプリフィル用(007 FR-014a — contracts/web-ui.md §2.4)。自板のみ
+    /// `Some`、他ノード板(開設できない)は `None`。互換面の board.json には出さない。
+    pub first_post_default: Option<String>,
 }
 
 /// 現行 BAN の一覧(007 FR-006b — 板管理セクションの BAN 一覧参照用)。
@@ -947,6 +955,15 @@ mod tests {
     }
 
     #[test]
+    fn res_view_carries_short_id_derived_from_board_key() {
+        // 007 T057(FR-002 — `{res_no} :{名前}:{日付} ID:{id}`): 互換 dat と同一導出の
+        // 短縮 ID(板鍵先頭 8 文字・表示専用)を載せる。完全鍵は出さない。
+        let res = confirmed_res(Some(1), None);
+        let view = ResView::from_res(&res, "名無しさん").unwrap();
+        assert_eq!(view.id, "22222222");
+    }
+
+    #[test]
     fn res_view_is_none_for_unconfirmed_res() {
         // res_no が None(未確定)のレスは閲覧 API に含めない(US1 は確定分のみ)。
         let res = confirmed_res(None, None);
@@ -981,6 +998,7 @@ mod tests {
                     ],
                     pending: Vec::new(),
                     compat_bbs_port: None,
+                    first_post_default: None,
                 })
             } else {
                 None

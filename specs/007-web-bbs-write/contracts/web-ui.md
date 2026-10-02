@@ -93,6 +93,9 @@
 {
   // ...既存フィールド(settings, レス列 等)は変更なし...
   "compat_bbs_port": 7183,        // 追加: 互換 API の待受ポート。無効時は null
+  "first_post_default": "...",    // 追加: 上書きなし開設時の >>1 本文(固定テンプレ、未設定なら
+                                  //   システム既定)。§2.4 のプリフィル用。自板のみ・他ノード板は null
+  "res": [ { /* ...既存... */ "id": "abcd1234" } ],  // 追加: 短縮 ID(板鍵先頭 8 文字・dat と同一導出)
   "settings": {
     // ...既存...
     "first_post_template": "..."  // 追加: 固定 >>1 テンプレ(板主向け設定表示用)
@@ -175,7 +178,7 @@
   "noname_name": "名無しさん",
   "res_limit": 1000,
   "local_rules_html": "<h1>…</h1>",   // サーバ側で安全 HTML 化済み(§4)
-  "res": [ { "res_no": 1, "name": "…", "mail": "", "body": "…", "created_at": 0 } ],
+  "res": [ { "res_no": 1, "name": "…", "mail": "", "body": "…", "created_at": 0, "id": "abcd1234" } ],
   "thread": { "generation": 1, "res_count": 42 },
   "compat_bbs_port": 7183
 }

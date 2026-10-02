@@ -1,6 +1,7 @@
 //! 2ch 互換 API(T052/T054 — contracts/compat-api.md)
 //!
-//! 専用 loopback リスナー(`compat_bbs_bind`)で subject.txt / dat / SETTING.TXT / head.txt /
+//! 専用リスナー(`compat_bbs_bind` — 既定 loopback、007 で明示オプトインにより LAN 内
+//! プライベートアドレスへも公開可。ADR-0015)で subject.txt / dat / SETTING.TXT / head.txt /
 //! bbs.cgi を Shift_JIS で提供する。既存 `/api/v1`(AppState)とは**独立した専用状態**
 //! ([`CompatState`])を持つ — index.txt の LAN リスナー(ADR-0012)と同じ設計思想で、
 //! 「経路フィルタのバグで API がこちらに露出する」「逆にこちらのバグでトークン保護 API が
@@ -24,14 +25,20 @@
 //! 同一の `include_str!` 資産・UTF-8 HTML)を配信する。専ブラ向け `subject.txt`/`dat`/`bbs.cgi`
 //! の応答・SJIS・検証は不変で、他面(`http_bind`)への HTTP リダイレクトは行わない(MUST NOT —
 //! 公開面ごとの独立オプトイン維持・同一 URL での自己完結。contracts/web-ui.md §7・research R11)。
-//! なお本リスナーは依然 `/api/v1` を持たないため、板ページ SPA のデータ経路の互換ポート到達性は
-//! 設計課題として別途整理する(tasks T050)。
+//! SPA のデータ経路は `/api/v1` を生やさず、互換名前空間 JSON(`GET /boards.json`・
+//! `GET /{board}/board.json`・`POST /{board}/write.json`)で自己完結させる(007 FR-023a/b/c・
+//! research R13・ADR-0015 決定 7)。board.json は公開済み SJIS 読取の JSON 再エンコードに留め
+//! (板主設定・pending・原文ローカルルールは出さない)、write.json の実体は bbs.cgi と同一の
+//! [`bbs_cgi::submit`]。互換オリジンの SPA は視聴者スコープ(ホスト管理導線なし)で動作する。
 //!
 //! ## 保護層(FR-026)
 //!
-//! 1. **Host 検証**: `127.0.0.1[:port]` / `localhost[:port]` 以外は定型 403
-//! 2. **レート制限**: 同一接続元・秒あたり([`RATE_LIMIT_PER_SEC`])
-//! 3. **ボディ上限**: ≤ 64KB(bbs.cgi の POST のみ関係する)
+//! 1. **送信元 LAN 限定**(007 — 非 loopback 待受時のみ): 送信元 IP が loopback / RFC 1918 /
+//!    リンクローカル / ULA 以外は定型 403(`source_guard`)
+//! 2. **Host 検証**: loopback 3 形式(`127.0.0.1` / `localhost` / `[::1]`、各 `:port`)と、
+//!    非 loopback bind 時の `{bind_ip}:{port}` 以外は定型 403
+//! 3. **レート制限**: 同一接続元・秒あたり([`RATE_LIMIT_PER_SEC`])。LAN 公開でも緩和しない
+//! 4. **ボディ上限**: ≤ 64KB(bbs.cgi・write.json の POST が関係する)
 //!
 //! 違反はすべて `compat_bbs_denied` として記録する(内部情報を含めない)。
 
@@ -333,6 +340,8 @@ struct CompatResView {
     mail: String,
     body: String,
     created_at: i64,
+    /// 表示用の短縮 ID(dat の `ID:xxxxxxxx` と同一導出 — 公開済み dat の JSON 再エンコード)。
+    id: String,
 }
 
 /// board.json のスレ記述子(SPA のスレルーティング用)。
@@ -386,6 +395,7 @@ fn compat_res_views(snapshot: &BoardSnapshot) -> Vec<CompatResView> {
                 mail: r.mail.clone().unwrap_or_default(),
                 body: r.body.clone(),
                 created_at: r.created_at,
+                id: dat::short_id(&r.board_key).to_string(),
             })
         })
         .collect()

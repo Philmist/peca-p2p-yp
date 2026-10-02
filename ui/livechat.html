@@ -69,6 +69,7 @@
     .res-name { color: #008000; font-weight: bold; }
     .res-mail { color: #0000ee; }
     .res-date { color: #333; }
+    .res-id { color: #333; }
     .res-body { margin: 0.2rem 0 0.2rem 1.6rem; line-height: 1.5; font-size: 0.95rem; word-break: break-word; }
     .res-pending .res-body { color: #b06000; font-style: italic; }
     .anchor { color: #0000ee; text-decoration: underline; cursor: pointer; }
@@ -103,7 +104,7 @@
 </head>
 <body>
   <div class="wrap">
-    <div class="topnav"><a href="/index.html">&larr; トップ</a></div>
+    <div class="topnav" id="top-nav"><a href="/index.html">&larr; トップ</a></div>
 
     <div id="disabled-banner" class="banner banner-warn" hidden>
       スレ機能が無効(livechat_enabled=false)か、供給元が未配線です。設定を確認してください。
@@ -409,7 +410,9 @@
     }
 
     async function renderHome() {
-      await loadChannels();
+      // チャンネル選択はホスト管理(スレ開設)専用。互換オリジンは /api/v1 を持たないため
+      // 取得自体を行わない(FR-023a/b)。
+      if (!ON_COMPAT) await loadChannels();
       const statusEl = document.getElementById('home-status');
       const list = document.getElementById('board-list');
       list.innerHTML = '';
@@ -428,8 +431,10 @@
         const link = (t.is_local || ON_COMPAT)
           ? `<a href="#/board/${encodeURIComponent(t.board_id)}">${badge} ${escHtml(t.title)}</a>`
           : `<a href="#" class="join-link" data-b="${escHtml(t.board_id)}">${badge} ${escHtml(t.title)}</a>`;
+        // 接続先(tip)は http_bind の一覧にのみ在る(boards.json は出さない — FR-023c)。
+        const tip = t.tip ? ` / ${escHtml(t.tip)}` : '';
         li.innerHTML = `${link} ` +
-          `<span class="muted">(${t.res_count} レス / ${escHtml(t.tip)})</span>`;
+          `<span class="muted">(${t.res_count} レス${tip})</span>`;
         list.appendChild(li);
       }
       list.querySelectorAll('.join-link').forEach(a =>
@@ -532,9 +537,10 @@
       // スコープ)では開設導線を出さない(FR-023b)。
       if (!ON_COMPAT && summary && summary.is_local && summary.channel) {
         newWrap.hidden = false;
-        // >>1 本文欄に固定 >>1 テンプレをプリフィル(FR-014a。未設定なら空 = 開設時は
-        // サーバのシステム既定テンプレが >>1 になる — 空 >>1 は生じない)。
-        document.getElementById('nt-firstpost').value = d.settings.first_post_template || '';
+        // >>1 本文欄に既定値をプリフィル(FR-014a)。板詳細の first_post_default は固定 >>1
+        // テンプレ(未設定ならシステム既定テンプレ)で、上書きなし開設時の >>1 と同一。
+        const fpDefault = d.first_post_default || d.settings.first_post_template || '';
+        document.getElementById('nt-firstpost').value = fpDefault;
         const btn = document.getElementById('nt-btn');
         btn.onclick = async () => {
           const title = document.getElementById('nt-title').value;
@@ -542,11 +548,13 @@
           // channel は "30311:<pubkey>:<guid>" 形式。open_thread は d タグ(guid)を要求する。
           const parts = summary.channel.split(':');
           const channel_id = parts[parts.length - 1];
-          // >>1 上書き(FR-014a): 入力があればそのスレ限りで上書き。空なら null で
-          // 送りサーバ側テンプレ(未設定時は既定)に委ねる。上書きは板設定を変更しない。
+          // >>1 上書き(FR-014a): プリフィルから編集されていればそのスレ限りで上書き。
+          // 未編集・空なら null で送りサーバ側テンプレ(未設定時は既定)に委ねる。
+          // 上書きは板設定を変更しない。
           const fp = document.getElementById('nt-firstpost').value;
+          const edited = fp.trim() && fp !== fpDefault;
           const r = await api('POST', '/livechat/threads', {
-            channel_id, title: title || null, first_post_override: fp.trim() ? fp : null,
+            channel_id, title: title || null, first_post_override: edited ? fp : null,
           });
           if (r.status === 201) {
             const j = await r.json();
@@ -718,9 +726,9 @@
       }
     }
 
-    // 確定レス 1 件の DOM(伝統形式ヘッダ + 本文)。id="res-{n}" を付与(アンカージャンプ先)。
-    // 注: 投稿者 ID(2ch の ID:xxxx)は板詳細 JSON に含まれない(板鍵を UI へ露出しない方針)ため
-    // ヘッダは `{res_no} ：{名前}：{日付}` とする(dat 側の ID は互換 API が別途生成)。
+    // 確定レス 1 件の DOM(伝統形式ヘッダ `{res_no} ：{名前}：{日付} ID:{id}` + 本文)。
+    // id="res-{n}" を付与(アンカージャンプ先)。ID は互換 dat と同一導出の短縮 ID(板鍵先頭
+    // 8 文字・表示専用 — FR-002)で、板詳細/board.json の `id` をそのまま表示する。
     function resNode(r) {
       const div = document.createElement('div');
       div.className = 'res';
@@ -729,7 +737,8 @@
       div.innerHTML =
         `<div class="res-head"><span class="res-no">${r.res_no}</span> ：` +
         `<span class="res-name">${escHtml(r.name)}</span>${mail} ：` +
-        `<span class="res-date">${escHtml(fmtDate(r.created_at))}</span></div>` +
+        `<span class="res-date">${escHtml(fmtDate(r.created_at))}</span>` +
+        (r.id ? ` <span class="res-id">ID:${escHtml(r.id)}</span>` : '') + `</div>` +
         `<div class="res-body">${renderBody(r.body)}</div>`;
       return div;
     }
@@ -878,7 +887,8 @@
     // 選択・スレ開設(home)・スレ操作・モデレーション(thread)は互換面に対応する API を持たない。
     function applyCompatViewerScope() {
       if (!ON_COMPAT) return;
-      for (const id of ['home-open-wrap', 'thread-ops-wrap', 'thread-mod-wrap']) {
+      // top-nav(`/index.html`)は http_bind の静的アセットで、互換ポートには存在しない。
+      for (const id of ['top-nav', 'home-open-wrap', 'thread-ops-wrap', 'thread-mod-wrap']) {
         const el = document.getElementById(id);
         if (el) el.hidden = true;
       }

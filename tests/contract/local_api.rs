@@ -1237,6 +1237,7 @@ impl LivechatDirectory for PortDirectory {
             res: Vec::new(),
             pending: Vec::new(),
             compat_bbs_port: self.compat_bbs_port,
+            first_post_default: Some("既定 >>1 本文".into()),
         })
     }
     fn next_thread(&self, _board_id: &str) -> Option<u32> {
@@ -1275,6 +1276,15 @@ async fn thread_detail_json(compat_bbs_port: Option<u16>) -> Value {
 async fn get_thread_includes_compat_bbs_port_when_enabled() {
     let json = thread_detail_json(Some(7183)).await;
     assert_eq!(json["compat_bbs_port"], 7183);
+}
+
+/// T059(FR-014a — contracts/web-ui.md §2.4/§5.1): 板詳細は新規スレ作成欄のプリフィル用に
+/// 「上書きなしで開設したとき >>1 になる本文」(固定テンプレ、未設定ならシステム既定)を
+/// `first_post_default` として返す。
+#[tokio::test]
+async fn get_thread_includes_first_post_default_for_prefill() {
+    let json = thread_detail_json(Some(7183)).await;
+    assert_eq!(json["first_post_default"], "既定 >>1 本文");
 }
 
 /// 互換 API 無効時も `compat_bbs_port` キーは存在し、値は null。
@@ -1418,6 +1428,7 @@ impl LivechatDirectory for SettingsDirectory {
             res: Vec::new(),
             pending: Vec::new(),
             compat_bbs_port: None,
+            first_post_default: None,
         })
     }
     fn next_thread(&self, _board_id: &str) -> Option<u32> {

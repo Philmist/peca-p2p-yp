@@ -124,7 +124,7 @@ Host 検証 + 送信元 LAN 限定 + レート制限を共有する。
 |---|---|---|
 | `title` / `noname_name` / `res_limit` | BoardSettings | SETTING.TXT 相当の公開情報 |
 | `local_rules_html` | `render_local_rules_html` | 安全 HTML 化済み。原文 `local_rules` は**出さない** |
-| `res[]` | 確定レス列(ResView 同形の最小: `res_no,name,mail,body,created_at`) | dat 相当の公開情報 |
+| `res[]` | 確定レス列(ResView 同形の最小: `res_no,name,mail,body,created_at,id` — `id` は dat と同一導出の短縮 ID) | dat 相当の公開情報 |
 | `thread` | `{generation, res_count}` | 現行スレ記述子(SPA のスレルーティング用) |
 | `compat_bbs_port` | 待受ポート | 板 URL の自己生成用 |
 
