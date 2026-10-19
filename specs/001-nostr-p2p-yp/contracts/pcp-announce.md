@@ -26,8 +26,14 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
   HELO の `sid` をエコーしてはならない(2026-07-04 実機検証で改訂): PCP クライアント
   (本家 PeerCast / PeerCastStation)は OLEH の sid が自分の SessionID と一致すると
   自己接続と判定して切断するため、エコー実装では掲載前に切断・再接続が繰り返される
-- `PCP_OLEH` の `port` は HELO で申告された待受ポートのエコー(申告が無ければ省略)。
-  loopback 専用 YP のため connect-back による到達性検証は行わない
+- `PCP_OLEH` の `port` は HELO で申告された待受ポートのエコー。HELO に `port` が無く
+  ポート確認依頼の `ping` がある場合は `ping` の値をエコーする(両方あれば `port` を
+  優先、どちらも無ければ省略)(#13 で改訂): PeerCastStation はポート状態 Unknown の
+  とき `ping` のみを送り、OLEH に `port` が無いと Unknown のまま PUSH フラグ付き BCST
+  (TIP 非掲載)になる。loopback 専用 YP のため connect-back による到達性検証は
+  行わない(rip が loopback で配信者へ到達できず、グローバル IP 経由の確認は
+  ヘアピン NAT 非対応の家庭用ルーターで失敗するため)。したがって実際には閉じている
+  配信者の TIP も掲載されうる
 - `PCP_OLEH` の `rip` は**接続元のアドレスファミリに応じて 4/16 バイト**で必ず返す
   (2026-07-05 実機検証で改訂): PeerCastStation は OLEH の `rip`+`port` の組で当該
   ファミリのポート開放を確認するため、IPv6 接続(`[::1]` 待受)で `rip` を省略すると
@@ -39,6 +45,11 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
 - `PCP_BCST` 内のチャンネル情報 atom(`name`/`gnre`/`desc`/`url`/`bitr`/`type`/
   `titl`/`crea`/`albm`)と `PCP_HOST`(グローバル IP:port、`numl`/`numr`、flg1)を
   data-model.md の AnnouncedChannel に写像する
+- **トラッカーの網への非掲載**(#13 で改訂): `PCP_HOST` の ip が loopback・LAN 内
+  プライベート(IPv4 RFC 1918 / 169.254/16、IPv6 ULA fc00::/7 / fe80::/10)・
+  unspecified の場合はトラッカーなし(TIP 空)とする。判定は index.txt LAN 公開の
+  バインド検証(ADR-0012)と同じく v4-mapped を正規化してから行う。OLEH の rip が
+  loopback のため、GlobalAddress 未取得のクライアントは 127.0.0.1 を PCP_HOST に載せうる
 - **BCST の実構造**(2026-07-04 実機検証で改訂): ChannelID は `chan` 直下では
   **`id`** atom、`bcst` 直下と `host` 内では `cid` atom に格納される(`chan` 内に
   `cid` は存在しない)。PeerCastStation は 1 チャンネルにつき **`chan`(情報)と

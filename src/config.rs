@@ -432,7 +432,19 @@ fn require_loopback(key: &'static str, value: &str) -> Result<(), ConfigError> {
 /// - 上記いずれにも該当しなければ [`ConfigError::NonLanBind`] で拒否する。
 fn require_lan_or_loopback(key: &'static str, value: &str) -> Result<(), ConfigError> {
     let addr = parse_bind(key, value)?;
-    let allowed = match addr.ip().to_canonical() {
+    if is_lan_or_loopback(addr.ip()) {
+        Ok(())
+    } else {
+        Err(ConfigError::NonLanBind { key })
+    }
+}
+
+/// IP が loopback または LAN 内プライベートアドレスか([`require_lan_or_loopback`] の判定本体)。
+///
+/// [`IpAddr::to_canonical`] で正規化してから判定する(v4-mapped 表記の判定漏れ防止)。
+/// PCP_HOST 由来のトラッカーを網へ載せない判定([`crate::pcp::session`])も同じ基準を使う。
+pub fn is_lan_or_loopback(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         IpAddr::V6(v6) => {
             // fc00::/7(ULA)と fe80::/10(リンクローカル)を上位セグメントの
@@ -441,11 +453,6 @@ fn require_lan_or_loopback(key: &'static str, value: &str) -> Result<(), ConfigE
                 || v6.segments()[0] & 0xfe00 == 0xfc00
                 || v6.segments()[0] & 0xffc0 == 0xfe80
         }
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(ConfigError::NonLanBind { key })
     }
 }
 
