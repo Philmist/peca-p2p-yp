@@ -25,13 +25,14 @@
 //! 単一チャンネルセッション(通常運用)では両者は一致する。
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 
+use crate::config::is_lan_or_loopback;
 use crate::pcp::atom::Atom;
 use crate::pcp::channel::{AnnouncedChannel, ChannelRegistry, ChannelState, RawChannelInfo};
 use crate::security::{SecurityCategory, SecurityLog};
@@ -409,8 +410,12 @@ impl AnnounceSession {
     /// `sid` には**自ノード自身の SessionID** を入れる。PCP クライアント
     /// (本家 PeerCast / PeerCastStation)は OLEH の sid が自分の SessionID と
     /// 一致すると自己接続と判定して切断するため、HELO の sid をエコーしてはならない。
-    /// `port` は HELO で申告された待受ポートのエコー(loopback 専用 YP のため
-    /// connect-back による到達性検証は行わない。申告が無ければ省略)。
+    /// `port` は HELO で申告された待受ポート(`port`、無ければポート確認依頼の `ping`)の
+    /// エコー。loopback 専用 YP であり、OLEH の rip(loopback)からは配信者の
+    /// グローバルアドレスへ到達できず、グローバル IP 経由の確認はヘアピン NAT に
+    /// 依存するため、connect-back による到達性検証は行わず申告を開放済みとして返す。
+    /// `ping` を無視するとポート状態 Unknown のクライアント(PeerCastStation)が
+    /// firewalled のまま PUSH 付き BCST を送る(#13)。どちらも無ければ省略。
     fn build_oleh(&self, helo: &Atom) -> Atom {
         let mut children = vec![
             Atom::bytes("sid", node_session_id()),
@@ -432,7 +437,10 @@ impl AnnounceSession {
             }
             None => {}
         }
-        if let Some(port) = helo.find("port").and_then(Atom::as_i32)
+        if let Some(port) = helo
+            .find("port")
+            .or_else(|| helo.find("ping"))
+            .and_then(Atom::as_i32)
             && (0..=65535).contains(&port)
         {
             children.push(Atom::u16v("port", port as u16));
@@ -462,24 +470,32 @@ fn child_i32(parent: Option<&Atom>, name: &str, default: i64) -> i64 {
 /// PCP の IP atom はバイト逆順格納(IPv4 = 32bit 整数のリトルエンディアン、
 /// IPv6 も同様に 16 バイトを逆順で格納 — PeerCastStation 実機 2026-07-04 確認)。
 /// IPv6 は `[addr]:port` のブラケット形式で返す(SocketAddr 互換)。
+///
+/// loopback / LAN 内プライベート / unspecified の ip も `None`(網へ載せない)。
+/// OLEH の rip は loopback のため、GlobalAddress 未取得のクライアントは
+/// 127.0.0.1 を自アドレスとして PCP_HOST に載せうる(#13)。
 fn build_tracker(host: &Atom) -> Option<String> {
     let ip = host.find("ip")?.payload()?;
     let port = host.find("port")?.as_i32()?;
     if !(0..=65535).contains(&port) {
         return None;
     }
-    match ip.len() {
-        4 => Some(format!("{}.{}.{}.{}:{}", ip[3], ip[2], ip[1], ip[0], port)),
+    let addr = match ip.len() {
+        4 => IpAddr::V4(Ipv4Addr::new(ip[3], ip[2], ip[1], ip[0])),
         16 => {
             let mut bytes = [0u8; 16];
             for (dst, src) in bytes.iter_mut().zip(ip.iter().rev()) {
                 *dst = *src;
             }
-            let addr = std::net::Ipv6Addr::from(bytes);
-            Some(format!("[{addr}]:{port}"))
+            IpAddr::V6(Ipv6Addr::from(bytes))
         }
-        _ => None,
+        _ => return None,
+    };
+    if is_lan_or_loopback(addr) || addr.to_canonical().is_unspecified() {
+        return None;
     }
+    // SocketAddr の Display は IPv6 を `[addr]:port` で出す。
+    Some(SocketAddr::new(addr, port as u16).to_string())
 }
 
 /// 自ノードの PCP SessionID(プロセス起動ごとにランダム生成)。
@@ -781,6 +797,52 @@ mod tests {
     }
 
     #[test]
+    fn ping_only_helo_is_echoed_as_port() {
+        // PeerCastStation はポート状態 Unknown のとき HELO に port ではなく ping を
+        // 付ける。OLEH に port が無いと Unknown のまま PUSH 付き BCST になる(#13)。
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry, sec, "127.0.0.1:40009".into());
+        let helo = Atom::parent(
+            "helo",
+            vec![Atom::bytes("sid", &[1u8; 16]), Atom::u16v("ping", 7144)],
+        );
+        let actions = feed(&mut s, &helo);
+        let AnnounceAction::Send(oleh) = &actions[0];
+        assert_eq!(oleh.find("port").and_then(Atom::as_i32), Some(7144));
+    }
+
+    #[test]
+    fn declared_port_takes_precedence_over_ping() {
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry, sec, "127.0.0.1:40010".into());
+        let helo = Atom::parent(
+            "helo",
+            vec![
+                Atom::bytes("sid", &[1u8; 16]),
+                Atom::u16v("port", 7144),
+                Atom::u16v("ping", 7145),
+            ],
+        );
+        let actions = feed(&mut s, &helo);
+        let AnnounceAction::Send(oleh) = &actions[0];
+        assert_eq!(oleh.find("port").and_then(Atom::as_i32), Some(7144));
+    }
+
+    #[test]
+    fn helo_without_port_or_ping_omits_oleh_port() {
+        // クライアント自身が firewalled と判断している(どちらも付けない)場合は
+        // port を省略し、クライアントの判断を上書きしない。
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry, sec, "127.0.0.1:40011".into());
+        let actions = feed(&mut s, &helo(&[1u8; 16]));
+        let AnnounceAction::Send(oleh) = &actions[0];
+        assert!(oleh.find("port").is_none());
+    }
+
+    #[test]
     fn ipv6_source_yields_reversed_16byte_rip() {
         let (sec, _g) = security();
         let registry = ChannelRegistry::new();
@@ -946,6 +1008,69 @@ mod tests {
         feed(&mut s, &helo(&[6u8; 16]));
         feed(&mut s, &bcst(&[9u8; 16], "A", FLG1_RECV | FLG1_PUSH));
         assert_eq!(registry.snapshot()[0].tracker, None);
+    }
+
+    /// host ip のワイヤ表現(LE / 逆順格納)を差し替えた BCST。
+    fn bcst_with_ip(cid: &[u8; 16], ip_wire: &[u8]) -> Atom {
+        Atom::parent(
+            "bcst",
+            vec![
+                Atom::bytes("cid", cid),
+                Atom::parent(
+                    "host",
+                    vec![
+                        Atom::bytes("cid", cid),
+                        Atom::bytes("ip", ip_wire),
+                        Atom::u16v("port", 7144),
+                        Atom::u8v("flg1", FLG1_RECV),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    /// IP をワイヤ表現(逆順格納)へ変換する。
+    fn wire(ip: std::net::IpAddr) -> Vec<u8> {
+        let mut bytes = match ip {
+            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
+        bytes.reverse();
+        bytes
+    }
+
+    #[test]
+    fn non_global_host_ip_has_no_tracker() {
+        // `ping` エコーで PUSH が立たなくなるため、OLEH rip(127.0.0.1)を
+        // GlobalAddress に採用したクライアントの loopback / LAN アドレスが
+        // TIP として網へ流れないよう、掲載前に落とす(#13)。
+        for addr in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+        ] {
+            let (sec, _g) = security();
+            let registry = ChannelRegistry::new();
+            let mut s = AnnounceSession::new(registry.clone(), sec, "127.0.0.1:40012".into());
+            feed(&mut s, &helo(&[12u8; 16]));
+            feed(
+                &mut s,
+                &bcst_with_ip(&[13u8; 16], &wire(addr.parse().unwrap())),
+            );
+            let snap = registry.snapshot();
+            assert_eq!(snap.len(), 1, "{addr}: チャンネル自体は掲載される");
+            assert_eq!(snap[0].tracker, None, "{addr} は TIP に載せない");
+        }
     }
 
     #[test]
