@@ -105,6 +105,7 @@ PeerCastStation から PCP で受信した配信中チャンネル。イベン�
 | name | `name` | 1..256 バイト(UTF-8)、制御文字除去 |
 | genre | `gnre` | 0..256 バイト |
 | description | `desc` | 0..1024 バイト |
+| comment | `cmnt` | 0..1024 バイト、制御文字除去(2026-11-01 追加) |
 | contact_url | `url` | 0..512 バイト。表示前に URL 警告判定(FR-012) |
 | bitrate_kbps | `bitr` | 0..100_000 |
 | content_type | `type` | 0..32 バイト英数 |
@@ -148,7 +149,7 @@ gossip 受信・自ノード発行の両方のイベントを保持し、SYNC_RE
 |-----------|------|------|
 | author_pubkey | event.pubkey | 署名検証必須(`nostr` クレート)。失敗は破棄+セキュリティログ(FR-005) |
 | channel_id | `d` タグ | hex 32 桁。不一致は破棄 |
-| (name, genre, description, contact_url, bitrate, content_type, track, tracker, listeners, relays_cnt, started_at) | contracts/nostr-events.md のタグ写像 | 同契約の上限・形式チェック |
+| (name, genre, description, comment, contact_url, bitrate, content_type, track, tracker, listeners, relays_cnt, started_at) | contracts/nostr-events.md のタグ写像 | 同契約の上限・形式チェック |
 | status | `status` タグ | `live` / `ended`。それ以外は破棄 |
 | created_at | event.created_at | 未来方向 +300 秒超は破棄(時計ずれ対策) |
 | source_peers | 受信ピア集合 | UI 表示・ピア品質判断用 |

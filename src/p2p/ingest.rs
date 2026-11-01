@@ -216,6 +216,7 @@ mod tests {
             content_type: None,
             tip: None,
             contact: None,
+            comment: None,
             relays: -1,
             track: None,
         }

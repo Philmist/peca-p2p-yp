@@ -36,9 +36,10 @@ accept → クライアントの PCP_HELO 受信 → PCP_OLEH 応答
   BCST を含みうる。チャンネルは ChannelID 単位で AnnouncedChannel(data-model.md)を構成し、
   1 セッションあたりの同時掲載チャンネル数は ≤ 16(超過分は無視+`pcp_reject` ログ)。
   同時セッション上限(32)は TCP 接続単位で適用する
-- `PCP_BCST` 内のチャンネル情報 atom(`name`/`gnre`/`desc`/`url`/`bitr`/`type`/
+- `PCP_BCST` 内のチャンネル情報 atom(`name`/`gnre`/`desc`/`cmnt`/`url`/`bitr`/`type`/
   `titl`/`crea`/`albm`)と `PCP_HOST`(グローバル IP:port、`numl`/`numr`、flg1)を
-  data-model.md の AnnouncedChannel に写像する
+  data-model.md の AnnouncedChannel に写像する(`cmnt` は 2026-11-01 改訂で追加。
+  `info` の `styp`/`sext` と `trck` の `url`/`gnre` は引き続き非対応 = 無視)
 - **BCST の実構造**(2026-07-04 実機検証で改訂): ChannelID は `chan` 直下では
   **`id`** atom、`bcst` 直下と `host` 内では `cid` atom に格納される(`chan` 内に
   `cid` は存在しない)。PeerCastStation は 1 チャンネルにつき **`chan`(情報)と

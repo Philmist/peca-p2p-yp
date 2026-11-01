@@ -7,7 +7,7 @@
 //! ## 責務
 //! - HELO(sid・bcid)→ OLEH 応答(**自ノードの SessionID** + agent 名 `peca-p2p-yp/<semver>`。
 //!   sid のエコーはクライアント側の自己接続判定を誤発火させるため禁止 — 本家 PeerCast 互換)
-//! - BCST 解析(name/gnre/desc/url/bitr/type/titl/crea/albm + PCP_HOST)を [`RawChannelInfo`]
+//! - BCST 解析(name/gnre/desc/cmnt/url/bitr/type/titl/crea/albm + PCP_HOST)を [`RawChannelInfo`]
 //!   へ写し、[`ChannelRegistry`] へ upsert。`chan`(情報)と `host`(リスナー数・トラッカー)は
 //!   **別々の BCST** で届きうるためセッション内でマージする(実機 PeerCastStation の挙動)
 //! - 1 セッション内の複数チャンネル(ChannelID 単位、≤ 16。超過は無視+`pcp_reject`)
@@ -324,6 +324,7 @@ impl AnnounceSession {
             name: String::new(),
             genre: String::new(),
             description: String::new(),
+            comment: String::new(),
             contact_url: String::new(),
             bitrate: 0,
             content_type: String::new(),
@@ -341,6 +342,7 @@ impl AnnounceSession {
                 entry.name = child_str(info, "name");
                 entry.genre = child_str(info, "gnre");
                 entry.description = child_str(info, "desc");
+                entry.comment = child_str(info, "cmnt");
                 entry.contact_url = child_str(info, "url");
                 entry.bitrate = child_i32(info, "bitr", 0);
                 entry.content_type = child_str(info, "type");
@@ -897,6 +899,35 @@ mod tests {
         assert_eq!(s.tracked_channels(), 1);
         let snap = registry.snapshot();
         assert_eq!(snap[0].tracker.as_deref(), Some("192.0.2.5:7144"));
+    }
+
+    #[test]
+    fn info_cmnt_is_mapped_to_comment() {
+        let (sec, _g) = security();
+        let registry = ChannelRegistry::new();
+        let mut s = AnnounceSession::new(registry.clone(), sec, "127.0.0.1:40009".into());
+        feed(&mut s, &helo(&[12u8; 16]));
+        let cid = [13u8; 16];
+        let chan_only = Atom::parent(
+            "bcst",
+            vec![
+                Atom::bytes("cid", &cid),
+                Atom::parent(
+                    "chan",
+                    vec![
+                        Atom::bytes("id", &cid),
+                        Atom::parent(
+                            "info",
+                            vec![Atom::str("name", "C"), Atom::str("cmnt", "初見歓迎")],
+                        ),
+                    ],
+                ),
+            ],
+        );
+        feed(&mut s, &chan_only);
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].comment, "初見歓迎");
     }
 
     #[test]

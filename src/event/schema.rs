@@ -107,6 +107,8 @@ pub struct ChannelListing {
     pub tip: Option<String>,
     /// `["peca","contact",..]` = コンタクト URL(任意)。
     pub contact: Option<String>,
+    /// `["peca","comment",..]` = コメント(任意)。
+    pub comment: Option<String>,
     /// `["peca","relays",..]` = リレー数。不明は [`UNKNOWN_COUNT`]。
     pub relays: i64,
     /// `["peca","track",..]` = 曲情報(任意)。
@@ -154,6 +156,9 @@ impl ChannelListing {
         }
         if let Some(contact) = &self.contact {
             raw.push(vec!["peca".into(), "contact".into(), contact.clone()]);
+        }
+        if let Some(comment) = &self.comment {
+            raw.push(vec!["peca".into(), "comment".into(), comment.clone()]);
         }
         if self.relays >= 0 {
             raw.push(vec![
@@ -242,6 +247,7 @@ impl ChannelListing {
         };
         let content_type = clean_optional(peca_value(event, "type"))?;
         let contact = clean_optional(peca_value(event, "contact"))?;
+        let comment = clean_optional(peca_value(event, "comment"))?;
         let tip = match peca_value(event, "tip") {
             Some(v) => {
                 if security::contains_control_chars(v) || SocketAddr::from_str(v).is_err() {
@@ -267,6 +273,7 @@ impl ChannelListing {
             content_type,
             tip,
             contact,
+            comment,
             relays,
             track,
         })
@@ -588,6 +595,7 @@ mod tests {
             content_type: Some("FLV".into()),
             tip: Some("198.51.100.1:7144".into()),
             contact: Some("https://example.com/".into()),
+            comment: Some("コメント".into()),
             relays: 3,
             track: Some(Track {
                 title: "song".into(),
@@ -631,6 +639,19 @@ mod tests {
         let restored = ChannelListing::from_event(&event).unwrap();
         assert_eq!(restored.current_participants, UNKNOWN_COUNT);
         assert_eq!(restored.relays, UNKNOWN_COUNT);
+    }
+
+    #[test]
+    fn missing_comment_tag_restores_as_none() {
+        // comment タグを持たない旧ノードのイベントも受理し、コメントは None で復元する。
+        let keys = Keys::generate();
+        let mut listing = sample_listing();
+        listing.comment = None;
+        let event = listing.sign(&keys, listing.starts, 0).unwrap();
+        assert!(peca_value(&event, "comment").is_none(), "空ならタグ省略");
+
+        let restored = ChannelListing::from_event(&event).unwrap();
+        assert_eq!(restored.comment, None);
     }
 
     #[test]

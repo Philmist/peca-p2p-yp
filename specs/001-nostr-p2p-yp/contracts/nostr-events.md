@@ -34,8 +34,13 @@ addressable イベント。置換規則 `(30311, pubkey, d)` は各ノードの�
 | `["peca","type","<content type>"]` | 例 `FLV` | `type` |
 | `["peca","tip","<ip:port>"]` | トラッカー。firewalled 時は省略 | PCP_HOST |
 | `["peca","contact","<url>"]` | コンタクト URL | `url` |
+| `["peca","comment","<text>"]` | コメント。空なら省略(2026-11-01 追加) | `cmnt` |
 | `["peca","relays","<count>"]` | リレー数 | `numr`(負値は省略。受信側はタグ省略を「不明 = -1」として復元する) |
 | `["peca","track","<title>","<artist>","<album>","<url>"]` | 曲情報(空要素可) | `titl`/`crea`/`albm`。`<url>` 要素は **v1 では常に空文字列**(対応する PCP atom を受信しない — contracts/pcp-announce.md) |
+
+**拡張タグの互換性**(2026-11-01 追加): 受信側は `peca` タグを第 2 要素(サブキー)で
+識別し、未知のサブキーは無視する(破棄しない)。追加タグ `comment` を知らない旧ノードは
+これを読まずに受理し、再伝搬時もイベントを変更しない(署名済み JSON をそのまま運ぶ)。
 
 `content` フィールドは空文字列とする(全情報はタグで表現)。
 

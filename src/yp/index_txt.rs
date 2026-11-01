@@ -95,11 +95,12 @@ fn channel_line(ch: &DiscoveredChannel, now: u64, encoding: IndexEncoding) -> St
     // フィールド 16: BROADCAST_TIME
     let broadcast_time = format_broadcast_time(now, l.starts);
     // フィールド 17: 固定文字列 `click`
-    // フィールド 18: COMMENT — v1 は常に空
+    // フィールド 18: COMMENT — comment タグ省略時は空
+    let comment = sanitize(l.comment.as_deref().unwrap_or(""));
     // フィールド 19: DIRECT — 固定 `0`(直接再生の提供なし)
 
     format!(
-        "{name}<>{id}<>{tip}<>{contact}<>{genre}<>{detail}<>{listener_num}<>{relay_num}<>{bitrate}<>{content_type}<>{track_artist}<>{track_album}<>{track_title}<>{track_contact_url}<>{name_encoded}<>{broadcast_time}<>click<><>0"
+        "{name}<>{id}<>{tip}<>{contact}<>{genre}<>{detail}<>{listener_num}<>{relay_num}<>{bitrate}<>{content_type}<>{track_artist}<>{track_album}<>{track_title}<>{track_contact_url}<>{name_encoded}<>{broadcast_time}<>click<>{comment}<>0"
     )
 }
 
@@ -272,6 +273,7 @@ mod tests {
             content_type: None,
             tip: None,
             contact: None,
+            comment: None,
             relays: UNKNOWN_COUNT,
             track: None,
         }
@@ -327,7 +329,18 @@ mod tests {
         let fields: Vec<&str> = line.split("<>").collect();
         assert_eq!(fields.len(), 19);
         assert_eq!(fields[16], "click", "17 番目は固定文字列 click");
+        assert_eq!(fields[17], "", "comment なしの COMMENT は空");
         assert_eq!(fields[18], "0", "19 番目(DIRECT)は固定 0");
+    }
+
+    #[test]
+    fn comment_field_is_sanitized() {
+        let mut ch = minimal_channel("aabbccdd00112233445566778899aabb");
+        ch.listing.comment = Some("よろしく<>ね".to_string());
+        let line = channel_line(&ch, 3600, IndexEncoding::Utf8);
+        let fields: Vec<&str> = line.split("<>").collect();
+        assert_eq!(fields.len(), 19, "エスケープによりフィールド数は不変");
+        assert_eq!(fields[17], "よろしく&lt;&gt;ね");
     }
 
     #[test]

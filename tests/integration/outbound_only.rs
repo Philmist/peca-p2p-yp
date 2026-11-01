@@ -40,6 +40,7 @@ fn listing(channel_id: &str, title: &str) -> ChannelListing {
         content_type: Some("FLV".into()),
         tip: Some(TIP.into()),
         contact: Some("https://example.com/".into()),
+        comment: None,
         relays: 1,
         track: Some(Track::default()),
     }

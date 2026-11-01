@@ -50,7 +50,7 @@ CHANNEL_NAME<>ID<>TIP<>CONTACT_URL<>GENRE<>DETAIL<>LISTENER_NUM<>RELAY_NUM
 | NAME_ENCODED | name(生値) | percent エンコード(出力エンコーディングのバイト列基準・大文字 hex。UTF-8 なら `%E3%83…`、Shift_JIS なら古典形 `%83e%83X…`) |
 | BROADCAST_TIME | now - started_at を `HH:MM` | H は 2 桁以上可 — 24 時間超は時間部をそのまま拡張する(例 25 時間 30 分 → `25:30`)。分は 2 桁固定(`0` 埋め)。既存 YP ブラウザの解釈揺れは実機確認(research R5 と同枠)で検証する |
 | (17 番目) | — | 固定文字列 `click`(実物準拠) |
-| COMMENT | 空(v1) | |
+| COMMENT | comment | 欠損(30311 の `comment` タグ省略)は空文字列。サニタイズは他の文字列フィールドと同一(2026-11-01 改訂 — 改訂前は v1 で常に空) |
 | DIRECT | — | 固定 `0`(直接再生の提供なし) |
 
 - **空値・欠損の共通規則**: 文字列フィールドは空文字列を出力する(行のフィールド数は常に固定)
@@ -85,5 +85,6 @@ CHANNEL_NAME<>ID<>TIP<>CONTACT_URL<>GENRE<>DETAIL<>LISTENER_NUM<>RELAY_NUM
 ## 検証方法
 
 - `tests/contract/`: 既知の DiscoveredChannel 集合 → index.txt ゴールデンファイル比較
-  (Shift_JIS / UTF-8 両方、空一覧、firewalled、`<>` 含む名称のサニタイズ)
+  (Shift_JIS / UTF-8 両方、空一覧、firewalled、`<>` 含む名称のサニタイズ、
+  COMMENT あり/なし)
 - 受け入れ: ユーザー所有の実 YP ブラウザで表示確認(research R5 のリスク解消)
