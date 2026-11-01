@@ -45,6 +45,7 @@ fn channel_to_json(ch: &DiscoveredChannel) -> Value {
         "relay_num": l.relays,
         "bitrate": l.bitrate_kbps.unwrap_or(0),
         "content_type": l.content_type,
+        "comment": l.comment,
         "status": match l.status {
             crate::event::schema::ChannelStatus::Live => "live",
             crate::event::schema::ChannelStatus::Ended => "ended",

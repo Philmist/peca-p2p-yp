@@ -47,6 +47,7 @@ fn full_listing() -> ChannelListing {
         content_type: Some("FLV".into()),
         tip: Some("198.51.100.1:7144".into()),
         contact: Some("https://example.com/".into()),
+        comment: None,
         relays: 3,
         track: Some(Track {
             title: "song".into(),

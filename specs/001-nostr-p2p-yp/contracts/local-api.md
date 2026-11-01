@@ -23,7 +23,7 @@
 
 | Method & Path | 説明 | 主な入出力 |
 |---------------|------|-----------|
-| `GET /channels` | 発見済みチャンネル一覧(視聴者向け) | DiscoveredChannel の配列(muted 除外、`url_warning` フラグ付き — FR-012) |
+| `GET /channels` | 発見済みチャンネル一覧(視聴者向け) | DiscoveredChannel の配列(muted 除外、`url_warning` フラグ付き — FR-012。`comment` は 2026-11-01 追加、欠損は `null`) |
 | `GET /announced` | 自分が掲載中のチャンネルと掲載状態 | AnnouncedChannel + 伝搬先(established ピア)数 |
 | `GET /personas` | ペルソナ一覧(pubkey, label, state) | 秘密鍵は返さない |
 | `POST /personas` | ペルソナ新規作成 | `{label}` → `{pubkey}` |

@@ -60,6 +60,8 @@ pub struct AnnouncedChannel {
     pub genre: String,
     /// 説明(`desc`)。0..1024 バイト。
     pub description: String,
+    /// コメント(`cmnt`)。0..1024 バイト。
+    pub comment: String,
     /// コンタクト URL(`url`)。0..512 バイト。
     pub contact_url: String,
     /// ビットレート kbps(`bitr`)。0..100_000。
@@ -91,6 +93,8 @@ pub struct RawChannelInfo {
     pub genre: String,
     /// `desc`。
     pub description: String,
+    /// `cmnt`。
+    pub comment: String,
     /// `url`。
     pub contact_url: String,
     /// `bitr`。
@@ -124,6 +128,7 @@ impl AnnouncedChannel {
             name: sanitize_text(&raw.name, 256),
             genre: sanitize_text(&raw.genre, 256),
             description: sanitize_text(&raw.description, 1024),
+            comment: sanitize_text(&raw.comment, 1024),
             contact_url: sanitize_text(&raw.contact_url, 512),
             bitrate_kbps: clamp_bitrate(raw.bitrate),
             content_type: sanitize_content_type(&raw.content_type),
@@ -176,6 +181,7 @@ impl AnnouncedChannel {
             content_type: non_empty(&self.content_type),
             tip: self.tracker.clone(),
             contact: non_empty(&self.contact_url),
+            comment: non_empty(&self.comment),
             relays: self.relays_cnt,
             track: (!self.track.is_empty()).then(|| Track {
                 title: self.track.title.clone(),
@@ -356,6 +362,7 @@ mod tests {
             name: name.into(),
             genre: "Game".into(),
             description: "説明".into(),
+            comment: "コメント".into(),
             contact_url: "http://example.com/".into(),
             bitrate: 500,
             content_type: "FLV".into(),
@@ -454,5 +461,22 @@ mod tests {
         assert!(listing.tip.is_none());
         assert_eq!(listing.current_participants, UNKNOWN_COUNT);
         assert_eq!(listing.title, "C");
+    }
+
+    #[test]
+    fn to_listing_maps_comment_and_omits_when_empty() {
+        let mut ch = AnnouncedChannel::from_raw(raw(4, "D"), ChannelState::Announced);
+        assert_eq!(ch.to_listing().comment.as_deref(), Some("コメント"));
+        ch.comment = String::new();
+        assert_eq!(ch.to_listing().comment, None, "空コメントは省略");
+    }
+
+    #[test]
+    fn from_raw_sanitizes_comment() {
+        let mut r = raw(5, "E");
+        r.comment = format!("a\u{7}b{}", "x".repeat(2000));
+        let ch = AnnouncedChannel::from_raw(r, ChannelState::Announced);
+        assert!(ch.comment.starts_with("ab"), "制御文字は除去");
+        assert_eq!(ch.comment.len(), 1024, "1024 バイトで切詰め");
     }
 }

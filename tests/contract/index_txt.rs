@@ -14,6 +14,7 @@
 //! - NAME_ENCODED(15 番目)= チャンネル名の percent エンコード、17 番目 = `click`、
 //!   19 番目(DIRECT)= `0`
 //! - 不明フィールド: listeners/relays = -1、bitrate = 0
+//! - COMMENT(18 番目): comment タグあり → 出力(サニタイズ込み)、なし → 空文字列
 
 use encoding_rs::SHIFT_JIS;
 
@@ -40,6 +41,7 @@ fn make_listing(channel_id: &str) -> ChannelListing {
         content_type: Some("FLV".to_string()),
         tip: Some("192.168.1.1:7144".to_string()),
         contact: Some("http://example.com/".to_string()),
+        comment: None,
         relays: 3,
         track: Some(Track {
             title: "test song".to_string(),
@@ -166,6 +168,37 @@ fn shift_jis_golden_japanese() {
     let expected_utf8 = "テスト放送<>00000000000000000000000000000001<>192.168.1.1:7144<>http://example.com/<>テスト<>詳細説明<>5<>3<>128<>FLV<>test artist<>test album<>test song<><>%83e%83X%83g%95%FA%91%97<>0:01<>click<><>0\n";
     let expected_bytes = to_sjis_bytes(expected_utf8);
     assert_eq!(out, expected_bytes, "Shift_JIS エンコードが一致する");
+}
+
+/// COMMENT あり: 18 番目にコメントを出力し、`<`/`>` はエスケープする(UTF-8)。
+#[test]
+fn comment_is_output_in_18th_field() {
+    let cid = "00000000000000000000000000000008";
+    let mut listing = make_listing(cid);
+    listing.comment = Some("初見歓迎<>雑談".to_string());
+    let ch = make_channel(cid, listing, 2_000);
+    let now = 1_000 + 60;
+
+    let out = generate(&[ch], IndexEncoding::Utf8, now);
+    let text = std::str::from_utf8(&out).unwrap();
+    let fields: Vec<&str> = text.trim_end_matches('\n').split("<>").collect();
+    assert_eq!(fields.len(), 19, "エスケープ後もフィールド数は 19");
+    assert_eq!(fields[17], "初見歓迎&lt;&gt;雑談");
+    assert_eq!(fields[18], "0");
+}
+
+/// COMMENT あり(Shift_JIS ゴールデン)。
+#[test]
+fn shift_jis_golden_with_comment() {
+    let cid = "00000000000000000000000000000009";
+    let mut listing = make_listing(cid);
+    listing.comment = Some("コメント".to_string());
+    let ch = make_channel(cid, listing, 2_000);
+    let now = 1_000 + 90;
+
+    let out = generate(&[ch], IndexEncoding::ShiftJis, now);
+    let expected_utf8 = "テスト放送<>00000000000000000000000000000009<>192.168.1.1:7144<>http://example.com/<>テスト<>詳細説明<>5<>3<>128<>FLV<>test artist<>test album<>test song<><>%83e%83X%83g%95%FA%91%97<>0:01<>click<>コメント<>0\n";
+    assert_eq!(out, to_sjis_bytes(expected_utf8));
 }
 
 /// firewalled チャンネルは TIP フィールドが空文字列になる。
