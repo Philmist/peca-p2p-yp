@@ -398,6 +398,7 @@ mod tests {
             content_type: None,
             tip: None,
             contact: None,
+            comment: None,
             relays: UNKNOWN,
             track: None,
         }

@@ -22,6 +22,7 @@ fn sample() -> AnnouncedChannel {
         name: "テスト配信".into(),
         genre: "game".into(),
         description: "説明文".into(),
+        comment: "コメント".into(),
         contact_url: "https://example.com/".into(),
         bitrate_kbps: 1500,
         content_type: "FLV".into(),
@@ -87,6 +88,7 @@ fn maps_required_and_extension_tags() {
     assert_eq!(peca_value(&event, "type"), Some("FLV"));
     assert_eq!(peca_value(&event, "tip"), Some("198.51.100.1:7144"));
     assert_eq!(peca_value(&event, "contact"), Some("https://example.com/"));
+    assert_eq!(peca_value(&event, "comment"), Some("コメント"));
     assert_eq!(peca_value(&event, "relays"), Some("3"));
 
     // current_participants(listeners)
@@ -152,6 +154,15 @@ fn negative_counts_omit_tags() {
     let event = sign(&ch, &keys);
     assert_eq!(tag_value(&event, "current_participants"), None);
     assert_eq!(peca_value(&event, "relays"), None);
+}
+
+#[test]
+fn empty_comment_omits_tag() {
+    let keys = Keys::generate();
+    let mut ch = sample();
+    ch.comment = String::new();
+    let event = sign(&ch, &keys);
+    assert_eq!(peca_value(&event, "comment"), None, "空コメントはタグ省略");
 }
 
 #[test]

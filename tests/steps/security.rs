@@ -107,6 +107,7 @@ fn listing(channel_id: &str, title: &str, contact: Option<&str>) -> ChannelListi
         content_type: Some("FLV".into()),
         tip: Some("198.51.100.1:7144".into()),
         contact: contact.map(str::to_string),
+        comment: None,
         relays: 0,
         track: Some(Track::default()),
     }

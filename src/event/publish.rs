@@ -310,6 +310,7 @@ mod tests {
             content_type: Some("FLV".into()),
             tip: Some("198.51.100.1:7144".into()),
             contact: None,
+            comment: None,
             relays: 0,
             track: Some(Track::default()),
         }
